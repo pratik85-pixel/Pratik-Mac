@@ -1,0 +1,33 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Expo Start (ZenFlowVerity)",
+			"type": "shell",
+			"command": "cd /Users/pratikbarman/Desktop/ZenFlowVerity && npx expo start",
+			"isBackground": true,
+			"problemMatcher": []
+		},
+		{
+			"label": "Expo Start Android",
+			"type": "shell",
+			"command": "cd /Users/pratikbarman/Desktop/ZenFlowVerity && npx expo start --android",
+			"isBackground": true,
+			"problemMatcher": []
+		},
+		{
+			"label": "Expo Start (new IP)",
+			"type": "shell",
+			"command": "cd /Users/pratikbarman/Desktop/ZenFlowVerity && npx expo start --port 8081",
+			"isBackground": true,
+			"problemMatcher": []
+		},
+		{
+			"label": "Backend Server",
+			"type": "shell",
+			"command": "pkill -f 'uvicorn api.main' 2>/dev/null; sleep 1; cd /Users/pratikbarman/Desktop/ZenFlow_Verity && .venv/bin/uvicorn api.main:app --host 127.0.0.1 --port 8000 --reload",
+			"isBackground": true,
+			"problemMatcher": []
+		}
+	]
+}
