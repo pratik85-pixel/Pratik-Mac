@@ -20,4 +20,4 @@ COPY . .
 RUN chmod +x start.sh
 
 # Run startup script (migrations + uvicorn)
-CMD ["./start.sh"]
+ENTRYPOINT ["/bin/sh", "-c", "echo CONTAINER_STARTED && /bin/sh /app/start.sh"]
