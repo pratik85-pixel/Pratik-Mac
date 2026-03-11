@@ -232,6 +232,91 @@ async def get_recovery_windows(
     ]
 
 
+# ── Ingest (from BLE bridge / app) ───────────────────────────────────────────
+
+class BeatSample(BaseModel):
+    ppi_ms:   float
+    ts:       float          # unix epoch seconds (float)
+    artifact: bool = False
+
+
+class IngestRequest(BaseModel):
+    beats:     list[BeatSample]
+    context:   str   = "background"   # "background" | "sleep"
+    acc_mean:  Optional[float] = None
+    gyro_mean: Optional[float] = None
+
+
+class IngestResponse(BaseModel):
+    windows_processed: int
+    beats_received:    int
+
+
+@router.post("/ingest", response_model=IngestResponse)
+async def ingest_beats(
+    body: IngestRequest,
+    svc:  TrackingService = Depends(_tracking_svc),
+) -> IngestResponse:
+    """
+    Accept a batch of raw PPI beats from the mobile app's BLE bridge.
+
+    The app calls this endpoint every ~5 minutes with all beats collected since
+    the last flush.  Beats are split into WINDOW_MINUTES-wide windows here;
+    each complete window is processed by the tracking pipeline and written to
+    BackgroundWindow.
+
+    No PersonalModel is required — windows are always stored.  Stress / recovery
+    detection is a no-op (returns early) until the personal baseline is built.
+    """
+    if not body.beats:
+        return IngestResponse(windows_processed=0, beats_received=0)
+
+    context = body.context if body.context in ("background", "sleep") else "background"
+
+    # Sort by timestamp
+    beats = sorted(body.beats, key=lambda b: b.ts)
+
+    WINDOW_SEC = 300  # 5 minutes
+
+    # Group beats into 5-min buckets anchored to the first beat
+    bucket_start_ts = beats[0].ts
+    buckets: list[list[BeatSample]] = []
+    current: list[BeatSample] = []
+
+    for beat in beats:
+        if beat.ts - bucket_start_ts >= WINDOW_SEC and current:
+            buckets.append(current)
+            current = []
+            bucket_start_ts = beat.ts
+        current.append(beat)
+
+    if current:
+        buckets.append(current)
+
+    windows_processed = 0
+    for bucket in buckets:
+        ppi_vals = [b.ppi_ms for b in bucket]
+        ts_vals  = [b.ts for b in bucket]
+        win_start = datetime.fromtimestamp(bucket[0].ts, tz=UTC)
+        win_end   = datetime.fromtimestamp(bucket[-1].ts, tz=UTC)
+
+        try:
+            await svc.ingest_background_window(
+                ppi_ms       = ppi_vals,
+                timestamps   = ts_vals,
+                window_start = win_start,
+                window_end   = win_end,
+                context      = context,
+                acc_mean     = body.acc_mean,
+                gyro_mean    = body.gyro_mean,
+            )
+            windows_processed += 1
+        except Exception:
+            logger.exception("ingest_background_window failed for window %s", win_start)
+
+    return IngestResponse(windows_processed=windows_processed, beats_received=len(beats))
+
+
 @router.post("/tag-window", status_code=204, response_model=None)
 async def tag_window(
     body: TagWindowRequest,
