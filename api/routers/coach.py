@@ -148,10 +148,22 @@ async def conversation_turn(
     if conversation_id is None:
         conversation_id = await conv_svc.open(user_id, trigger_context="user_initiated")
 
-    result = await conv_svc.process_turn(
-        conversation_id, body.message,
-        model_service=model_svc, db=db,
-    )
+    try:
+        result = await conv_svc.process_turn(
+            conversation_id, body.message,
+            model_service=model_svc, db=db,
+        )
+    except ValueError as exc:
+        if "not found" in str(exc):
+            # Stale conversation_id (server restarted, in-memory store wiped).
+            # Open a fresh conversation and retry transparently.
+            conversation_id = await conv_svc.open(user_id, trigger_context="user_initiated")
+            result = await conv_svc.process_turn(
+                conversation_id, body.message,
+                model_service=model_svc, db=db,
+            )
+        else:
+            raise
 
     if not result.session_open:
         await conv_svc.close_and_persist(conversation_id, db=db)
