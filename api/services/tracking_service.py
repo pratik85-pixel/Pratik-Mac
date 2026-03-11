@@ -35,6 +35,8 @@ from tracking.recovery_detector import RecoveryWindowResult, detect_recovery_win
 from tracking.daily_summarizer import DailySummaryResult, compute_daily_summary
 from tracking.wake_detector import WakeSleepBoundary, detect_wake_sleep_boundary
 
+import numpy as np
+
 from api.db import schema as db
 from config import CONFIG
 
@@ -145,7 +147,7 @@ async def _load_personal_model(
     result = await db_session.execute(
         select(db.PersonalModel)
         .where(db.PersonalModel.user_id == user_id)
-        .order_by(db.PersonalModel.computed_at.desc())
+        .order_by(db.PersonalModel.updated_at.desc())
         .limit(1)
     )
     return result.scalar_one_or_none()
@@ -179,6 +181,126 @@ async def _load_existing_recovery_windows(
         .where(db.RecoveryWindow.started_at < day_end)
     )
     return result.scalars().all()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# PersonalModel bootstrap (Phase 1 — unblocks detection pipeline on first wear)
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Population-average seeds (conservative HRV reference values)
+_SEED_RMSSD_FLOOR    = 28.0   # ms  — 10th-pct adult resting
+_SEED_RMSSD_CEILING  = 75.0   # ms  — 90th-pct adult resting
+_SEED_RMSSD_MORNING  = 45.0   # ms  — median adult morning
+_SEED_CAPACITY_FLOOR = 32.0   # ms  — seed stress detection threshold
+_MIN_WINDOWS_FOR_REFINE = 3   # need ≥3 valid 5-min windows before refining
+
+
+async def _load_all_background_for_model(
+    db_session: AsyncSession,
+    user_id: str,
+    max_days: int = 30,
+) -> list[BackgroundWindowResult]:
+    """Load all valid BackgroundWindow rows for the last max_days days."""
+    cutoff = datetime.now(UTC) - timedelta(days=max_days)
+    result = await db_session.execute(
+        select(db.BackgroundWindow)
+        .where(db.BackgroundWindow.user_id == user_id)
+        .where(db.BackgroundWindow.window_start >= cutoff)
+        .where(db.BackgroundWindow.is_valid == True)  # noqa: E712
+        .order_by(db.BackgroundWindow.window_start)
+    )
+    rows = result.scalars().all()
+    return [
+        BackgroundWindowResult(
+            user_id       = str(row.user_id),
+            window_start  = row.window_start,
+            window_end    = row.window_end,
+            context       = row.context,
+            rmssd_ms      = row.rmssd_ms,
+            hr_bpm        = row.hr_bpm,
+            lf_hf         = row.lf_hf,
+            confidence    = row.confidence,
+            acc_mean      = row.acc_mean,
+            gyro_mean     = row.gyro_mean,
+            n_beats       = row.n_beats,
+            artifact_rate = row.artifact_rate,
+            is_valid      = row.is_valid,
+        )
+        for row in rows
+    ]
+
+
+async def _bootstrap_personal_model(
+    db_session: AsyncSession,
+    user_id: str,
+) -> db.PersonalModel:
+    """
+    Guarantee a PersonalModel row exists for `user_id`.
+
+    If no row exists: create one with conservative population-average seed
+    values so the detection pipeline can run immediately on first wear.
+
+    While still in bootstrap phase (capacity_version == 0): refine the seed
+    values with actual observed RMSSD statistics from BackgroundWindow rows
+    whenever ≥ 3 valid windows are available.
+
+    Once capacity_version > 0 (set by fingerprint_updater after proper
+    calibration), this function leaves the model untouched.
+    """
+    personal = await _load_personal_model(db_session, user_id)
+    is_new   = personal is None
+
+    if is_new:
+        personal = db.PersonalModel(
+            user_id                      = user_id,
+            rmssd_floor                  = _SEED_RMSSD_FLOOR,
+            rmssd_ceiling                = _SEED_RMSSD_CEILING,
+            rmssd_morning_avg            = _SEED_RMSSD_MORNING,
+            stress_capacity_floor_rmssd  = _SEED_CAPACITY_FLOOR,
+            capacity_version             = 0,
+            prf_status                   = "PRF_UNKNOWN",
+            typical_wake_time            = "07:00",
+            typical_sleep_time           = "23:00",
+        )
+        db_session.add(personal)
+        try:
+            await db_session.flush()
+        except Exception:
+            # Unique-constraint race: another concurrent request just created it
+            await db_session.rollback()
+            personal = await _load_personal_model(db_session, user_id)
+            if personal is None:
+                raise
+            is_new = False
+        else:
+            logger.info("Seeded population-average PersonalModel for user %s", user_id)
+
+    # Refine from real data while still in bootstrap phase
+    if (personal.capacity_version or 0) == 0:
+        windows = await _load_all_background_for_model(db_session, user_id)
+        rmssd_values = [
+            w.rmssd_ms for w in windows
+            if w.rmssd_ms is not None and w.rmssd_ms > 10.0
+        ]
+        if len(rmssd_values) >= _MIN_WINDOWS_FOR_REFINE:
+            arr       = np.array(rmssd_values, dtype=float)
+            floor     = float(np.percentile(arr, 10))
+            ceiling   = float(np.percentile(arr, 90))
+            morning   = float(np.median(arr))
+            cap_floor = max(floor + 0.1 * (ceiling - floor), 20.0)
+
+            personal.rmssd_floor                = round(floor,   1)
+            personal.rmssd_ceiling              = round(ceiling, 1)
+            personal.rmssd_morning_avg          = round(morning, 1)
+            personal.stress_capacity_floor_rmssd= round(cap_floor, 1)
+            await db_session.flush()
+            logger.debug(
+                "Bootstrap PersonalModel user=%s floor=%.1f ceiling=%.1f "
+                "morning=%.1f n_windows=%d",
+                user_id, floor, ceiling, morning, len(rmssd_values),
+            )
+
+    return personal
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -258,10 +380,7 @@ class TrackingService:
         Run detection algorithms over all BackgroundWindows for this day and
         replace existing StressWindow / RecoveryWindow rows with fresh results.
         """
-        personal = await _load_personal_model(self._db, self._uid)
-        if personal is None:
-            logger.debug("No PersonalModel for user %s — skipping window recompute", self._uid)
-            return
+        personal = await _bootstrap_personal_model(self._db, self._uid)
 
         morning_rmssd  = personal.rmssd_morning_avg
         capacity_floor = personal.stress_capacity_floor_rmssd or personal.rmssd_floor
@@ -320,9 +439,7 @@ class TrackingService:
         )
         day_end = day_start + timedelta(days=1)
 
-        personal = await _load_personal_model(self._db, self._uid)
-        if personal is None:
-            raise ValueError(f"No PersonalModel for user {self._uid}")
+        personal = await _bootstrap_personal_model(self._db, self._uid)
 
         morning_rmssd    = personal.rmssd_morning_avg
         capacity_floor   = personal.stress_capacity_floor_rmssd or personal.rmssd_floor

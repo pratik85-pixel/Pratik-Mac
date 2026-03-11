@@ -151,6 +151,7 @@ async def _rebuild_one_user(
     result: dict = {
         "user_id": str(user_id),
         "status":  "ok",
+        "day_closed":         False,
         "narrative_version": None,
         "engagement_tier":   None,
         "plan_items":        0,
@@ -160,6 +161,20 @@ async def _rebuild_one_user(
     }
 
     try:
+        # ── Step 0: Close yesterday's day (write DailyStressSummary) ──────────────
+        from api.services.tracking_service import TrackingService
+        yesterday = (datetime.now(UTC) - timedelta(days=1)).date()
+        try:
+            tracking_svc = TrackingService(user_session, user_id)
+            await tracking_svc.close_day(yesterday)
+            result["day_closed"] = True
+            log.debug("close_day OK user=%s date=%s", user_id, yesterday)
+        except Exception as exc:
+            log.warning("close_day failed user=%s date=%s: %s", user_id, yesterday, exc)
+            # Non-fatal — continue with profile rebuild using whatever
+            # DailyStressSummary data already exists
+
+        # ── Step 1: Profile rebuild (narrative + plan) ───────────────────────
         # Get today's scores (from most recent DailyStressSummary)
         summary_res = await session.execute(
             select(db.DailyStressSummary)

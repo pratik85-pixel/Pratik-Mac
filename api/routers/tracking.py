@@ -337,6 +337,51 @@ async def tag_window(
     return Response(status_code=204)
 
 
+class CloseDayRequest(BaseModel):
+    date: Optional[str] = None  # YYYY-MM-DD; defaults to today
+
+
+class CloseDayResponse(BaseModel):
+    summary_date:      str
+    stress_load_score: Optional[float]
+    recovery_score:    Optional[float]
+    readiness_score:   Optional[float]
+    day_type:          Optional[str]
+    is_estimated:      bool
+
+
+@router.post("/close-day", response_model=CloseDayResponse)
+async def close_day(
+    body: CloseDayRequest = CloseDayRequest(),
+    svc:  TrackingService = Depends(_tracking_svc),
+) -> CloseDayResponse:
+    """
+    Finalise the DailyStressSummary for today (or a given date).
+
+    This writes the stress / recovery / readiness scores to the database
+    and makes them available from GET /tracking/daily-summary.
+
+    Triggered automatically by the 02:00 UTC nightly scheduler.
+    Can also be called manually (e.g. from the app when sleep boundary
+    is detected, or by a developer to force a day close).
+    """
+    target = _parse_date(body.date) if body.date else datetime.now(UTC).date()
+    try:
+        result = await svc.close_day(target)
+    except Exception as exc:
+        logger.exception("close_day failed for %s: %s", target, exc)
+        raise HTTPException(status_code=500, detail=f"close_day failed: {exc}") from exc
+
+    return CloseDayResponse(
+        summary_date      = target.isoformat(),
+        stress_load_score = result.stress_load_score,
+        recovery_score    = result.recovery_score,
+        readiness_score   = result.readiness_score,
+        day_type          = result.day_type,
+        is_estimated      = result.is_estimated,
+    )
+
+
 @router.get("/history", response_model=list[HistoryEntry])
 async def get_history(
     days: int = 28,

@@ -31,6 +31,13 @@ from api.services.session_service import SessionService
 from api.services.coach_service import CoachService
 from api.services.conversation_service import ConversationService
 
+try:
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+    from apscheduler.triggers.cron import CronTrigger
+    _SCHEDULER_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    _SCHEDULER_AVAILABLE = False
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)-8s %(name)s — %(message)s",
@@ -71,9 +78,30 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.conversation_service = ConversationService(llm_client=llm)
 
     logger.info("services initialised: session, coach, conversation")
+
+    # ── Nightly scheduler (02:00 UTC) ─────────────────────────────────────────
+    scheduler = None
+    if _SCHEDULER_AVAILABLE:
+        from jobs.nightly_rebuild import run_nightly_rebuild
+        scheduler = AsyncIOScheduler(timezone="UTC")
+        scheduler.add_job(
+            run_nightly_rebuild,
+            CronTrigger(hour=2, minute=0, timezone="UTC"),
+            id="nightly_rebuild",
+            name="Nightly rebuild + close_day (02:00 UTC)",
+            replace_existing=True,
+        )
+        scheduler.start()
+        logger.info("nightly scheduler started — next run 02:00 UTC")
+    else:
+        logger.warning("apscheduler not installed — nightly rebuild will not run automatically")
+
     yield
 
     # Graceful shutdown
+    if scheduler and scheduler.running:
+        scheduler.shutdown(wait=False)
+        logger.info("nightly scheduler stopped")
     active = app.state.session_service.active_count()
     if active:
         logger.warning("shutdown with %d active sessions still open", active)
