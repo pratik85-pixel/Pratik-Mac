@@ -346,13 +346,12 @@ class TrackingService:
         """
         result = aggregate_background_window(
             user_id      = self._uid,
-            ppi_ms       = ppi_ms,
-            timestamps   = timestamps,
-            window_start = window_start,
-            window_end   = window_end,
+            ppi_ms       = np.array(ppi_ms, dtype=float),
+            ts_start     = window_start,
+            ts_end       = window_end,
             context      = context,
-            acc_mean     = acc_mean,
-            gyro_mean    = gyro_mean,
+            acc_samples  = np.array([acc_mean]) if acc_mean is not None else None,
+            gyro_samples = np.array([gyro_mean]) if gyro_mean is not None else None,
         )
 
         # Persist raw window
