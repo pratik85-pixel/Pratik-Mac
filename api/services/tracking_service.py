@@ -388,13 +388,25 @@ class TrackingService:
 
         bg_windows = await _load_today_background(self._db, self._uid, day_start, day_end)
 
+        # Estimate max-possible areas for intraday contribution normalisation.
+        # Exact values are computed at day-close (when waking_minutes is known);
+        # here we use a conservative 16-hour waking day (960 min).
+        _INTRADAY_WAKING_MIN = 960.0
+        capacity_ceiling = personal.rmssd_ceiling or (morning_rmssd * 1.5)
+        max_suppression = max(
+            0.0, (morning_rmssd - capacity_floor) * _INTRADAY_WAKING_MIN
+        )
+        max_recovery = max(
+            0.0, (capacity_ceiling - morning_rmssd) * (_INTRADAY_WAKING_MIN + 480.0)
+        )
+
         # Detect stress windows
         raw_stress = detect_stress_windows(
             windows              = bg_windows,
             personal_morning_avg = morning_rmssd,
             personal_floor       = capacity_floor,
         )
-        raw_stress = compute_stress_contributions(raw_stress)
+        raw_stress = compute_stress_contributions(raw_stress, max_suppression)
 
         # Detect recovery windows
         zenflow_intervals: list[tuple[datetime, datetime, str]] = []
@@ -403,7 +415,7 @@ class TrackingService:
             personal_morning_avg = morning_rmssd,
             zenflow_session_intervals = zenflow_intervals,
         )
-        raw_recovery = compute_recovery_contributions(raw_recovery)
+        raw_recovery = compute_recovery_contributions(raw_recovery, max_recovery)
 
         # Delete old windows for today and re-insert
         existing_s = await _load_existing_stress_windows(self._db, self._uid, day_start, day_end)
