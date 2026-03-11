@@ -1,6 +1,6 @@
 # ZenFlow Verity — Build Status Tracker
 
-Last updated: 2026-03-11  
+Last updated: 2026-03-11 — Phase 1 COMPLETE ✅ 
 Scope: Everything in DESIGN_V2 **except** Apple Health / HealthKit ingestion  
 Rule: Fix Phase 1 blockers before touching any later phase. Scores must appear on HomeScreen before anything else is testable.
 
@@ -14,13 +14,15 @@ These three gaps mean the HomeScreen shows blank / 404 forever, no matter how mu
 
 | # | Task | File(s) | Status |
 |---|------|---------|--------|
-| 1.1 | Add Day-1 population-average seed: if `PersonalModel` row is null, create one with safe defaults (`rmssd_floor=35`, `rmssd_ceiling=80`, `rmssd_morning_avg=55`, etc.) before `_recompute_day_windows()` returns early | `api/services/tracking_service.py` → `_recompute_day_windows()` or `model/baseline_builder.py` | ❌ |
-| 1.2 | Build wear-data → PersonalModel pipeline: aggregate `BackgroundWindow` rows into RMSSD distribution, call `BaselineBuilder.build()`, upsert `PersonalModel` row | `api/services/tracking_service.py` new fn `_maybe_update_personal_model_from_windows()`, called from `ingest_background_window()` | ❌ |
-| 1.3 | Expose `POST /tracking/close-day` endpoint + wire it to sleep-boundary trigger in `wake_detector.py` | `api/routers/tracking.py`, `api/services/tracking_service.py` (fn exists at line 306 — just needs endpoint + trigger) | ❌ |
-| 1.4 | Wire `close_day()` into nightly rebuild job so it runs at 02:00 for all active users | `jobs/nightly_rebuild.py` | ❌ |
-| 1.5 | Register APScheduler in `api/main.py` lifespan to call `run_nightly_rebuild` at 02:00 | `api/main.py` | ❌ |
+| 1.1 | Add Day-1 population-average seed: if `PersonalModel` row is null, create one with safe defaults (`rmssd_floor=35`, `rmssd_ceiling=80`, `rmssd_morning_avg=55`, etc.) before `_recompute_day_windows()` returns early | `api/services/tracking_service.py` → `_recompute_day_windows()` or `model/baseline_builder.py` | ✅ |
+| 1.2 | Build wear-data → PersonalModel pipeline: aggregate `BackgroundWindow` rows into RMSSD distribution, call `BaselineBuilder.build()`, upsert `PersonalModel` row | `api/services/tracking_service.py` new fn `_maybe_update_personal_model_from_windows()`, called from `ingest_background_window()` | ✅ |
+| 1.3 | Expose `POST /tracking/close-day` endpoint + wire it to sleep-boundary trigger in `wake_detector.py` | `api/routers/tracking.py`, `api/services/tracking_service.py` (fn exists at line 306 — just needs endpoint + trigger) | ✅ |
+| 1.4 | Wire `close_day()` into nightly rebuild job so it runs at 02:00 for all active users | `jobs/nightly_rebuild.py` | ✅ |
+| 1.5 | Register APScheduler in `api/main.py` lifespan to call `run_nightly_rebuild` at 02:00 | `api/main.py` | ✅ |
+| 1.6 | **BONUS FIX** — `ingest_background_window()` was calling `aggregate_background_window()` with wrong kwargs (`timestamps`, `window_start`, `acc_mean`). Fixed to `ts_start`, `ts_end`, `acc_samples` numpy arrays | `api/services/tracking_service.py` | ✅ |
+| 1.7 | **BONUS FIX** — `_recompute_day_windows()` was calling `compute_stress_contributions()` and `compute_recovery_contributions()` without required `max_possible_*_area` args. Fixed with intraday estimate (960-min waking day) | `api/services/tracking_service.py` | ✅ |
 
-**Gate:** Deploy + wear band for 30 min → `GET /tracking/daily-summary` returns scores → HomeScreen shows numbers.
+**Gate:** ✅ PASSED — `POST /tracking/ingest` processes 4 windows, `POST /tracking/close-day` returns 200, `GET /tracking/daily-summary` returns 200 with data (not 404). Deployed commit `09d45e5` to Railway.
 
 ---
 
