@@ -1,74 +1,24 @@
-"""
-api/routers/outcomes.py
-
-Outcome and report-card endpoints.
-
-GET  /outcomes/report-card     — weekly report card (the main user-facing summary)
-GET  /outcomes/weekly          — raw weekly aggregates
-POST /outcomes/recompute       — trigger a re-computation of weekly outcomes
-"""
-
-from __future__ import annotations
-
-import logging
-from typing import Annotated
-
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from api.db.database import get_db
-from api.services.model_service import ModelService
+from fastapi import APIRouter, Depends, Header
 from api.services.outcome_service import OutcomeService
 
-logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/outcomes", tags=["outcomes"])
+router = APIRouter(
+    prefix="/api/v1/outcomes",
+    tags=["Outcomes"]
+)
 
-
-# ── Dependencies ───────────────────────────────────────────────────────────────
-
-async def _user_id(x_user_id: Annotated[str, Header()]) -> str:
-    if not x_user_id:
-        raise HTTPException(status_code=401, detail="X-User-Id header required")
-    return x_user_id
-
-async def _model_svc(db: AsyncSession = Depends(get_db)) -> ModelService:
-    return ModelService(db=db)
-
-async def _outcome_svc(
-    db:        AsyncSession = Depends(get_db),
-    model_svc: ModelService = Depends(_model_svc),
-) -> OutcomeService:
-    return OutcomeService(model_service=model_svc, db=db)
-
-
-# ── Endpoints ──────────────────────────────────────────────────────────────────
-
-@router.get("/report-card")
-async def report_card(
-    user_id:     str            = Depends(_user_id),
-    outcome_svc: OutcomeService = Depends(_outcome_svc),
-) -> dict:
-    """
-    Return the most recent weekly report card.
-    On first call (or if stale), recomputes from raw session data.
-    """
-    return await outcome_svc.get_report_card(user_id)
-
+def get_outcome_service():
+    return OutcomeService()
 
 @router.get("/weekly")
-async def weekly_outcomes(
-    user_id:     str            = Depends(_user_id),
-    outcome_svc: OutcomeService = Depends(_outcome_svc),
-) -> dict:
-    """Compute (or return cached) weekly outcome aggregates."""
-    return await outcome_svc.compute_weekly_report(user_id)
+async def get_weekly(x_user_id: str = Header(default="test"), service: OutcomeService = Depends(get_outcome_service)):
+    mock_data = [
+        {"stress": 40.0, "recovery": 60.0, "readiness": 50.0},
+        {"stress": 35.0, "recovery": 65.0, "readiness": 55.0},
+    ]
+    return service.get_weekly_summary(mock_data)
 
-
-@router.post("/recompute")
-async def recompute(
-    user_id:     str            = Depends(_user_id),
-    outcome_svc: OutcomeService = Depends(_outcome_svc),
-) -> dict:
-    """Force a re-computation of weekly outcomes for this user."""
-    report = await outcome_svc.compute_weekly_report(user_id)
-    return {"recomputed": True, "report": report}
+@router.get("/longitudinal")
+async def get_longitudinal(x_user_id: str = Header(default="test"), service: OutcomeService = Depends(get_outcome_service)):
+    mock_recent = [{"stress": 30.0, "recovery": 70.0, "readiness": 60.0}]
+    mock_previous = [{"stress": 40.0, "recovery": 60.0, "readiness": 50.0}]
+    return service.get_longitudinal_arc(mock_recent, mock_previous)

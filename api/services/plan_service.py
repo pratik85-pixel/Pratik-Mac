@@ -296,3 +296,30 @@ class PlanService:
             "prescriber_notes": row.prescriber_notes or [],
             "adherence_pct":    row.adherence_pct,
         }
+
+    async def confirm_plan_item(self, user_id: str, tag: str) -> bool:
+        """
+        Runs IntradayMatcher using the confirmed tag.
+        Updates the daily plan's items_json if an item matches.
+        """
+        from datetime import date, datetime, UTC
+        from api.utils import parse_uuid
+        from tagging.intraday_matcher import IntradayMatcher
+        from sqlalchemy.orm.attributes import flag_modified
+        
+        uid = parse_uuid(user_id)
+        if not uid: return False
+        today = date.today()
+        today_dt = datetime(today.year, today.month, today.day, tzinfo=UTC)
+        plan_row = await self._load_today_row(uid, today_dt)
+        if not plan_row or not plan_row.items_json:
+            return False
+            
+        matcher = IntradayMatcher()
+        matched = matcher.match(plan_row.items_json, tag)
+        if matched:
+            flag_modified(plan_row, "items_json")
+            await self._db.commit()
+            return True
+        return False
+

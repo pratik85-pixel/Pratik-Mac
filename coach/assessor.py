@@ -549,3 +549,16 @@ def _build_summary_note(
         parts.append("Advancement suppressed by conversation signal.")
 
     return " ".join(parts)
+
+def assess_daily_adherence(plan_items: list, llm_client=None) -> list:
+    for item in plan_items:
+        if item.get("has_evidence"):
+            item["adherence_score"] = 1.0
+        elif item.get("deviation_reason"):
+            item["adherence_score"] = 0.0
+        else:
+            if llm_client and hasattr(llm_client, "estimate_adherence"):
+                item["adherence_score"] = float(llm_client.estimate_adherence(item))
+            else:
+                item["adherence_score"] = 0.0
+    return plan_items

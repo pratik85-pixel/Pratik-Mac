@@ -28,6 +28,12 @@
 			"command": "pkill -f 'uvicorn api.main' 2>/dev/null; sleep 1; cd /Users/pratikbarman/Desktop/ZenFlow_Verity && .venv/bin/uvicorn api.main:app --host 127.0.0.1 --port 8000 --reload",
 			"isBackground": true,
 			"problemMatcher": []
+		},
+		{
+			"label": "EAS Build Android v13-fix",
+			"type": "shell",
+			"command": "export PATH=\"$HOME/.npm-global/bin:$PATH\" EXPO_TOKEN=\"NkUqALgfgbtl9bqLG8UW8OlhSn7QSW2MLHs_6Tyn\" && cd /Users/pratikbarman/Desktop/ZenFlowVerity && eas build --platform android --profile preview --non-interactive",
+			"isBackground": false
 		}
 	]
 }

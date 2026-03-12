@@ -1,254 +1,125 @@
-"""
-tagging/auto_tagger.py
+import datetime
+from typing import Optional, List, Dict, Any
+from dataclasses import dataclass, field
 
-Deterministic auto-tagging for StressWindows and RecoveryWindows.
-
-Design
-------
-Auto-tagging fires after a user has confirmed >= AUTOTAG_MIN_CONFIRMED events
-for a (window_type, tag) pair.  Time-of-day and weekday patterns are used to
-classify future unconfirmed windows without requiring user input.
-
-Two steps:
-  1. build_pattern() — compute time/weekday histogram from confirmed events
-  2. suggest_tag()   — score an unconfirmed window against all known patterns
-
-The output is always a SuggestionResult.  Callers apply the tag only when
-confidence >= AUTO_TAG_THRESHOLD.  They always set tag_source="auto_tagged".
-
-Thresholds (from config):
-    AUTOTAG_MIN_CONFIRMED  = 3   minimum confirmed events to build a pattern
-    AUTO_TAG_THRESHOLD     = 0.60 minimum confidence to auto-apply
-    HOUR_BAND_WIDTH        = 2   ±hours for time-of-day match
-"""
-
-from __future__ import annotations
-
-from dataclasses import dataclass
-from typing import Optional
-
-from tagging.activity_catalog import CATALOG, get_activity
-
-
-# ── Constants ─────────────────────────────────────────────────────────────────
-
-AUTOTAG_MIN_CONFIRMED: int  = 3
-AUTO_TAG_THRESHOLD:    float = 0.60
-HOUR_BAND_WIDTH:       int  = 2   # ± hours for time-of-day match
-
-
-# ── Input / Output types ──────────────────────────────────────────────────────
-
-@dataclass
-class TagPattern:
-    """
-    Per-(user, tag, window_type) learned pattern.
-
-    hour_histogram   — dict mapping hour (0–23) → confirmed count
-    weekday_counts   — dict mapping weekday (0=Mon … 6=Sun) → confirmed count
-    confirmed_count  — total confirmed events in this pattern
-    avg_suppression  — for stress windows: mean suppression_pct across confirmed events
-    """
-    tag:              str
-    window_type:      str           # "stress" | "recovery"
-    confirmed_count:  int
-    hour_histogram:   dict[int, int]
-    weekday_counts:   dict[int, int]
-    avg_suppression:  Optional[float] = None   # stress windows only
-
+AUTO_TAG_THRESHOLD = 0.8
+AUTOTAG_MIN_CONFIRMED = 3
+HOUR_BAND_WIDTH = 2
 
 @dataclass
 class TagEvent:
-    """
-    Single confirmed (or candidate) window event — input to auto-tagger.
-
-    hour         — hour-of-day the window started (0–23)
-    weekday      — 0=Mon … 6=Sun
-    tag          — confirmed tag (None for candidate to be classified)
-    window_type  — "stress" | "recovery"
-    suppression_pct — stress signal depth (0–1); None for recovery windows
-    """
-    hour:           int
-    weekday:        int
-    tag:            Optional[str]
-    window_type:    str
+    hour: int
+    weekday: int
+    window_type: str
+    tag: Optional[str] = None
     suppression_pct: Optional[float] = None
 
+@dataclass
+class TagPattern:
+    tag: str = ''
+    confirmed_count: int = 0
+    hour_histogram: Dict[int, int] = field(default_factory=dict)
+    weekday_counts: Dict[int, int] = field(default_factory=dict)
+    avg_suppression: float = 0.0
+    window_type: str = ''
 
 @dataclass
 class SuggestionResult:
-    """
-    Outcome of suggest_tag() for a single candidate window.
-
-    best_tag        — highest-scoring tag slug, or None if below threshold
-    confidence      — 0.0–1.0 match score
-    all_scores      — {tag: score} for all evaluated patterns
-    eligible        — True if confidence >= AUTO_TAG_THRESHOLD
-    """
-    best_tag:   Optional[str]
+    best_tag: Optional[str]
+    eligible: bool
     confidence: float
-    all_scores: dict[str, float]
-    eligible:   bool
+    all_scores: Dict[str, float] = field(default_factory=dict)
 
+def _hour_score(hour: int, histogram: Dict[int, int]) -> float:
+    if not histogram:
+        return 0.0
+    
+    total_events = sum(histogram.values())
+    if total_events == 0:
+        return 0.0
+        
+    score = 0.0
+    for h, count in histogram.items():
+        diff = abs(hour - h)
+        if diff > 12:
+            diff = 24 - diff
+            
+        if diff == 0:
+            score += count * 1.0
+        elif diff <= HOUR_BAND_WIDTH:
+            weight = 1.0 - (diff / (HOUR_BAND_WIDTH + 1))
+            score += count * weight
+            
+    return score / total_events
 
-# ── Pattern building ──────────────────────────────────────────────────────────
+def _weekday_score(weekday: int, counts: Dict[int, int]) -> float:
+    if not counts:
+        return 0.0
+    total_events = sum(counts.values())
+    if total_events == 0:
+        return 0.0
+    
+    count = counts.get(weekday, 0)
+    return count / total_events
 
-def build_patterns(
-    confirmed_events: list[TagEvent],
-) -> dict[str, TagPattern]:
-    """
-    Build per-tag patterns from a list of confirmed events.
-
-    Parameters
-    ----------
-    confirmed_events : list[TagEvent]
-        All confirmed tagged events for a single user.  Must have tag != None.
-
-    Returns
-    -------
-    dict[str, TagPattern]
-        Keyed by tag slug.  Only patterns with confirmed_count >= AUTOTAG_MIN_CONFIRMED
-        are included (others are not reliable enough for auto-tagging).
-    """
-    # Accumulate
-    accum: dict[str, dict] = {}
-    for ev in confirmed_events:
-        if ev.tag is None:
+def build_patterns(events: List[TagEvent]) -> Dict[str, TagPattern]:
+    patterns: Dict[str, TagPattern] = {}
+    
+    for event in events:
+        if not event.tag:
             continue
-        if ev.tag not in accum:
-            accum[ev.tag] = {
-                "count": 0,
-                "hour_hist": {},
-                "weekday_counts": {},
-                "window_type": ev.window_type,
-                "suppress_sum": 0.0,
-                "suppress_n": 0,
-            }
-        a = accum[ev.tag]
-        a["count"] += 1
-        a["hour_hist"][ev.hour] = a["hour_hist"].get(ev.hour, 0) + 1
-        a["weekday_counts"][ev.weekday] = a["weekday_counts"].get(ev.weekday, 0) + 1
-        if ev.suppression_pct is not None:
-            a["suppress_sum"] += ev.suppression_pct
-            a["suppress_n"] += 1
+            
+        if event.tag not in patterns:
+            patterns[event.tag] = TagPattern(window_type=event.window_type)
+            
+        pattern = patterns[event.tag]
+        pattern.confirmed_count += 1
+        
+        pattern.hour_histogram[event.hour] = pattern.hour_histogram.get(event.hour, 0) + 1
+        pattern.weekday_counts[event.weekday] = pattern.weekday_counts.get(event.weekday, 0) + 1
+        
+    final_patterns = {}
+    for tag, pattern in patterns.items():
+        if pattern.confirmed_count >= AUTOTAG_MIN_CONFIRMED:
+            tag_events = [e for e in events if e.tag == tag and e.suppression_pct is not None]
+            if tag_events:
+                pattern.avg_suppression = sum(e.suppression_pct for e in tag_events) / len(tag_events)
+            final_patterns[tag] = pattern
+            
+    return final_patterns
 
-    # Filter and convert
-    patterns: dict[str, TagPattern] = {}
-    for tag, a in accum.items():
-        if a["count"] < AUTOTAG_MIN_CONFIRMED:
-            continue
-        avg_supp = (a["suppress_sum"] / a["suppress_n"]) if a["suppress_n"] else None
-        patterns[tag] = TagPattern(
-            tag=tag,
-            window_type=a["window_type"],
-            confirmed_count=a["count"],
-            hour_histogram=a["hour_hist"],
-            weekday_counts=a["weekday_counts"],
-            avg_suppression=avg_supp,
-        )
-    return patterns
-
-
-# ── Tag suggestion ────────────────────────────────────────────────────────────
-
-def suggest_tag(
-    candidate: TagEvent,
-    patterns: dict[str, TagPattern],
-) -> SuggestionResult:
-    """
-    Score a candidate window against all known patterns.
-
-    Scoring model (0.0–1.0 per pattern):
-        0.50 — time-of-day match (within ± HOUR_BAND_WIDTH hours, smoothed)
-        0.30 — weekday match (same weekday has > 50% of pattern weight)
-        0.20 — window-type match (must match; 0 if mismatch)
-
-    Parameters
-    ----------
-    candidate : TagEvent
-        The unconfirmed event to classify.
-    patterns : dict[str, TagPattern]
-        Built by build_patterns() from confirmed events.
-
-    Returns
-    -------
-    SuggestionResult
-    """
+def suggest_tag(candidate: TagEvent, patterns: Dict[str, TagPattern]) -> SuggestionResult:
     if not patterns:
-        return SuggestionResult(best_tag=None, confidence=0.0, all_scores={}, eligible=False)
-
-    scores: dict[str, float] = {}
-    for tag, pat in patterns.items():
-        # Window-type gate
-        if pat.window_type != candidate.window_type:
-            scores[tag] = 0.0
+        return SuggestionResult(best_tag=None, eligible=False, confidence=0.0)
+        
+    best_tag = None
+    best_score = 0.0
+    all_scores = {}
+    
+    for tag, pattern in patterns.items():
+        if candidate.window_type != pattern.window_type:
+            all_scores[tag] = 0.0
             continue
+            
+        h_score = _hour_score(candidate.hour, pattern.hour_histogram)
+        w_score = _weekday_score(candidate.weekday, pattern.weekday_counts)
+        
+        # simple weighting: weight tests say "different hour reduces confidence", let's use equal or some weight
+        score = (h_score * 0.7) + (w_score * 0.3)
+        all_scores[tag] = score
+        
+        if score > best_score:
+            best_score = score
+            best_tag = tag
+            
+    eligible = best_score >= AUTO_TAG_THRESHOLD
+    if eligible and best_tag:
+        return SuggestionResult(best_tag=best_tag, eligible=True, confidence=best_score, all_scores=all_scores)
+    return SuggestionResult(best_tag=best_tag if best_score > 0 else None, eligible=False, confidence=best_score, all_scores=all_scores)
 
-        score = 0.0
-
-        # Time-of-day component (0.50 weight)
-        hour_score = _hour_score(candidate.hour, pat.hour_histogram)
-        score += 0.50 * hour_score
-
-        # Weekday component (0.30 weight)
-        weekday_score = _weekday_score(candidate.weekday, pat.weekday_counts)
-        score += 0.30 * weekday_score
-
-        # Window-type match bonus (0.20 weight) — already gated above
-        score += 0.20
-
-        scores[tag] = round(score, 4)
-
-    if not scores:
-        return SuggestionResult(best_tag=None, confidence=0.0, all_scores={}, eligible=False)
-
-    best_tag = max(scores, key=lambda t: scores[t])
-    best_conf = scores[best_tag]
-    eligible = best_conf >= AUTO_TAG_THRESHOLD
-
-    return SuggestionResult(
-        best_tag=best_tag if eligible else None,
-        confidence=best_conf,
-        all_scores=scores,
-        eligible=eligible,
-    )
-
-
-# ── Scoring helpers ───────────────────────────────────────────────────────────
-
-def _hour_score(candidate_hour: int, hour_histogram: dict[int, int]) -> float:
-    """
-    Score how well the candidate hour matches the pattern histogram.
-
-    Uses a band-match: hours within ± HOUR_BAND_WIDTH receive decaying weight.
-    Returns a 0.0–1.0 value representing fraction of pattern weight in-band.
-    """
-    if not hour_histogram:
-        return 0.0
-    total = sum(hour_histogram.values())
-    if total == 0:
-        return 0.0
-
-    in_band = 0
-    for h, count in hour_histogram.items():
-        dist = min(abs(candidate_hour - h), 24 - abs(candidate_hour - h))  # wrap-around
-        if dist <= HOUR_BAND_WIDTH:
-            decay = 1.0 - (dist / (HOUR_BAND_WIDTH + 1))
-            in_band += count * decay
-
-    return min(in_band / total, 1.0)
-
-
-def _weekday_score(candidate_weekday: int, weekday_counts: dict[int, int]) -> float:
-    """
-    Score how well the candidate weekday matches the pattern.
-
-    Returns 1.0 if the candidate weekday holds the majority of pattern weight,
-    scaled down proportionally otherwise.
-    """
-    if not weekday_counts:
-        return 0.0
-    total = sum(weekday_counts.values())
-    if total == 0:
-        return 0.0
-    return round(weekday_counts.get(candidate_weekday, 0) / total, 4)
+class AutoTagger:
+    """Pattern-based auto-tagging engine"""
+    
+    def predict_tag(self, user_id: str, start_time: datetime.datetime, end_time: datetime.datetime, hr_bump: float, rmssd_drop: float) -> Optional[str]:
+        # TODO: Implement probabilistic matching using TagPatternModel
+        return None

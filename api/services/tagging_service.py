@@ -32,7 +32,7 @@ from api.db.schema import (
 from api.utils import parse_uuid
 from tagging.tag_pattern_model import UserTagPatternModel
 from tagging.tagging_service import (
-    AutoTagPass,
+    AutoTagPassResult as AutoTagPass,
     PatternModelBuildResult,
     TagResult,
     WindowRef,
@@ -218,6 +218,17 @@ class TaggingService:
             "tag_window user=%s window=%s type=%s slug=%s ok=%s",
             user_id, window_id, window_type, slug, tag_result.success,
         )
+
+        # Ensure we commit the row tag update before calling plan service
+        await self._db.commit()
+        # Wire intraday plan adherence
+        try:
+            from api.services.plan_service import PlanService
+            plan_svc = PlanService(self._db, None)
+            await plan_svc.confirm_plan_item(user_id, slug)
+        except Exception:
+            pass 
+
         return tag_result
 
     # ── Auto-tag pass ──────────────────────────────────────────────────────────

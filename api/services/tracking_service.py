@@ -555,6 +555,22 @@ class TrackingService:
         await self._db.commit()
         logger.info("Closed day %s for user %s: readiness=%.0f day_type=%s",
                     target_date, self._uid, result.readiness_score or 0, result.day_type)
+
+        # Wire evening assessor 
+        try:
+            from api.services.plan_service import PlanService
+            from coach.assessor import assess_daily_adherence
+            from sqlalchemy.orm.attributes import flag_modified
+            plan_svc = PlanService(self._db, None)
+            today_dt = datetime(target_date.year, target_date.month, target_date.day, tzinfo=UTC)
+            plan_row = await plan_svc._load_today_row(self._uid, today_dt)
+            if plan_row and plan_row.items_json:
+                plan_row.items_json = assess_daily_adherence(plan_row.items_json)
+                flag_modified(plan_row, "items_json")
+                await self._db.commit()
+        except Exception as e:
+            logger.warning("Failed evening plan assessment: %s", e)
+
         return result
 
     # ── Tag update ─────────────────────────────────────────────────────────────

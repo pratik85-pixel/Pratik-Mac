@@ -1,9 +1,183 @@
 # ZenFlow Verity — Project Context
 
-**Created:** 4 March 2026  
-**Hardware:** Polar Verity Sense (optical armband)  
-**Status:** Pre-development — band ordered, arriving in ~2 days  
+**Last updated:** 11 March 2026
+**Hardware:** Polar Verity Sense (optical armband)
+**Status:** DEPLOYED & WORKING — API live on Railway, Android APK installed on test phone
 **Parent project:** ZenFlow_project (H10 chest strap, running and stable — do not touch)
+
+---
+
+## Current System State (11 March 2026)
+
+### What is working right now
+- Railway API: `https://api-production-8195d.up.railway.app` — LIVE and healthy
+- Railway Postgres: provisioned and connected (`postgres-ciqd.railway.internal:5432`)
+- All 3 Alembic migrations applied: initial schema, psychological profile tables, unified user profile + user facts tables
+- Android APK v5 installed on test phone (device: `JJCE6H4XJNXS6L8D`, package: `com.zenflow.verity`)
+- Onboarding → home screen flow working end-to-end
+
+### Key credentials
+| Item | Value |
+|---|---|
+| Railway API URL | `https://api-production-8195d.up.railway.app` |
+| Railway project ID | `52409a46-4797-4027-b17a-e25cfb8fd62c` |
+| Postgres internal URL | `postgresql://postgres:VaebpXWINRSXJrVlakRrqSBDeehOeEEh@postgres-ciqd.railway.internal:5432/railway` |
+| Postgres service name | `postgres-ciqd` (NEW — replaced crashed original) |
+| EAS project | `@pratik85/zenflow-verity` (ID: `bab74a16-9052-43bd-9c2a-cc33fc667a02`) |
+| EAS token | `NkUqALgfgbtl9bqLG8UW8OlhSn7QSW2MLHs_6Tyn` |
+| Last APK build ID | `ee67c4cf-1388-4dcd-a3de-4a326a125b66` |
+| Last APK artifact | `https://expo.dev/artifacts/eas/vrtQo2HhVUpJzFYH4J79cq.apk` |
+| Test phone adb ID | `JJCE6H4XJNXS6L8D` |
+| adb path | `/Users/pratikbarman/Library/Android/sdk/platform-tools/adb` |
+
+---
+
+## Repository Structure
+
+**Two separate repos:**
+
+### `/Users/pratikbarman/Desktop/ZenFlow_Verity` — FastAPI backend
+- `api/config.py` — Pydantic settings; `DATABASE_URL`/`DATABASE_SYNC_URL` validators strip `postgresql://` → asyncpg/psycopg2 prefixes
+- `api/main.py` — FastAPI entrypoint
+- `api/routers/` — route handlers (tracking, coach, profile, etc.)
+- `api/services/` — business logic
+- `api/db/` — SQLAlchemy async engine
+- `alembic/` — 3 migrations applied
+- `Dockerfile`, `railway.toml`, `start.sh` (runs `alembic upgrade head` then `uvicorn`), `requirements.txt`
+- `processing/`, `model/`, `archetypes/`, `coach/`, `outcomes/`, `tracking/`, `sessions/`, `psych/`, `profile/`, `tagging/`, `jobs/`, `scripts/`
+
+### `/Users/pratikbarman/Desktop/ZenFlowVerity` — React Native / Expo frontend
+- `App.tsx` — bootstrap: saves API base, calls `initClient` (**must** be awaited), loads `userId`
+- `src/api/client.ts` — axios instance; `initClient()`, `setUserId()`, `getClient()`
+- `src/api/endpoints.ts` — all API call functions (`getToday`, `updateHabits`, `rebuildProfile`, etc.)
+- `src/screens/HomeScreen.tsx` — calls `getToday()` on focus; shows error state if API fails
+- `src/screens/onboarding/Step8Name.tsx` — final onboarding step: generates UUID, calls `saveUser`, navigates to Main
+- `src/store/auth.ts` — AsyncStorage wrappers: `saveUser`, `getUser`, `saveApiBase`, `getApiBase`
+- `src/navigation/` — `AppNavigator`, `OnboardingNavigator`
+- `src/components/` — `ScreenWrapper`, `ScoreCard`, `DayTypeBadge`, `EmptyState`, etc.
+- `eas.json` — preview profile: `buildType=apk`, `EXPO_PUBLIC_API_URL=https://api-production-8195d.up.railway.app`
+
+---
+
+## Git History
+
+### ZenFlowVerity (frontend)
+```
+f7b0e892  fix: treat 404 as empty state, not server error on HomeScreen  ← LATEST
+978dbeea  fix: remove hardcoded local API URL from onboarding that overwrote Railway URL
+f770359b  fix: await initClient on startup + fix stale WiFi error message
+1d84be89  fix: add splash image + adaptive icon foreground to fix Gradle build
+1be05c56  fix: add .gitignore, remove node_modules from tracking
+9aec5a52  Initial commit
+```
+
+### ZenFlow_Verity (backend)
+```
+879878c  start.sh: migrations + uvicorn, fix Dockerfile CMD  ← LATEST
+dc9f4d2  Remove Procfile startCommand override, simplify railway.toml
+b87cf23  Minimal Dockerfile: direct uvicorn, skip migrations
+98505e2  Make migrations non-fatal so uvicorn starts regardless
+```
+
+---
+
+## Key Architecture & Gotchas
+
+### API client bootstrap (`App.tsx`)
+```tsx
+const DEV_API_BASE = process.env.EXPO_PUBLIC_API_URL ?? 'http://127.0.0.1:8000';
+await saveApiBase(DEV_API_BASE);   // persists to AsyncStorage
+await initClient(DEV_API_BASE);    // builds axios instance — MUST be awaited
+```
+`EXPO_PUBLIC_API_URL` is baked in at EAS build time from `eas.json preview.env`.
+
+### User ID flow
+- `uuidv4()` generated in `Step8Name.tsx` at end of onboarding
+- Stored in AsyncStorage under key `user_id`
+- Loaded in `App.tsx` bootstrap → `setUserId(stored.userId)`
+- Injected as `X-User-Id` header on every request via axios interceptor
+- All `/tracking/*` endpoints require a valid UUID in `X-User-Id` — returns `422` if missing/invalid
+
+### Root cause of "Can't reach server" (FIXED — commit `978dbeea`)
+`Step8Name.tsx` had three lines that ran at the end of onboarding:
+```ts
+const apiBase = 'http://192.168.1.33:8000';  // hardcoded old laptop IP
+initClient(apiBase);       // overwrote Railway URL in memory
+await saveApiBase(apiBase); // persisted dead URL to AsyncStorage permanently
+```
+Every user who completed onboarding was stuck pointing at a dead local IP.
+**Fix:** removed all three lines. `App.tsx` already initialised the client with the Railway URL before onboarding started.
+
+### `api/config.py` DATABASE_URL validators
+- `_fix_async_url`: `postgresql://` → `postgresql+asyncpg://` (used by SQLAlchemy async engine)
+- `_fix_sync_url`: `postgresql://` → `postgresql+psycopg2://` (used only by Alembic migrations)
+- asyncpg ignores `?sslmode=require` in URL — do not add it. Internal Railway networking doesn't need SSL.
+
+### Railway Postgres history
+- Original Postgres crashed in a loop ("Stopping Container" immediately after "ready to accept connections")
+- `railway redeploy` did not fix it — likely corrupted volume
+- **Solution:** deleted via Railway dashboard, provisioned new service (`postgres-ciqd`)
+- Set both `DATABASE_URL` and `DATABASE_SYNC_URL` on the `api` service to the new internal URL
+- 3 migrations ran cleanly
+
+---
+
+## Issue History (all resolved)
+
+| # | Symptom | Root cause | Fix |
+|---|---|---|---|
+| 1 | EAS build ERRORED | node_modules committed to git | Added `.gitignore`, removed from tracking |
+| 2 | EAS build ERRORED | Missing `splashscreen_logo` drawable | Added `splash.image` + `adaptiveIcon.foregroundImage` to `app.json` |
+| 3 | App "can't reach server" | `initClient` not awaited in `App.tsx` | Added `await` |
+| 4 | asyncpg `TimeoutError` / Postgres crash loop | Corrupted Railway Postgres volume | Deleted, provisioned new `postgres-ciqd` service |
+| 5 | App "can't reach server" after onboarding | `Step8Name.tsx` hardcoded local IP, overwrote Railway URL | Removed 3 lines from `Step8Name.tsx` |
+| 6 | App shows "Can't reach server" on home screen for new users | `/tracking/daily-summary` returns 404 when no sessions exist; axios throws on non-2xx → `HomeScreen` treated it as network error | Check `e.response.status === 404` in `load()`, set `noData=true` instead of `error=true`; show "Nothing here yet" empty state |
+
+---
+
+## Useful Commands
+
+```bash
+# Check API health
+curl https://api-production-8195d.up.railway.app/health
+
+# Test DB-dependent endpoint (replace UUID with a real one from the app)
+curl https://api-production-8195d.up.railway.app/tracking/daily-summary \
+  -H "x-user-id: 00000000-0000-0000-0000-000000000001"
+
+# Railway
+cd /Users/pratikbarman/Desktop/ZenFlow_Verity
+railway logs --service api
+railway logs --service Postgres
+railway variables --service api
+railway redeploy --service api --yes
+
+# Build new APK
+export PATH="$HOME/.npm-global/bin:$PATH" EXPO_TOKEN="NkUqALgfgbtl9bqLG8UW8OlhSn7QSW2MLHs_6Tyn"
+cd /Users/pratikbarman/Desktop/ZenFlowVerity
+eas build --platform android --profile preview --non-interactive
+
+# Install APK to phone
+/Users/pratikbarman/Library/Android/sdk/platform-tools/adb install -r ~/Downloads/ZenFlow-vX.apk
+```
+
+---
+
+## What to Work on Next
+
+App and API are live and working. Next priorities are the actual HRV/physiology features:
+
+1. **Polar BLE SDK integration** — stream PPI + PPG raw from Verity Sense into the app
+2. **Processing pipeline** — PPI → RMSSD, RSA coherence scoring (Verity no-accel architecture)
+3. **Session engine** — guided breathing with real-time coherence feedback (visual ring)
+4. **Background HRV monitoring** — passive stress arc tracking, nudge triggers
+5. **Baseline week** — 7-day onboarding measurement protocol
+
+**Do not start algorithm work until real PPI signal quality is validated from the band.**
+
+---
+
+## Original Context (pre-development)
 
 ---
 
