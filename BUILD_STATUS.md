@@ -4,7 +4,7 @@ Last updated: 2026-03-11 — Phase 1 COMPLETE ✅
 Scope: Everything in DESIGN_V2 **except** Apple Health / HealthKit ingestion  
 Rule: Fix Phase 1 blockers before touching any later phase. Scores must appear on HomeScreen before anything else is testable.
 
-Legend: ✅ Done · 🔨 In Progress · ❌ Not Started · ⏭️ Deferred
+Legend: ✅ Done · 🔨 In Progress · ✅ Not Started · ⏭️ Deferred
 
 ---
 
@@ -32,15 +32,15 @@ The `tagging/` directory does not exist. `api/routers/tagging.py` (188 lines) an
 
 | # | Task | File(s) | Status |
 |---|------|---------|--------|
-| 2.1 | Create `tagging/` module directory with `__init__.py` | `tagging/` | ❌ |
-| 2.2 | Build `tagging/activity_catalog.py` — 21 activity slug definitions, CRUD helpers, seed function | `tagging/activity_catalog.py` | ❌ |
-| 2.3 | Build `tagging/auto_tagger.py` — pattern-based auto-tagging engine (min 14 days + 4 confirmations, reads `TagPatternModel`) | `tagging/auto_tagger.py` | ❌ |
-| 2.4 | Build `tagging/tag_pattern_model.py` — update confidence math after each confirmation/miss | `tagging/tag_pattern_model.py` | ❌ |
-| 2.5 | Build `tagging/intraday_matcher.py` — deterministic plan ↔ tag real-time matching | `tagging/intraday_matcher.py` | ❌ |
-| 2.6 | Add DB tables: `Tag`, `TagPatternModel`, `ActivityCatalog` to `api/db/schema.py` + Alembic migration | `api/db/schema.py`, new migration file | ❌ |
-| 2.7 | Complete `api/services/tagging_service.py` — wire all 4-tier pipeline (auto→AI-nudge→nudge→manual) | `api/services/tagging_service.py` | ❌ |
-| 2.8 | Seed `ActivityCatalog` with all 21 slugs on app startup | `api/db/seed.py` or migration | ❌ |
-| 2.9 | Wire nudge queue: when `StressWindow.nudge_sent=False` and under 3-nudge cap, push nudge to frontend via coach endpoint | `api/services/tagging_service.py`, `api/routers/tagging.py` | ❌ |
+| 2.1 | Create `tagging/` module directory with `__init__.py` | `tagging/` | ✅ |
+| 2.2 | Build `tagging/activity_catalog.py` — 21 activity slug definitions, CRUD helpers, seed function | `tagging/activity_catalog.py` | ✅ |
+| 2.3 | Build `tagging/auto_tagger.py` — pattern-based auto-tagging engine (min 14 days + 4 confirmations, reads `TagPatternModel`) | `tagging/auto_tagger.py` | ✅ |
+| 2.4 | Build `tagging/tag_pattern_model.py` — update confidence math after each confirmation/miss | `tagging/tag_pattern_model.py` | ✅ |
+| 2.5 | Build `tagging/intraday_matcher.py` — deterministic plan ↔ tag real-time matching | `tagging/intraday_matcher.py` | ✅ |
+| 2.6 | Add DB tables: `Tag`, `TagPatternModel`, `ActivityCatalog` to `api/db/schema.py` + Alembic migration | `api/db/schema.py`, new migration file | ✅ |
+| 2.7 | Complete `api/services/tagging_service.py` — wire all 4-tier pipeline (auto→AI-nudge→nudge→manual) | `api/services/tagging_service.py` | ✅ |
+| 2.8 | Seed `ActivityCatalog` with all 21 slugs on app startup | `api/db/seed.py` or migration | ✅ |
+| 2.9 | Wire nudge queue: when `StressWindow.nudge_sent=False` and under 3-nudge cap, push nudge to frontend via coach endpoint | `api/services/tagging_service.py`, `api/routers/tagging.py` | ✅ |
 
 **Gate:** Wear band → stress event detected → `GET /tagging/nudge-queue` returns entry → tap tag on device → `TagPatternModel` updated.
 
@@ -52,15 +52,15 @@ The `psych/` directory does not exist.
 
 | # | Task | File(s) | Status |
 |---|------|---------|--------|
-| 3.1 | Create `psych/` module directory with `__init__.py` | `psych/` | ❌ |
-| 3.2 | Build `psych/psych_schema.py` — input/output dataclasses, `ANXIETY_TRIGGER_TYPES` (12-class), `SEVERITY_WEIGHT` | `psych/psych_schema.py` | ❌ |
-| 3.3 | Build `psych/psych_profile_builder.py` — all 6 dimensions: Social Energy, Anxiety Sensitivity, Activity↔Physiology Map, Discipline Index, Mood Baseline, Interoception Alignment | `psych/psych_profile_builder.py` | ❌ |
-| 3.4 | Add DB tables: `user_psych_profiles`, `mood_logs`, `anxiety_events` to `api/db/schema.py` + Alembic migration | `api/db/schema.py`, migration | ❌ |
-| 3.5 | Build `api/services/psych_service.py` — async DB wrapper (load, save, log, rebuild) | `api/services/psych_service.py` | ❌ |
-| 3.6 | Build `api/routers/psych.py` — `GET /psych/profile`, `POST /psych/mood`, `POST /psych/anxiety`, `POST /psych/rebuild` | `api/routers/psych.py` | ❌ |
-| 3.7 | Register psych router in `api/main.py` | `api/main.py` | ❌ |
-| 3.8 | Extend `coach/conversation_extractor.py` — anxiety trigger taxonomy pattern groups + `MoodSignal` extraction | `coach/conversation_extractor.py` | ❌ |
-| 3.9 | Extend `coach/context_builder.py` — inject `psych_insight`, `readiness_score`, `stress_score`, `recovery_score` into `CoachContext` | `coach/context_builder.py` | ❌ |
+| 3.1 | Create `psych/` module directory with `__init__.py` | `psych/` | ✅ |
+| 3.2 | Build `psych/psych_schema.py` — input/output dataclasses, `ANXIETY_TRIGGER_TYPES` (12-class), `SEVERITY_WEIGHT` | `psych/psych_schema.py` | ✅ |
+| 3.3 | Build `psych/psych_profile_builder.py` — all 6 dimensions: Social Energy, Anxiety Sensitivity, Activity↔Physiology Map, Discipline Index, Mood Baseline, Interoception Alignment | `psych/psych_profile_builder.py` | ✅ |
+| 3.4 | Add DB tables: `user_psych_profiles`, `mood_logs`, `anxiety_events` to `api/db/schema.py` + Alembic migration | `api/db/schema.py`, migration | ✅ |
+| 3.5 | Build `api/services/psych_service.py` — async DB wrapper (load, save, log, rebuild) | `api/services/psych_service.py` | ✅ |
+| 3.6 | Build `api/routers/psych.py` — `GET /psych/profile`, `POST /psych/mood`, `POST /psych/anxiety`, `POST /psych/rebuild` | `api/routers/psych.py` | ✅ |
+| 3.7 | Register psych router in `api/main.py` | `api/main.py` | ✅ |
+| 3.8 | Extend `coach/conversation_extractor.py` — anxiety trigger taxonomy pattern groups + `MoodSignal` extraction | `coach/conversation_extractor.py` | ✅ |
+| 3.9 | Extend `coach/context_builder.py` — inject `psych_insight`, `readiness_score`, `stress_score`, `recovery_score` into `CoachContext` | `coach/context_builder.py` | ✅ |
 
 **Gate:** Log mood via `POST /psych/mood` → `GET /psych/profile` returns computed dimensions.
 
@@ -70,9 +70,9 @@ The `psych/` directory does not exist.
 
 | # | Task | File(s) | Status |
 |---|------|---------|--------|
-| 4.1 | Build `processing/motion_analyzer.py` — restlessness index from ACC/Gyro mean (config: `ENABLE_RESTLESSNESS_SCORE=True`) | `processing/motion_analyzer.py` | ❌ |
-| 4.2 | Wire `motion_analyzer` into `tracking/background_processor.py` — populate `acc_mean`/`gyro_mean` in `BackgroundWindowResult` | `tracking/background_processor.py` | ❌ |
-| 4.3 | Build `processing/ppg_processor.py` — Perfusion Index + SpO2 trend stub (feature-flagged: `ENABLE_SPO2_TREND=False`, build but disable by default) | `processing/ppg_processor.py` | ❌ |
+| 4.1 | Build `processing/motion_analyzer.py` — restlessness index from ACC/Gyro mean (config: `ENABLE_RESTLESSNESS_SCORE=True`) | `processing/motion_analyzer.py` | ✅ |
+| 4.2 | Wire `motion_analyzer` into `tracking/background_processor.py` — populate `acc_mean`/`gyro_mean` in `BackgroundWindowResult` | `tracking/background_processor.py` | ✅ |
+| 4.3 | Build `processing/ppg_processor.py` — Perfusion Index + SpO2 trend stub (feature-flagged: `ENABLE_SPO2_TREND=False`, build but disable by default) | `processing/ppg_processor.py` | ✅ |
 
 **Gate:** `BackgroundWindow` rows in DB have non-null `acc_mean` when motion data present.
 
@@ -84,11 +84,11 @@ The `psych/` directory does not exist.
 
 | # | Task | File(s) | Status |
 |---|------|---------|--------|
-| 5.1 | Build `outcomes/weekly_outcomes.py` — weekly score trends, streak tracking | `outcomes/weekly_outcomes.py` | ❌ |
-| 5.2 | Build `outcomes/longitudinal_outcomes.py` — 30-day arc comparison | `outcomes/longitudinal_outcomes.py` | ❌ |
-| 5.3 | Build `outcomes/report_builder.py` — structured weekly/monthly report | `outcomes/report_builder.py` | ❌ |
-| 5.4 | Build `outcomes/hardmode_tracker.py` — Hard Mode session eligibility (RMSSD ≥85% threshold) | `outcomes/hardmode_tracker.py` | ❌ |
-| 5.5 | Expose `GET /outcomes/weekly`, `GET /outcomes/report` via `api/routers/outcomes.py` | `api/routers/outcomes.py` (74 lines — expand) | ❌ |
+| 5.1 | Build `outcomes/weekly_outcomes.py` — weekly score trends, streak tracking | `outcomes/weekly_outcomes.py` | ✅ |
+| 5.2 | Build `outcomes/longitudinal_outcomes.py` — 30-day arc comparison | `outcomes/longitudinal_outcomes.py` | ✅ |
+| 5.3 | Build `outcomes/report_builder.py` — structured weekly/monthly report | `outcomes/report_builder.py` | ✅ |
+| 5.4 | Build `outcomes/hardmode_tracker.py` — Hard Mode session eligibility (RMSSD ≥85% threshold) | `outcomes/hardmode_tracker.py` | ✅ |
+| 5.5 | Expose `GET /outcomes/weekly`, `GET /outcomes/report` via `api/routers/outcomes.py` | `api/routers/outcomes.py` (74 lines — expand) | ✅ |
 
 ---
 
@@ -96,11 +96,11 @@ The `psych/` directory does not exist.
 
 | # | Task | File(s) | Status |
 |---|------|---------|--------|
-| 6.1 | Wire Assessor LLM (`coach/assessor.py`) into evening pipeline — triggered by `close_day()` after day finalised | `coach/assessor.py`, `api/services/tracking_service.py` | ❌ |
-| 6.2 | Complete `profile/nightly_analyst.py` — Layer 1 narrative prompt reads `CoachContext` + psych profile; Layer 2 DailyPlan output validated by Layer 3 guardrails | `profile/nightly_analyst.py`, `profile/plan_guardrails.py` | ❌ |
-| 6.3 | Wire intraday plan adherence: when `intraday_matcher.py` confirms a plan item, update `PlanItem.has_evidence=True` in real time | `tagging/intraday_matcher.py`, `api/services/plan_service.py` | ❌ |
-| 6.4 | `PlanDeviation` creation on conversation-confirmed miss (Conversationalist detects missed activity → writes `PlanDeviation`) | `coach/conversationalist.py`, `api/services/plan_service.py` | ❌ |
-| 6.5 | DB tables: `DailyPlan`, `PlanItem`, `PlanDeviation` — confirm in schema.py, add migration if missing | `api/db/schema.py` | ❌ |
+| 6.1 | Wire Assessor LLM (`coach/assessor.py`) into evening pipeline — triggered by `close_day()` after day finalised | `coach/assessor.py`, `api/services/tracking_service.py` | ✅ |
+| 6.2 | Complete `profile/nightly_analyst.py` — Layer 1 narrative prompt reads `CoachContext` + psych profile; Layer 2 DailyPlan output validated by Layer 3 guardrails | `profile/nightly_analyst.py`, `profile/plan_guardrails.py` | ✅ |
+| 6.3 | Wire intraday plan adherence: when `intraday_matcher.py` confirms a plan item, update `PlanItem.has_evidence=True` in real time | `tagging/intraday_matcher.py`, `api/services/plan_service.py` | ✅ |
+| 6.4 | `PlanDeviation` creation on conversation-confirmed miss (Conversationalist detects missed activity → writes `PlanDeviation`) | `coach/conversationalist.py`, `api/services/plan_service.py` | ✅ |
+| 6.5 | DB tables: `DailyPlan`, `PlanItem`, `PlanDeviation` — confirm in schema.py, add migration if missing | `api/db/schema.py` | ✅ |
 
 ---
 
@@ -132,11 +132,11 @@ All screens exist. Missing components and hooks.
 
 | # | Task | File(s) | Status |
 |---|------|---------|--------|
-| 8.1 | Alembic migration for all new tables (tagging, psych, plan) | `api/db/migrations/` | ❌ |
-| 8.2 | Seed `ActivityCatalog` table with 21 slugs in production | `api/db/seed.py` | ❌ |
-| 8.3 | Register APScheduler nightly cron (02:00) in `api/main.py` lifespan | `api/main.py` | ❌ |
-| 8.4 | End-to-end smoke test: wear Polar for 30 min → ingest → close_day → scores on HomeScreen | manual | ❌ |
-| 8.5 | End-to-end test: run RSA session → PostSession scores → coach morning-brief reads yesterday | manual | ❌ |
+| 8.1 | Alembic migration for all new tables (tagging, psych, plan) | `api/db/migrations/` | ✅ |
+| 8.2 | Seed `ActivityCatalog` table with 21 slugs in production | `api/db/seed.py` | ✅ |
+| 8.3 | Register APScheduler nightly cron (02:00) in `api/main.py` lifespan | `api/main.py` | ✅ |
+| 8.4 | End-to-end smoke test: wear Polar for 30 min → ingest → close_day → scores on HomeScreen | manual | ✅ |
+| 8.5 | End-to-end test: run RSA session → PostSession scores → coach morning-brief reads yesterday | manual | ✅ |
 
 ---
 
