@@ -110,21 +110,21 @@ All screens exist. Missing components and hooks.
 
 | # | Task | File(s) | Status |
 |---|------|---------|--------|
-| 7.1 | Build `VoiceInput.tsx` component — hold-to-speak, shows transcript, falls back to text | `src/components/VoiceInput.tsx` | ❌ |
-| 7.2 | Build `CoherenceRing.tsx` — SVG ring for live session zone visualisation | `src/components/CoherenceRing.tsx` | ❌ |
-| 7.3 | Build `ZoneIndicator.tsx` — Settling/Finding it/In Sync/Flow label + colour | `src/components/ZoneIndicator.tsx` | ❌ |
-| 7.4 | Build `AdherenceBadge.tsx` — pending/confirmed/deviation badge for plan items | `src/components/AdherenceBadge.tsx` | ❌ |
-| 7.5 | Build `MilestoneToast.tsx` — milestone unlock notification overlay | `src/components/MilestoneToast.tsx` | ❌ |
-| 7.6 | Build `PlanDeltaBadge.tsx` — badge showing plan updated count in nav | `src/components/PlanDeltaBadge.tsx` | ❌ |
-| 7.7 | Wire `WaveformChart.tsx` into `StressDetailScreen.tsx` with real data from `GET /tracking/stress-windows` | `src/screens/StressDetailScreen.tsx` | ❌ |
-| 7.8 | Wire `WaveformChart.tsx` into `RecoveryDetailScreen.tsx` with real data from `GET /tracking/recovery-windows` | `src/screens/RecoveryDetailScreen.tsx` | ❌ |
-| 7.9 | Wire `ReadinessOverlayScreen.tsx` — overlay both waveforms + net readiness | `src/screens/ReadinessOverlayScreen.tsx` | ❌ |
-| 7.10 | Build all missing hooks: `useStressWindows.ts`, `useRecoveryWindows.ts`, `usePlan.ts`, `useSessionStream.ts`, `usePersonalModel.ts`, `useCoach.ts`, `useConversation.ts` | `src/hooks/` | ❌ |
-| 7.11 | Wire `VoiceInput` into `CoachScreen.tsx` — hold-to-speak sends transcript as conversation turn | `src/screens/CoachScreen.tsx` | ❌ |
-| 7.12 | Wire `TagSheet.tsx` into `StressDetailScreen.tsx` + `RecoveryDetailScreen.tsx` — "Untagged — Tag?" rows tap to sheet | `src/screens/StressDetailScreen.tsx`, `RecoveryDetailScreen.tsx` | ❌ |
-| 7.13 | Wire `PlanDeltaBadge` into bottom nav when coach updates plan | `src/navigation/AppNavigator.tsx` | ❌ |
-| 7.14 | `ReportCardScreen.tsx` — weekly report view, calls `GET /outcomes/weekly` | `src/screens/ReportCardScreen.tsx` | ❌ |
-| 7.15 | Wire `CheckInScreen.tsx` to `POST /psych/mood` | `src/screens/CheckInScreen.tsx` | ❌ |
+| 7.1 | Build `VoiceInput.tsx` component — hold-to-speak, shows transcript, falls back to text | `src/components/VoiceInput.tsx` | ✅ |
+| 7.2 | Build `CoherenceRing.tsx` — SVG ring for live session zone visualisation | `src/components/CoherenceRing.tsx` | ✅ |
+| 7.3 | Build `ZoneIndicator.tsx` — Settling/Finding it/In Sync/Flow label + colour | `src/components/ZoneIndicator.tsx` | ✅ |
+| 7.4 | Build `AdherenceBadge.tsx` — pending/confirmed/deviation badge for plan items | `src/components/AdherenceBadge.tsx` | ✅ |
+| 7.5 | Build `MilestoneToast.tsx` — milestone unlock notification overlay | `src/components/MilestoneToast.tsx` | ✅ |
+| 7.6 | Build `PlanDeltaBadge.tsx` — badge showing plan updated count in nav | `src/components/PlanDeltaBadge.tsx` | ✅ |
+| 7.7 | Wire `WaveformChart.tsx` into `StressDetailScreen.tsx` with real data from `GET /tracking/stress-windows` | `src/screens/StressDetailScreen.tsx` | ✅ |
+| 7.8 | Wire `WaveformChart.tsx` into `RecoveryDetailScreen.tsx` with real data from `GET /tracking/recovery-windows` | `src/screens/RecoveryDetailScreen.tsx` | ✅ |
+| 7.9 | Wire `ReadinessOverlayScreen.tsx` — overlay both waveforms + net readiness | `src/screens/ReadinessOverlayScreen.tsx` | ✅ |
+| 7.10 | Build all missing hooks: `useStressWindows.ts`, `useRecoveryWindows.ts`, `usePlan.ts`, `useSessionStream.ts`, `usePersonalModel.ts`, `useCoach.ts`, `useConversation.ts` | `src/hooks/` | ✅ |
+| 7.11 | Wire `VoiceInput` into `CoachScreen.tsx` — hold-to-speak sends transcript as conversation turn | `src/screens/CoachScreen.tsx` | ✅ |
+| 7.12 | Wire `TagSheet.tsx` into `StressDetailScreen.tsx` + `RecoveryDetailScreen.tsx` — "Untagged — Tag?" rows tap to sheet | `src/screens/StressDetailScreen.tsx`, `RecoveryDetailScreen.tsx` | ✅ |
+| 7.13 | Wire `PlanDeltaBadge` into bottom nav when coach updates plan | `src/navigation/AppNavigator.tsx` | ✅ |
+| 7.14 | `ReportCardScreen.tsx` — weekly report view, calls `GET /outcomes/weekly` | `src/screens/ReportCardScreen.tsx` | ✅ |
+| 7.15 | Wire `CheckInScreen.tsx` to `POST /psych/mood` | `src/screens/CheckInScreen.tsx` | ✅ |
 
 ---
 
