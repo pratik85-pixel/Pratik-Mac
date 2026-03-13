@@ -22,7 +22,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.db.database import get_db
-from api.db.schema import Metric, MorningRead, PersonalModel
+from api.db.schema import Metric, MorningRead, PersonalModel, Session
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -35,17 +35,77 @@ class SeedBaselineRequest(BaseModel):
 
 
 class SeedBaselineResponse(BaseModel):
-    user_id:           str
-    rmssd_samples:     int
-    morning_samples:   int
-    rmssd_floor:       Optional[float]
-    rmssd_ceiling:     Optional[float]
-    rmssd_morning_avg: Optional[float]
+    user_id:              str
+    rmssd_samples:        int
+    session_samples:      int
+    morning_samples:      int
+    rmssd_floor:          Optional[float]
+    rmssd_ceiling:        Optional[float]
+    rmssd_morning_avg:    Optional[float]
     stress_capacity_floor_rmssd: Optional[float]
-    message:           str
+    message:              str
+
+
+class DebugDataResponse(BaseModel):
+    user_id:          str
+    metric_rows:      int
+    session_rows:     int
+    morning_rows:     int
+    sample_rmssd_values: list[float]
+    sample_session_rmssd: list[float]
 
 
 # ── Endpoint ───────────────────────────────────────────────────────────────────
+
+@router.get("/debug/{user_id}", response_model=DebugDataResponse)
+async def debug_user_data(
+    user_id: str,
+    db: AsyncSession = Depends(get_db),
+) -> DebugDataResponse:
+    """Quick probe — shows how many rows exist per table for this user."""
+    try:
+        uid = uuid.UUID(user_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid UUID")
+
+    metric_result = await db.execute(
+        select(Metric.value)
+        .where(Metric.user_id == uid)
+        .where(Metric.name == "rmssd")
+        .limit(10)
+    )
+    metric_vals = [r[0] for r in metric_result.fetchall()]
+
+    session_result = await db.execute(
+        select(Session.rmssd_pre, Session.rmssd_post)
+        .where(Session.user_id == uid)
+        .limit(20)
+    )
+    session_rmssd = [v for row in session_result.fetchall() for v in [row[0], row[1]] if v]
+
+    morning_result = await db.execute(
+        select(MorningRead.rmssd_ms)
+        .where(MorningRead.user_id == uid)
+        .where(MorningRead.rmssd_ms.isnot(None))
+        .limit(10)
+    )
+    morning_count = len(morning_result.fetchall())
+
+    all_metrics_count = await db.execute(
+        select(Metric.name)
+        .where(Metric.user_id == uid)
+    )
+    total_metric_rows = len(all_metrics_count.fetchall())
+
+    return DebugDataResponse(
+        user_id=user_id,
+        metric_rows=total_metric_rows,
+        session_rows=len(session_rmssd) // 2,
+        morning_rows=morning_count,
+        sample_rmssd_values=metric_vals[:5],
+        sample_session_rmssd=session_rmssd[:10],
+    )
+
 
 @router.post("/seed-baseline", response_model=SeedBaselineResponse)
 async def seed_baseline(
@@ -57,10 +117,11 @@ async def seed_baseline(
 
     Steps:
     1. Fetch all rmssd rows from `metrics` for this user.
-    2. Compute p25 (floor), p75 (ceiling), median (all-day avg).
-    3. Fetch morning_reads and compute morning avg separately if available.
-    4. Upsert personal_models with those values.
-    5. Return computed values so caller can verify.
+    2. Fall back to rmssd_pre/rmssd_post from `sessions` if metrics table is empty.
+    3. Compute p10 (floor), p90 (ceiling), median (all-day avg).
+    4. Fetch morning_reads and compute morning avg separately if available.
+    5. Upsert personal_models with those values.
+    6. Return computed values so caller can verify.
     """
     try:
         uid = uuid.UUID(body.user_id)
@@ -77,10 +138,27 @@ async def seed_baseline(
     )
     rmssd_values = [row[0] for row in result.fetchall() if row[0] is not None and row[0] > 0]
 
+    # ── 1b. Fall back to session rmssd_pre / rmssd_post if metrics empty ─────
+    session_rmssd_count = 0
+    if not rmssd_values:
+        sess_result = await db.execute(
+            select(Session.rmssd_pre, Session.rmssd_post)
+            .where(Session.user_id == uid)
+        )
+        for row in sess_result.fetchall():
+            for v in [row[0], row[1]]:
+                if v and v > 0:
+                    rmssd_values.append(v)
+                    session_rmssd_count += 1
+        logger.info("seed-baseline: fell back to %d session rmssd values", session_rmssd_count)
+
     if not rmssd_values:
         raise HTTPException(
             status_code=404,
-            detail="No rmssd metrics found for this user. Cannot seed baseline."
+            detail=(
+                "No rmssd data found in metrics OR sessions for this user. "
+                "The app needs to have recorded at least one session before seeding."
+            )
         )
 
     logger.info("seed-baseline: %d rmssd samples for user %s", len(rmssd_values), uid)
@@ -152,7 +230,8 @@ async def seed_baseline(
 
     return SeedBaselineResponse(
         user_id=body.user_id,
-        rmssd_samples=n,
+        rmssd_samples=n - session_rmssd_count,
+        session_samples=session_rmssd_count,
         morning_samples=len(morning_values),
         rmssd_floor=rmssd_floor,
         rmssd_ceiling=rmssd_ceiling,
@@ -160,7 +239,8 @@ async def seed_baseline(
         stress_capacity_floor_rmssd=capacity_floor,
         message=(
             f"Baseline seeded from {n} rmssd samples "
-            f"({len(morning_values)} morning reads). "
+            f"({n - session_rmssd_count} raw metrics + {session_rmssd_count} session readings, "
+            f"{len(morning_values)} morning reads). "
             "Now call POST /tracking/close-day to recompute scores."
         ),
     )
