@@ -417,6 +417,16 @@ class TrackingService:
         )
         raw_recovery = compute_recovery_contributions(raw_recovery, max_recovery)
 
+        # Null out FK references in daily_stress_summaries before deleting windows.
+        # Without this, PostgreSQL raises ForeignKeyViolationError because the
+        # summary row's top_stress_window_id / top_recovery_window_id still points
+        # to the old window rows we're about to delete.
+        existing_summary = await self._load_day_summary(day_start.date())
+        if existing_summary is not None:
+            existing_summary.top_stress_window_id   = None
+            existing_summary.top_recovery_window_id = None
+            await self._db.flush()
+
         # Delete old windows for today and re-insert
         existing_s = await _load_existing_stress_windows(self._db, self._uid, day_start, day_end)
         for row in existing_s:
