@@ -22,7 +22,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.db.database import get_db
-from api.db.schema import Metric, MorningRead, PersonalModel, Session
+from api.db.schema import BackgroundWindow, Metric, MorningRead, PersonalModel, Session
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -35,24 +35,27 @@ class SeedBaselineRequest(BaseModel):
 
 
 class SeedBaselineResponse(BaseModel):
-    user_id:              str
-    rmssd_samples:        int
-    session_samples:      int
-    morning_samples:      int
-    rmssd_floor:          Optional[float]
-    rmssd_ceiling:        Optional[float]
-    rmssd_morning_avg:    Optional[float]
+    user_id:                     str
+    bg_window_samples:           int
+    metric_samples:              int
+    session_samples:             int
+    morning_samples:             int
+    rmssd_floor:                 Optional[float]
+    rmssd_ceiling:               Optional[float]
+    rmssd_morning_avg:           Optional[float]
     stress_capacity_floor_rmssd: Optional[float]
-    message:              str
+    message:                     str
 
 
 class DebugDataResponse(BaseModel):
-    user_id:          str
-    metric_rows:      int
-    session_rows:     int
-    morning_rows:     int
-    sample_rmssd_values: list[float]
-    sample_session_rmssd: list[float]
+    user_id:               str
+    metric_rows:           int
+    background_window_rows: int
+    session_rows:          int
+    morning_rows:          int
+    sample_rmssd_values:   list[float]
+    sample_bg_rmssd:       list[float]
+    sample_session_rmssd:  list[float]
 
 
 # ── Endpoint ───────────────────────────────────────────────────────────────────
@@ -76,6 +79,21 @@ async def debug_user_data(
     )
     metric_vals = [r[0] for r in metric_result.fetchall()]
 
+    bg_result = await db.execute(
+        select(BackgroundWindow.rmssd_ms)
+        .where(BackgroundWindow.user_id == uid)
+        .where(BackgroundWindow.rmssd_ms.isnot(None))
+        .order_by(BackgroundWindow.window_start.desc())
+        .limit(10)
+    )
+    bg_vals = [r[0] for r in bg_result.fetchall() if r[0]]
+
+    bg_count_result = await db.execute(
+        select(BackgroundWindow.rmssd_ms)
+        .where(BackgroundWindow.user_id == uid)
+    )
+    bg_total = len(bg_count_result.fetchall())
+
     session_result = await db.execute(
         select(Session.rmssd_pre, Session.rmssd_post)
         .where(Session.user_id == uid)
@@ -89,7 +107,7 @@ async def debug_user_data(
         .where(MorningRead.rmssd_ms.isnot(None))
         .limit(10)
     )
-    morning_count = len(morning_result.fetchall())
+    morning_rows = morning_result.fetchall()
 
     all_metrics_count = await db.execute(
         select(Metric.name)
@@ -100,9 +118,11 @@ async def debug_user_data(
     return DebugDataResponse(
         user_id=user_id,
         metric_rows=total_metric_rows,
+        background_window_rows=bg_total,
         session_rows=len(session_rmssd) // 2,
-        morning_rows=morning_count,
+        morning_rows=len(morning_rows),
         sample_rmssd_values=metric_vals[:5],
+        sample_bg_rmssd=bg_vals[:8],
         sample_session_rmssd=session_rmssd[:10],
     )
 
@@ -128,17 +148,30 @@ async def seed_baseline(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid UUID format for user_id")
 
-    # ── 1. Fetch raw RMSSD readings ────────────────────────────────────────────
-    result = await db.execute(
+    # ── 1. background_windows (primary) ───────────────────────────────────────
+    bg_result = await db.execute(
+        select(BackgroundWindow.rmssd_ms)
+        .where(BackgroundWindow.user_id == uid)
+        .where(BackgroundWindow.rmssd_ms.isnot(None))
+        .order_by(BackgroundWindow.window_start.desc())
+        .limit(2000)
+    )
+    rmssd_values = [r[0] for r in bg_result.fetchall() if r[0] and r[0] > 0]
+    bg_count = len(rmssd_values)
+
+    # ── 2. metrics table ──────────────────────────────────────────────────────
+    metric_result = await db.execute(
         select(Metric.value)
         .where(Metric.user_id == uid)
         .where(Metric.name == "rmssd")
         .order_by(Metric.ts.desc())
         .limit(2000)
     )
-    rmssd_values = [row[0] for row in result.fetchall() if row[0] is not None and row[0] > 0]
+    metric_vals = [r[0] for r in metric_result.fetchall() if r[0] and r[0] > 0]
+    rmssd_values.extend(metric_vals)
+    metric_count = len(metric_vals)
 
-    # ── 1b. Fall back to session rmssd_pre / rmssd_post if metrics empty ─────
+    # ── 3. session fallback ───────────────────────────────────────────────────
     session_rmssd_count = 0
     if not rmssd_values:
         sess_result = await db.execute(
@@ -150,18 +183,20 @@ async def seed_baseline(
                 if v and v > 0:
                     rmssd_values.append(v)
                     session_rmssd_count += 1
-        logger.info("seed-baseline: fell back to %d session rmssd values", session_rmssd_count)
 
     if not rmssd_values:
         raise HTTPException(
             status_code=404,
             detail=(
-                "No rmssd data found in metrics OR sessions for this user. "
-                "The app needs to have recorded at least one session before seeding."
+                "No RMSSD data found in background_windows, metrics, or sessions. "
+                "The app must flush at least one 5-min background window first."
             )
         )
 
-    logger.info("seed-baseline: %d rmssd samples for user %s", len(rmssd_values), uid)
+    logger.info(
+        "seed-baseline: user=%s total=%d (bg=%d metric=%d session=%d)",
+        uid, len(rmssd_values), bg_count, metric_count, session_rmssd_count,
+    )
 
     # ── 2. Compute all-day stats ───────────────────────────────────────────────
     sorted_vals = sorted(rmssd_values)
@@ -230,7 +265,8 @@ async def seed_baseline(
 
     return SeedBaselineResponse(
         user_id=body.user_id,
-        rmssd_samples=n - session_rmssd_count,
+        bg_window_samples=bg_count,
+        metric_samples=metric_count,
         session_samples=session_rmssd_count,
         morning_samples=len(morning_values),
         rmssd_floor=rmssd_floor,
@@ -238,8 +274,8 @@ async def seed_baseline(
         rmssd_morning_avg=rmssd_morning_avg,
         stress_capacity_floor_rmssd=capacity_floor,
         message=(
-            f"Baseline seeded from {n} rmssd samples "
-            f"({n - session_rmssd_count} raw metrics + {session_rmssd_count} session readings, "
+            f"Baseline seeded from {n} samples "
+            f"({bg_count} bg windows + {metric_count} metrics + {session_rmssd_count} sessions, "
             f"{len(morning_values)} morning reads). "
             "Now call POST /tracking/close-day to recompute scores."
         ),
