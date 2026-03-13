@@ -48,14 +48,37 @@ _cfg    = get_settings()
 
 # ── LLM client factory ─────────────────────────────────────────────────────────
 
+class _SyncLLMClient:
+    """
+    Thin synchronous wrapper that matches the duck-typed protocol expected by
+    coach_api.generate_response():
+
+        llm_client.chat(system: str, user: str) -> str  (raw JSON string)
+    """
+    def __init__(self, api_key: str, model: str = "gpt-4o"):
+        from openai import OpenAI
+        self._client = OpenAI(api_key=api_key)
+        self._model = model
+
+    def chat(self, system: str, user: str) -> str:
+        resp = self._client.chat.completions.create(
+            model=self._model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user",   "content": user},
+            ],
+            response_format={"type": "json_object"},
+        )
+        return resp.choices[0].message.content or ""
+
+
 def _build_llm_client():
-    """Return an OpenAI client or None (offline mode)."""
+    """Return an LLM client or None (offline mode)."""
     if not _cfg.LLM_ENABLED or not _cfg.OPENAI_API_KEY:
         logger.info("LLM disabled — using local_engine fallback")
         return None
     try:
-        from openai import AsyncOpenAI
-        return AsyncOpenAI(api_key=_cfg.OPENAI_API_KEY)
+        return _SyncLLMClient(api_key=_cfg.OPENAI_API_KEY, model=_cfg.OPENAI_MODEL)
     except ImportError:
         logger.warning("openai package not available — offline mode")
         return None
