@@ -26,7 +26,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from api.config import get_settings
-from api.routers import stream, session, user, coach, outcomes, plan, tracking, tagging, psych, profile, admin
+from api.routers import stream, session, user, coach, outcomes, plan, tracking, tagging, psych, profile
 from api.services.session_service import SessionService
 from api.services.coach_service import CoachService
 from api.services.conversation_service import ConversationService
@@ -141,7 +141,6 @@ def create_app() -> FastAPI:
     app.include_router(tagging.router)
     app.include_router(psych.router)
     app.include_router(profile.router)
-    app.include_router(admin.router)  # TEMP: remove after baseline seeded
 
     # ── Health check ──────────────────────────────────────────────────────────
     @app.get("/health", tags=["meta"])
