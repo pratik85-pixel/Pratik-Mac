@@ -109,13 +109,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         scheduler = AsyncIOScheduler(timezone="UTC")
         scheduler.add_job(
             run_nightly_rebuild,
-            CronTrigger(hour=2, minute=0, timezone="UTC"),
+            CronTrigger(hour=19, minute=30, timezone="UTC"),  # 01:00 IST fallback
             id="nightly_rebuild",
-            name="Nightly rebuild + close_day (02:00 UTC)",
+            name="Nightly rebuild + close_day (19:30 UTC / 01:00 IST fallback)",
             replace_existing=True,
         )
         scheduler.start()
-        logger.info("nightly scheduler started — next run 02:00 UTC")
+        logger.info("nightly scheduler started — next run 19:30 UTC (01:00 IST fallback)")
     else:
         logger.warning("apscheduler not installed — nightly rebuild will not run automatically")
 

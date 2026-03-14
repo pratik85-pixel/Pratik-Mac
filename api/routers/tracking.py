@@ -345,11 +345,15 @@ async def ingest_beats(
         buckets.append(current)
 
     windows_processed = 0
+    first_win_start: Optional[datetime] = None
     for bucket in buckets:
         ppi_vals = [b.ppi_ms for b in bucket]
         ts_vals  = [b.ts for b in bucket]
         win_start = datetime.fromtimestamp(bucket[0].ts, tz=UTC)
         win_end   = datetime.fromtimestamp(bucket[-1].ts, tz=UTC)
+
+        if first_win_start is None:
+            first_win_start = win_start
 
         try:
             await svc.ingest_background_window(
@@ -365,7 +369,22 @@ async def ingest_beats(
         except Exception:
             logger.exception("ingest_background_window failed for window %s", win_start)
 
-    logger.info("INGEST uid=%s windows_processed=%d beats=%d", svc._uid, windows_processed, len(beats))
+    # ── Sleep-triggered day close ──────────────────────────────────────────────
+    # When the app transitions to context="sleep", the waking day is over.
+    # Close the day immediately using the actual sleep onset time rather than
+    # waiting for a fixed cron (which runs at a UTC time that may be morning IST).
+    if context == "sleep" and windows_processed > 0 and first_win_start is not None:
+        day_to_close = first_win_start.date()
+        try:
+            await svc.close_day(day_to_close)
+            logger.info(
+                "SLEEP-TRIGGERED close_day uid=%s date=%s sleep_onset=%s",
+                svc._uid, day_to_close, first_win_start.isoformat(),
+            )
+        except Exception:
+            logger.exception("sleep-triggered close_day failed uid=%s date=%s", svc._uid, day_to_close)
+
+    logger.info("INGEST uid=%s context=%s windows_processed=%d beats=%d", svc._uid, context, windows_processed, len(beats))
     return IngestResponse(windows_processed=windows_processed, beats_received=len(beats))
 
 
