@@ -59,7 +59,12 @@ async def _get_active_user_ids(session) -> list:
     read_users = select(db.MorningRead.user_id).where(
         db.MorningRead.read_date >= cutoff
     )
-    all_active = union(session_users, read_users).subquery()
+    # Also include users who have background windows (the primary data source
+    # for Verity — users may never have a Session or MorningRead row yet)
+    background_users = select(db.BackgroundWindow.user_id).where(
+        db.BackgroundWindow.window_start >= cutoff
+    )
+    all_active = union(session_users, read_users, background_users).subquery()
 
     result = await session.execute(
         select(all_active.c.user_id).distinct()
@@ -165,7 +170,7 @@ async def _rebuild_one_user(
         from api.services.tracking_service import TrackingService
         yesterday = (datetime.now(UTC) - timedelta(days=1)).date()
         try:
-            tracking_svc = TrackingService(user_session, user_id)
+            tracking_svc = TrackingService(session, user_id)
             await tracking_svc.close_day(yesterday)
             result["day_closed"] = True
             log.debug("close_day OK user=%s date=%s", user_id, yesterday)
