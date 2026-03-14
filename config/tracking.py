@@ -37,16 +37,16 @@ class TrackingConfig(BaseSettings):
     # ── Stress Detection ────────────────────────────────────────────────────
     # downstream: tracking/stress_detector
     # RMSSD must fall below this fraction of personal morning average to breach threshold
-    STRESS_THRESHOLD_PCT: float = 0.85
+    STRESS_THRESHOLD_PCT: float = 0.75
 
-    # Minimum consecutive windows at threshold to declare a stress event (5 min each → 10 min)
-    STRESS_MIN_WINDOWS: int = 2
+    # Minimum consecutive windows at threshold to declare a stress event (5 min each → 15 min)
+    STRESS_MIN_WINDOWS: int = 3
 
     # Adjacent events with gap ≤ this (minutes) are merged into one event
     STRESS_MERGE_GAP_MINUTES: int = 5
 
     # Rate-of-change trigger: RMSSD dropped > this fraction in a single window
-    STRESS_RATE_TRIGGER_PCT: float = 0.10
+    STRESS_RATE_TRIGGER_PCT: float = 0.20
 
     # Minimum contribution fraction of daily capacity to warrant a nudge
     STRESS_MIN_NUDGE_CONTRIBUTION: float = 0.03
@@ -54,10 +54,10 @@ class TrackingConfig(BaseSettings):
     # ── Recovery Detection ─────────────────────────────────────────────────
     # downstream: tracking/recovery_detector
     # RMSSD must be at or above this fraction of personal morning average
-    RECOVERY_THRESHOLD_PCT: float = 1.00
+    RECOVERY_THRESHOLD_PCT: float = 1.10
 
     # Minimum consecutive windows above threshold to declare a recovery window
-    RECOVERY_MIN_WINDOWS: int = 3
+    RECOVERY_MIN_WINDOWS: int = 4
 
     # ── Recovery Score Weights ─────────────────────────────────────────────
     # downstream: tracking/daily_summarizer

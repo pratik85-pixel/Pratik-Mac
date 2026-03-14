@@ -655,6 +655,10 @@ class TrackingService:
     ) -> Optional[db.DailyStressSummary]:
         return await self._load_day_summary(target_date)
 
+    async def get_personal_model(self) -> Optional[db.PersonalModel]:
+        """Return the user's PersonalModel row (or None if it doesn't exist yet)."""
+        return await _load_personal_model(self._db, self._uid)
+
     async def compute_live_summary(
         self, target_date: date
     ) -> Optional[DailySummaryResult]:

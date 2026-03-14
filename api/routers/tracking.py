@@ -60,6 +60,10 @@ class DailySummaryResponse(BaseModel):
     wake_ts:               Optional[str]
     sleep_ts:              Optional[str]
     waking_minutes:        Optional[float]
+    # Chart denominator fields — needed by frontend to compute per-window score delta
+    ns_capacity_used:      Optional[float] = None   # (ceiling - floor) × 960
+    rmssd_morning_avg:     Optional[float] = None   # personal morning baseline (ms)
+    rmssd_ceiling:         Optional[float] = None   # personal RMSSD ceiling (ms)
 
 
 class WaveformPoint(BaseModel):
@@ -147,21 +151,23 @@ async def get_today_summary(
     """
     today = datetime.now(UTC).date()
 
+    personal = await svc.get_personal_model()
+
     # 1. Persisted summary
     row = await svc.get_daily_summary(today)
     if row is not None:
-        return _build_summary_response(row)
+        return _build_summary_response(row, personal)
 
     # 2. Live computation from today's background windows (no DB write)
     live = await svc.compute_live_summary(today)
     if live is not None:
-        return _build_summary_response(live)
+        return _build_summary_response(live, personal)
 
     # 3. Carry-forward from yesterday
     yesterday = (datetime.now(UTC) - timedelta(days=1)).date()
     row = await svc.get_daily_summary(yesterday)
     if row is not None:
-        r = _build_summary_response(row)
+        r = _build_summary_response(row, personal)
         return DailySummaryResponse(
             summary_date          = today.isoformat(),
             stress_load_score     = r.stress_load_score,
@@ -176,6 +182,9 @@ async def get_today_summary(
             wake_ts               = None,
             sleep_ts              = None,
             waking_minutes        = None,
+            ns_capacity_used      = r.ns_capacity_used,
+            rmssd_morning_avg     = r.rmssd_morning_avg,
+            rmssd_ceiling         = r.rmssd_ceiling,
         )
 
     raise HTTPException(status_code=404, detail="No summary available yet.")
@@ -187,13 +196,14 @@ async def get_summary_by_date(
     svc: TrackingService = Depends(_tracking_svc),
 ) -> DailySummaryResponse:
     """Return the three numbers for a specific date (YYYY-MM-DD)."""
-    target = _parse_date(date_str)
-    row    = await svc.get_daily_summary(target)
+    target   = _parse_date(date_str)
+    personal = await svc.get_personal_model()
+    row      = await svc.get_daily_summary(target)
     if row is None:
         row = await svc.compute_live_summary(target)
     if row is None:
         raise HTTPException(status_code=404, detail=f"No summary found for {date_str}.")
-    return _build_summary_response(row)
+    return _build_summary_response(row, personal)
 
 
 @router.get("/waveform/{date_str}", response_model=list[WaveformPoint])
@@ -455,7 +465,7 @@ async def get_history(
 
 # ── Private builder ────────────────────────────────────────────────────────────
 
-def _build_summary_response(row) -> DailySummaryResponse:
+def _build_summary_response(row, personal=None) -> DailySummaryResponse:
     return DailySummaryResponse(
         summary_date          = row.summary_date.date().isoformat() if row.summary_date else "",
         stress_load_score     = row.stress_load_score,
@@ -467,7 +477,10 @@ def _build_summary_response(row) -> DailySummaryResponse:
         calibration_days      = row.calibration_days or 0,
         is_estimated          = row.is_estimated,
         is_partial_data       = row.is_partial_data,
-        wake_ts               = _fmt_ts(row.wake_ts),
-        sleep_ts              = _fmt_ts(row.sleep_ts),
-        waking_minutes        = row.waking_minutes,
+        wake_ts               = _fmt_ts(getattr(row, 'wake_ts', None)),
+        sleep_ts              = _fmt_ts(getattr(row, 'sleep_ts', None)),
+        waking_minutes        = getattr(row, 'waking_minutes', None),
+        ns_capacity_used      = getattr(row, 'ns_capacity_used', None),
+        rmssd_morning_avg     = personal.rmssd_morning_avg if personal else None,
+        rmssd_ceiling         = personal.rmssd_ceiling if personal else None,
     )
