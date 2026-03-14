@@ -190,7 +190,6 @@ def create_app() -> FastAPI:
         except ValueError:
             raise HTTPException(status_code=400, detail="bad uuid")
         from sqlalchemy import text as _text
-        await db.execute(_text("DELETE FROM capacity_snapshot      WHERE user_id = :u"), {"u": str(uid)})
         await db.execute(_text("DELETE FROM daily_stress_summaries WHERE user_id = :u"), {"u": str(uid)})
         await db.execute(_text("DELETE FROM personal_models        WHERE user_id = :u"), {"u": str(uid)})
         await db.commit()
