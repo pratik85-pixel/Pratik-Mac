@@ -124,8 +124,24 @@ class ModelService:
         Apply a new SessionOutcome to the stored fingerprint.
         If `readings` is not supplied, synthesises MetricReadings from the
         outcome's pre/post RMSSD values.
+
+        Calibration lock (Phase 10): if the PersonalModel row already has
+        calibration_locked_at set, the floor/ceiling/morning_avg freeze is
+        enforced automatically via run_update(calibration_locked=True).
         """
         fp = await self.get_fingerprint(user_id) or PersonalFingerprint()
+
+        # Determine calibration lock from persisted DB state
+        calibration_locked = False
+        if self._db is not None:
+            uid = _parse_uuid(user_id)
+            if uid is not None:
+                _res = await self._db.execute(
+                    select(PersonalModel).where(PersonalModel.user_id == uid)
+                )
+                _row = _res.scalar_one_or_none()
+                if _row is not None and _row.calibration_locked_at is not None:
+                    calibration_locked = True
 
         if readings is None:
             readings = []
@@ -142,7 +158,7 @@ class ModelService:
                 ))
 
         if readings:
-            run_update(fp, readings)
+            run_update(fp, readings, calibration_locked=calibration_locked)
 
         await self._persist_fingerprint(user_id, fp)
 
@@ -182,6 +198,7 @@ class ModelService:
         row.lf_hf_sleep             = fp.lf_hf_sleep
         row.fingerprint_json        = _fingerprint_to_dict(fp)
         row.version                 = (row.version or 0) + 1
+        # calibration_locked_at is set externally by close_day(); don't touch here
 
         await self._db.commit()
         logger.debug("fingerprint persisted user=%s version=%d", user_id, row.version)

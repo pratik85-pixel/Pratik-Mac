@@ -207,6 +207,12 @@ class PersonalModel(Base):
     # "PRF_UNKNOWN" | "PRF_FOUND" | "PRF_CONFIRMED"
     prf_status               = Column(String(20), nullable=True, default="PRF_UNKNOWN")
 
+    # ── Phase 10: Calibration lock ────────────────────────────────────────────
+    # Set when calibration_days reaches BASELINE_STABLE_DAYS (3).
+    # Once set, floor/ceiling/morning_avg are frozen — no more EWM updates.
+    # Capacity grows only via explicit capacity-increase trigger.
+    calibration_locked_at    = Column(DateTime(timezone=True), nullable=True)
+
     user = relationship("User", back_populates="personal_model")
 
 
@@ -703,9 +709,17 @@ class DailyStressSummary(Base):
     # "green" | "yellow" | "red" — derived from readiness_score
     day_type     = Column(String(10), nullable=True)
 
-    # Credit-card model scores (Option C, v2)
-    waking_recovery_score = Column(Float, nullable=True)  # RMSSD-above-baseline, 0-100
-    net_balance           = Column(Float, nullable=True)  # waking_recovery - stress_load, -100 to +100
+    # Credit-card model scores (Phase 10)
+    waking_recovery_score = Column(Float, nullable=True)   # display only, clamped 0-100
+    net_balance           = Column(Float, nullable=True)   # raw: recovery% - stress% + opening_balance
+
+    # Continuous balance thread — carries across day boundaries
+    opening_balance       = Column(Float, nullable=True, server_default='0')  # carried from prev closing_balance
+    closing_balance       = Column(Float, nullable=True)   # = net_balance at day close
+
+    # Raw unclamped percentages (for carry-forward integrity)
+    stress_pct_raw        = Column(Float, nullable=True)   # stress_area / ns_capacity x 100 (unbounded)
+    recovery_pct_raw      = Column(Float, nullable=True)   # recovery_area / ns_capacity x 100 (unbounded)
 
     # Raw inputs (for recompute under new baseline)
     raw_suppression_area       = Column(Float, nullable=False, default=0.0)
@@ -713,6 +727,9 @@ class DailyStressSummary(Base):
     raw_recovery_area_zenflow  = Column(Float, nullable=False, default=0.0)
     raw_recovery_area_daytime  = Column(Float, nullable=False, default=0.0)
     raw_recovery_area_waking   = Column(Float, nullable=False, default=0.0)
+    # Single symmetric denominator: (ceiling - floor) x 960
+    ns_capacity_used           = Column(Float, nullable=False, default=0.0)
+    # Legacy field — kept for backward compat, equals ns_capacity_used
     max_possible_suppression   = Column(Float, nullable=False, default=0.0)
 
     # Baseline versioning

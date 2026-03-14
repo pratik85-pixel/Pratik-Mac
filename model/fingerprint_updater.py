@@ -3,15 +3,19 @@ model/fingerprint_updater.py
 
 Incrementally update a PersonalFingerprint after the baseline window.
 
-After the initial 48hr baseline:
+After the initial baseline:
   - Every new session adds to the RSA trainability trend.
-  - Every morning read updates rmssd_morning_avg (rolling 30-day).
+  - Every morning read updates rmssd_morning_avg (initial calibration only).
   - Every new RMSSD drop adds to the recovery arc stats.
   - Activity coherence tags update the activity map.
   - Check-ins (3-day cadence) update interoception_gap.
 
-This module is called by the background job that runs after each session
-and by the nightly summary job.
+Phase 10 change:
+  - rmssd_floor, rmssd_ceiling, and rmssd_morning_avg are FROZEN once calibration
+    is complete (calibration_locked=True). This prevents silent denominator drift.
+  - Capacity is only updated when new range exceeds current by >=10% for 7+ days
+    AND coach fires a user notification. That trigger happens outside this module.
+  - Pass calibration_locked=True to update_rmssd_stats after calibration_days >= 3.
 
 Design:
   - All updates are additive and non-destructive.
@@ -51,9 +55,26 @@ def update_rmssd_stats(
     fp: PersonalFingerprint,
     new_readings: list[MetricReading],
     rolling_days: Optional[int] = None,
+    calibration_locked: bool = False,
 ) -> list[str]:
     """
     Update RMSSD floor/ceiling/morning_avg from new readings.
+
+    Parameters
+    ----------
+    fp : PersonalFingerprint
+        The personal fingerprint to update in-place.
+    new_readings : list[MetricReading]
+        New readings from the current session or background window.
+    rolling_days : int, optional
+        Rolling window for distribution stats.
+    calibration_locked : bool
+        When True (calibration_days >= 3), the ceiling and morning_avg are FROZEN.
+        No EWM updates to morning_avg; no ceiling ratchet upward.
+        Floor can still lower (expands capacity, doesn't distort denominators).
+        Capacity grows only via explicit capacity-increase trigger
+        (>10% range growth x 7 days + coach notification).
+
     Returns list of field names that changed.
     """
     rolling = rolling_days or CONFIG.model.DISTRIBUTION_ROLLING_DAYS
@@ -67,15 +88,16 @@ def update_rmssd_stats(
     new_floor   = float(np.percentile(values, 5))
     new_ceiling = float(np.percentile(values, 95))
 
-    # Update floor: take the lower of new and existing (personal minimum is the reference)
+    # ── Floor: always allowed to decrease (expands capacity safely)
     if fp.rmssd_floor is None or new_floor < fp.rmssd_floor:
         fp.rmssd_floor = round(new_floor, 1)
         changed.append("rmssd_floor")
 
-    # Update ceiling: take the higher (best observed state)
-    if fp.rmssd_ceiling is None or new_ceiling > fp.rmssd_ceiling:
-        fp.rmssd_ceiling = round(new_ceiling, 1)
-        changed.append("rmssd_ceiling")
+    # ── Ceiling: FROZEN after calibration to prevent denominator drift
+    if not calibration_locked:
+        if fp.rmssd_ceiling is None or new_ceiling > fp.rmssd_ceiling:
+            fp.rmssd_ceiling = round(new_ceiling, 1)
+            changed.append("rmssd_ceiling")
 
     if fp.rmssd_floor is not None and fp.rmssd_ceiling is not None:
         new_range = round(fp.rmssd_ceiling - fp.rmssd_floor, 1)
@@ -83,21 +105,24 @@ def update_rmssd_stats(
             fp.rmssd_range = new_range
             changed.append("rmssd_range")
 
-    # Morning average: EWM update (exponential moving average)
-    morning_vals = [
-        r.value for r in rmssd
-        if 4 <= r.ts.hour < 10
-    ]
-    if morning_vals and fp.rmssd_morning_avg is not None:
-        alpha = 0.2   # weight of new observation
-        new_morning = float(np.mean(morning_vals))
-        fp.rmssd_morning_avg = round(
-            alpha * new_morning + (1 - alpha) * fp.rmssd_morning_avg, 1
-        )
-        changed.append("rmssd_morning_avg")
-    elif morning_vals:
-        fp.rmssd_morning_avg = round(float(np.mean(morning_vals)), 1)
-        changed.append("rmssd_morning_avg")
+    # ── Morning average: FROZEN after calibration
+    # EWM updates only happen during the initial calibration window (calibration_days < 3).
+    # After that, morning_avg is the frozen snapshot used as the scoring threshold.
+    if not calibration_locked:
+        morning_vals = [
+            r.value for r in rmssd
+            if 4 <= r.ts.hour < 10
+        ]
+        if morning_vals and fp.rmssd_morning_avg is not None:
+            alpha = 0.2   # weight of new observation
+            new_morning = float(np.mean(morning_vals))
+            fp.rmssd_morning_avg = round(
+                alpha * new_morning + (1 - alpha) * fp.rmssd_morning_avg, 1
+            )
+            changed.append("rmssd_morning_avg")
+        elif morning_vals:
+            fp.rmssd_morning_avg = round(float(np.mean(morning_vals)), 1)
+            changed.append("rmssd_morning_avg")
 
     return changed
 
@@ -211,6 +236,7 @@ def run_update(
     all_activity_obs: Optional[list[ActivityCoherenceObservation]] = None,
     check_in_scores: Optional[list[float]] = None,
     rmssd_same_day: Optional[list[float]] = None,
+    calibration_locked: bool = False,
 ) -> UpdateResult:
     """
     Run all update passes and return a summary of what changed.
@@ -229,6 +255,9 @@ def run_update(
         Normalised subjective scores (0–1) from recent check-ins.
     rmssd_same_day : list | None
         Paired objective RMSSD values for same check-in days.
+    calibration_locked : bool
+        When True, ceiling and morning_avg are frozen (Phase 10).
+        Floor may still decrease.  Pass True once calibration_days ≥ BASELINE_STABLE_DAYS.
 
     Returns
     -------
@@ -239,8 +268,8 @@ def run_update(
     n_arcs = 0
     n_activity = 0
 
-    # RMSSD stats
-    all_changed.extend(update_rmssd_stats(fp, new_readings))
+    # RMSSD stats — respect calibration lock
+    all_changed.extend(update_rmssd_stats(fp, new_readings, calibration_locked=calibration_locked))
 
     # Recovery arc
     arc_fields, n_arcs = update_recovery_arc(fp, new_readings)

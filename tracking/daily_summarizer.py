@@ -3,53 +3,63 @@ tracking/daily_summarizer.py
 
 Computes the final DailySummaryResult from a day's stress and recovery windows.
 
-Outputs three numbers:
-    - Stress Load (0–100): how much ANS stress accumulated from wake to sleep
-    - Recovery Score (0–100): how much recovery credit was deposited
+Outputs three numbers + a running balance:
+    - Stress Load (0–100 display): how much ANS stress accumulated from wake to sleep
+    - Waking Recovery Score (0–100 display): how much recovery credit was deposited
+    - Net Balance (unbounded): credit-card statement including opening carry-forward
     - Readiness (0–100): net position, calibrated by morning read
 
-Formulas ("Credit Card" model v2):
+Formulas ("Credit Card" model — Phase 10):
 
-    STRESS LOAD — cumulative ratchet, fixed denominator:
+    SINGLE SYMMETRIC DENOMINATOR:
 
-        daily_capacity = (personal_morning_avg - personal_floor)
-                         × DAILY_CAPACITY_WAKING_MINUTES (960 min)
+        ns_capacity = (personal_ceiling - personal_floor)
+                      × DAILY_CAPACITY_WAKING_MINUTES (960 min)
+
+        This is the credit limit. Both stress and recovery are measured
+        against the same denominator — personal HRV range × full day.
+        personal_floor and personal_ceiling are FROZEN at calibration snapshot,
+        not updated daily via EWM.
+
+    STRESS % (raw, uncapped):
 
         actual_suppression_area =
             Σ max(0, personal_morning_avg - window_rmssd) × window_duration_min
-            for each waking BackgroundWindow  (never decreases — true ratchet)
+            for each waking BackgroundWindow
 
-        stress_load = clamp(actual_suppression / daily_capacity × 100, 0, 100)
+        stress_pct_raw = actual_suppression_area / ns_capacity × 100
+        (can exceed 100 on severe days — represents genuine debt)
 
-    WAKING RECOVERY SCORE — symmetric credit, fixed denominator:
-
-        waking_recovery_capacity = (personal_ceiling - personal_morning_avg)
-                                   × DAILY_CAPACITY_WAKING_MINUTES (960 min)
+    RECOVERY % (raw, uncapped):
 
         actual_recovery_area_waking =
             Σ max(0, window_rmssd - personal_morning_avg) × window_duration_min
-            for each waking BackgroundWindow  (never decreases — true ratchet)
+            for each waking BackgroundWindow
 
-        waking_recovery_score = clamp(
-            actual_recovery_area_waking / waking_recovery_capacity × 100, 0, 100)
+        recovery_pct_raw = actual_recovery_area_waking / ns_capacity × 100
 
-    NET BALANCE (the "credit card statement"):
+    NET BALANCE — single continuous thread, never resets:
 
-        net_balance = waking_recovery_score - stress_load  ∈ [-100, +100]
-        positive → recovery surplus; negative → stress debt
+        net_balance = recovery_pct_raw - stress_pct_raw + opening_balance
+        opening_balance = previous day's closing_balance (or 0 on first day)
+        closing_balance = net_balance at end of day
+
+        Morning read is a checkpoint: overnight recovery crystallises, opening
+        debt carries forward — scores do NOT reset to zero each morning.
+
+    DISPLAY SCORES (clamped for UI only — do not feed net_balance from these):
+
+        stress_load_score       = clamp(stress_pct_raw, 0, 100)
+        waking_recovery_score   = clamp(recovery_pct_raw, 0, 100)
 
     OVERNIGHT RECOVERY SCORE (unchanged — feeds Readiness only):
         Weighted sum of sleep / zenflow / daytime recovery buckets, 0–100.
 
-    ---
-
-    net_prior = recovery_score - stress_load
-    readiness_prior = READINESS_CENTER + net_prior × READINESS_SCALE
-
-    morning_calibration = morning_rmssd / personal_morning_avg
-        (clamped to 0.5–1.5 to prevent extreme outliers)
-
-    readiness = clamp(readiness_prior × morning_calibration, 0, 100)
+    READINESS:
+        net_prior = recovery_score - stress_load
+        readiness_prior = READINESS_CENTER + net_prior × READINESS_SCALE
+        morning_calibration = morning_rmssd / personal_morning_avg (clamped 0.5–1.5)
+        readiness = clamp(readiness_prior × morning_calibration, 0, 100)
 """
 
 from __future__ import annotations
@@ -101,13 +111,24 @@ class DailySummaryResult:
     raw_recovery_area_zenflow:    float = 0.0
     raw_recovery_area_daytime:    float = 0.0
     raw_recovery_area_waking:     float = 0.0   # RMSSD-above-baseline during waking hours
+    # ns_capacity_used = (ceiling - floor) × 960 — single frozen denominator
+    ns_capacity_used:             float = 0.0
+    # legacy field — kept for DB backward compat, now equals ns_capacity_used
     max_possible_suppression:     float = 0.0
     capacity_floor_used:          Optional[float] = None
     capacity_version:             int = 0
 
     # ── Credit-card scores ─────────────────────────────────────────
-    waking_recovery_score:        Optional[float] = None   # symmetric credit (0–100)
-    net_balance:                  Optional[float] = None   # recovery − stress (−100 to +100)
+    waking_recovery_score:        Optional[float] = None   # display only, clamped 0–100
+    net_balance:                  Optional[float] = None   # raw: recovery% - stress% + opening_balance
+
+    # ── Continuous balance thread ──────────────────────────────────
+    opening_balance:              float = 0.0              # carried in from previous day close
+    closing_balance:              Optional[float] = None   # = net_balance at end of day
+
+    # ── Raw unclamped percentages (for carry-forward integrity) ────
+    stress_pct_raw:               Optional[float] = None   # stress_area / ns_capacity × 100 (unbounded)
+    recovery_pct_raw:             Optional[float] = None   # recovery_area / ns_capacity × 100 (unbounded)
 
     # ── Calibration metadata ───────────────────────────────────────
     calibration_days:     int = 0               # how many baseline days were available
@@ -133,6 +154,7 @@ def compute_daily_summary(
     calibration_days: int,
     morning_rmssd: Optional[float] = None,     # None → readiness not yet computable
     capacity_floor_used: Optional[float] = None,
+    opening_balance: float = 0.0,              # carry-forward from previous closing_balance
 ) -> DailySummaryResult:
     """
     Compute the full daily summary.
@@ -165,6 +187,9 @@ def compute_daily_summary(
     capacity_floor_used : float, optional
         If personalModel has stress_capacity_floor_rmssd, pass it here.
         Defaults to personal_floor if None.
+    opening_balance : float, optional
+        Previous day's closing_balance. Carries the debt or surplus forward.
+        0.0 on first day or when no history exists.
     """
     cfg = CONFIG.tracking
     cap_floor = capacity_floor_used if capacity_floor_used is not None else personal_floor
@@ -173,15 +198,18 @@ def compute_daily_summary(
     # ── Gap analysis ────────────────────────────────────────────────────────
     is_partial = _check_partial_data(background_windows, cfg.GAP_PARTIAL_DATA_MINUTES)
 
-    # ── Stress Load (Option C — fixed denominator, true ratchet) ────────────
-    # Denominator is always a full 16-hour waking day, not elapsed minutes.
-    # This prevents the score from drifting DOWN just because time passes.
-    max_possible_suppression = max(
+    # ── Single symmetric denominator: (ceiling - floor) × 960 ───────────────
+    # Both stress and recovery are measured against the same capacity.
+    # personal_floor and personal_ceiling MUST be frozen calibration snapshots —
+    # do not pass live EWM-updated values here.
+    ns_capacity = max(
         0.0,
-        (personal_morning_avg - cap_floor) * cfg.DAILY_CAPACITY_WAKING_MINUTES
+        (personal_ceiling - personal_floor) * cfg.DAILY_CAPACITY_WAKING_MINUTES
     )
+    # Keep legacy field populated for backward compat
+    max_possible_suppression = ns_capacity
 
-    # Actual suppression area from all background windows in waking hours
+    # ── Actual stress area (suppression below morning baseline) ─────────────
     actual_suppression = _compute_suppression_area(
         windows=background_windows,
         personal_morning_avg=personal_morning_avg,
@@ -190,23 +218,7 @@ def compute_daily_summary(
         window_duration=cfg.BACKGROUND_WINDOW_MINUTES,
     )
 
-    stress_load: Optional[float] = None
-    if max_possible_suppression > 0 and waking_minutes > 0:
-        stress_load = round(
-            _clamp(actual_suppression / max_possible_suppression * 100.0, 0.0, 100.0),
-            1
-        )
-
-    # Fill stress window contributions
-    compute_stress_contributions(stress_windows, max_possible_suppression)
-
-    # ── Waking Recovery Score (credit-card credit leg) ───────────────────────
-    # Symmetric to stress: RMSSD above morning_avg during waking hours.
-    # Same fixed denominator (960 min) so scores are directly comparable.
-    waking_recovery_capacity = max(
-        0.0,
-        (personal_ceiling - personal_morning_avg) * cfg.DAILY_CAPACITY_WAKING_MINUTES
-    )
+    # ── Actual waking recovery area (RMSSD above morning baseline) ──────────
     actual_recovery_area_waking = _compute_recovery_area_waking(
         windows=background_windows,
         personal_morning_avg=personal_morning_avg,
@@ -214,11 +226,23 @@ def compute_daily_summary(
         sleep_ts=boundary.sleep_ts,
         window_duration=cfg.BACKGROUND_WINDOW_MINUTES,
     )
+
+    # ── Raw percentages (unbounded — do NOT clamp before net_balance) ────────
+    stress_pct_raw: Optional[float] = None
+    recovery_pct_raw: Optional[float] = None
+    if ns_capacity > 0 and waking_minutes > 0:
+        stress_pct_raw   = round(actual_suppression / ns_capacity * 100.0, 2)
+        recovery_pct_raw = round(actual_recovery_area_waking / ns_capacity * 100.0, 2)
+
+    # ── Display scores (clamped 0–100 for UI rendering only) ─────────────────
+    stress_load: Optional[float] = None
     waking_recovery_score: Optional[float] = None
-    if waking_recovery_capacity > 0:
-        waking_recovery_score = round(
-            _clamp(actual_recovery_area_waking / waking_recovery_capacity * 100.0, 0.0, 100.0), 1
-        )
+    if stress_pct_raw is not None:
+        stress_load           = round(_clamp(stress_pct_raw, 0.0, 100.0), 1)
+        waking_recovery_score = round(_clamp(recovery_pct_raw or 0.0, 0.0, 100.0), 1)
+
+    # Fill stress window contributions (uses ns_capacity for % calc)
+    compute_stress_contributions(stress_windows, ns_capacity)
 
     # ── Overnight Recovery Score (feeds Readiness — unchanged) ───────────────
     # Max possible recovery area (ceiling - avg) × total recovery window time
@@ -277,12 +301,14 @@ def compute_daily_summary(
         )
         recovery_score = round(_clamp(recovery_weighted * 100.0, 0.0, 100.0), 1)
 
-    # ── Net Balance = waking_recovery − stress_load ─────────────────────────
+    # ── Net Balance — computed from RAW unclamped %s + opening carry-forward ─
+    # NEVER compute net_balance from clamped display scores: that loses information
+    # when stress exceeds 100 ("deep debt" days).
     net_balance: Optional[float] = None
-    if stress_load is not None and waking_recovery_score is not None:
-        net_balance = round(
-            _clamp(waking_recovery_score - stress_load, -100.0, 100.0), 1
-        )
+    closing_balance: Optional[float] = None
+    if stress_pct_raw is not None and recovery_pct_raw is not None:
+        net_balance     = round(recovery_pct_raw - stress_pct_raw + opening_balance, 1)
+        closing_balance = net_balance
 
     # ── Readiness ────────────────────────────────────────────────────────────
     readiness_score: Optional[float] = None
@@ -334,11 +360,16 @@ def compute_daily_summary(
         raw_recovery_area_zenflow=round(raw_zenflow, 2),
         raw_recovery_area_daytime=round(raw_daytime, 2),
         raw_recovery_area_waking=round(actual_recovery_area_waking, 2),
-        max_possible_suppression=round(max_possible_suppression, 2),
+        ns_capacity_used=round(ns_capacity, 2),
+        max_possible_suppression=round(ns_capacity, 2),  # legacy compat
         capacity_floor_used=cap_floor,
         capacity_version=capacity_version,
         waking_recovery_score=waking_recovery_score,
         net_balance=net_balance,
+        opening_balance=opening_balance,
+        closing_balance=closing_balance,
+        stress_pct_raw=stress_pct_raw,
+        recovery_pct_raw=recovery_pct_raw,
         calibration_days=calibration_days,
         is_estimated=is_estimated,
         is_partial_data=is_partial,

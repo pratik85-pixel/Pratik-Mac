@@ -512,6 +512,21 @@ class TrackingService:
         # Count calibration days
         calibration_days = await self._count_days_with_data()
 
+        # ── Phase 10: continuous balance thread ───────────────────────────────
+        # Fetch previous day's closing_balance for carry-forward.
+        prev_date    = target_date - timedelta(days=1)
+        prev_summary = await self._load_day_summary(prev_date)
+        opening_balance = float(prev_summary.closing_balance or 0.0) if prev_summary else 0.0
+
+        # Determine + persist calibration lock
+        calibration_locked = calibration_days >= CONFIG.model.BASELINE_STABLE_DAYS
+        if calibration_locked and personal.calibration_locked_at is None:
+            from datetime import timezone
+            personal.calibration_locked_at = datetime.now(timezone.utc)
+            await self._db.flush()
+            logger.info("Calibration locked for user %s after %d days", self._uid, calibration_days)
+        # ─────────────────────────────────────────────────────────────────────
+
         result = compute_daily_summary(
             user_id              = self._uid,
             summary_date         = day_start,
@@ -525,9 +540,8 @@ class TrackingService:
             capacity_version     = capacity_version,
             calibration_days     = calibration_days,
             capacity_floor_used  = capacity_floor,
+            opening_balance      = opening_balance,
         )
-
-        # Upsert DailyStressSummary
         existing_summary = await self._load_day_summary(target_date)
         if existing_summary is None:
             row = db.DailyStressSummary(
@@ -573,6 +587,12 @@ class TrackingService:
         row.top_recovery_window_id     = top_recovery_id
         row.waking_recovery_score      = result.waking_recovery_score
         row.net_balance                = result.net_balance
+        # Phase 10: continuous balance + raw percentage fields
+        row.opening_balance            = opening_balance
+        row.closing_balance            = result.closing_balance
+        row.ns_capacity_used           = result.ns_capacity_used
+        row.stress_pct_raw             = result.stress_pct_raw
+        row.recovery_pct_raw           = result.recovery_pct_raw
 
         await self._db.commit()
         logger.info("Closed day %s for user %s: readiness=%.0f day_type=%s",
@@ -675,6 +695,11 @@ class TrackingService:
 
         calibration_days = await self._count_days_with_data()
 
+        # Fetch today's opening balance for accurate live net_balance display
+        prev_date    = target_date - timedelta(days=1)
+        prev_summary = await self._load_day_summary(prev_date)
+        opening_balance = float(prev_summary.closing_balance or 0.0) if prev_summary else 0.0
+
         result = compute_daily_summary(
             user_id              = self._uid,
             summary_date         = day_start,
@@ -688,6 +713,7 @@ class TrackingService:
             capacity_version     = capacity_version,
             calibration_days     = calibration_days,
             capacity_floor_used  = capacity_floor,
+            opening_balance      = opening_balance,
         )
         result.is_partial_data = True  # always partial — day is not closed yet
         return result
