@@ -32,7 +32,7 @@ class TrackingConfig(BaseSettings):
     BACKGROUND_WINDOW_MINUTES: int = 5
 
     # downstream: tracking/background_processor (min beats for valid RMSSD)
-    BACKGROUND_MIN_BEATS: int = 20
+    BACKGROUND_MIN_BEATS: int = 25
 
     # ── Stress Detection ────────────────────────────────────────────────────
     # downstream: tracking/stress_detector
