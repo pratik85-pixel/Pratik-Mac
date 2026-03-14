@@ -66,6 +66,16 @@ class TrackingConfig(BaseSettings):
     RECOVERY_WEIGHT_ZENFLOW: float = 0.25
     RECOVERY_WEIGHT_DAYTIME: float = 0.25
 
+    # ── Credit-Card Scoring Model ──────────────────────────────────────────
+    # downstream: tracking/daily_summarizer
+    # Fixed denominator for both Stress Load and Waking Recovery Score.
+    # Represents a full 16-hour waking day in minutes.
+    # Using a fixed denominator ensures:
+    #   - score never drifts DOWN just because time passes (old bug)
+    #   - early-morning events are honest (small % of full-day budget)
+    #   - users can directly compare across time-of-day
+    DAILY_CAPACITY_WAKING_MINUTES: int = 960  # 16 h × 60 min
+
     # ── Readiness Formula ──────────────────────────────────────────────────
     # downstream: tracking/daily_summarizer
     # readiness_prior = READINESS_CENTER + (net × READINESS_SCALE)

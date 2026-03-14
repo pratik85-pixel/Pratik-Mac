@@ -172,12 +172,46 @@ All screens exist. Missing components and hooks.
 ## Build Order Summary
 
 ```
-Phase 1 (Blockers) → Test scores on device
-Phase 2 (Tagging)  → Test nudge → tag flow on device  
-Phase 3 (Psych)    → Test mood log + profile
-Phase 4 (Signals)  → Silent improvement, verify in DB
-Phase 5 (Outcomes) → Test weekly report screen
-Phase 6 (Coach)    → Test morning brief has real context
-Phase 7 (Frontend) → Test full UX end-to-end
-Phase 8 (Infra/QA) → Production ready
+Phase 1 (Blockers)     → Test scores on device
+Phase 2 (Tagging)      → Test nudge → tag flow on device  
+Phase 3 (Psych)        → Test mood log + profile
+Phase 4 (Signals)      → Silent improvement, verify in DB
+Phase 5 (Outcomes)     → Test weekly report screen
+Phase 6 (Coach)        → Test morning brief has real context
+Phase 7 (Frontend)     → Test full UX end-to-end
+Phase 8 (Infra/QA)     → Production ready
+Phase 9 (Scoring v2)   → Option C credit-card model + Balance hero UI
 ```
+
+---
+
+## Phase 9 — Credit-Card Scoring Model (Option C)
+
+**Problem identified:** The original stress formula used `waking_minutes` as the denominator (`max_possible_suppression = (avg - floor) × waking_minutes`). As the day progressed, the denominator grew, causing stress scores to drift DOWN even when no recovery occurred — mathematically dishonest.
+
+**Solution (Option C — fixed denominator + symmetric credit/debit accumulators):**
+
+```
+# Stress: denominator fixed at full 16h day — true ratchet
+daily_capacity = (morning_avg - floor) × 960 min
+stress_load = clamp(actual_suppression / daily_capacity × 100, 0, 100)
+
+# Waking recovery: symmetric credit accumulator
+waking_recovery_capacity = (ceiling - morning_avg) × 960 min
+waking_recovery_score = clamp(actual_waking_recovery / waking_recovery_capacity × 100, 0, 100)
+
+# Net balance: hero metric on HomeScreen
+net_balance = waking_recovery_score - stress_load  # ∈ [-100, +100]
+```
+
+| # | Task | File(s) | Status |
+|---|------|---------|--------|
+| 9.1 | Add `DAILY_CAPACITY_WAKING_MINUTES = 960` constant | `config/tracking.py` | ✅ |
+| 9.2 | Rewrite `daily_summarizer.py` — Option C formulas, add `waking_recovery_score`, `net_balance` to `DailySummaryResult` | `tracking/daily_summarizer.py` | ✅ |
+| 9.3 | Add `waking_recovery_score`, `net_balance`, `raw_recovery_area_waking` columns to DB schema | `api/db/schema.py` + Alembic migration | ✅ |
+| 9.4 | Wire new fields in `close_day()` DB write | `api/services/tracking_service.py` | ✅ |
+| 9.5 | Expose `waking_recovery_score` and `net_balance` in `DailySummaryResponse` + `CloseDayResponse` | `api/routers/tracking.py` | ✅ |
+| 9.6 | HomeScreen redesign: Balance hero `ScoreRing` (148px) + 2 tiles (Stress, Recovery) | `ZenFlowVerity/src/screens/HomeScreen.tsx` | ✅ |
+| 9.7 | Widen `ScoreRing.value` to `string | number | null` for `+15`/`-8` display | `ZenFlowVerity/src/ui/zenflow-ui-kit.tsx` | ✅ |
+
+**Gate:** `GET /tracking/daily-summary` returns `{ net_balance: 12.3, waking_recovery_score: 45.1, ... }`. HomeScreen shows Balance ring with signed number, green/blue color, and recovery/stress descriptor.

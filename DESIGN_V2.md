@@ -516,26 +516,56 @@ TODAY'S READINESS   71             (net position, calibrated by morning read)
 ### Stress Load (0–100)
 
 How much autonomic stress accumulated from wake to sleep.
-- 100 = RMSSD suppressed to personal floor for entire waking day
-- 0 = RMSSD never dropped below personal average
+- 100 = RMSSD suppressed to personal floor for entire 16-hour waking day
+- 0 = RMSSD never dropped below personal morning average
 
-**Formula:**
+**Formula ("Credit Card" model — Option C, v2):**
 ```
-waking_minutes = sleep_onset_ts - wake_ts
+# Denominator is always a full 16-hour waking day (960 min),
+# NEVER elapsed minutes — so the score only ratchets UP, never drifts down.
 
-max_possible_suppression_area =
-    (personal_morning_avg_rmssd - personal_rmssd_floor) × waking_minutes
+daily_capacity = (personal_morning_avg_rmssd - personal_rmssd_floor) × 960
 
 actual_suppression_area =
     Σ max(0, personal_morning_avg_rmssd - window_rmssd) × window_duration_minutes
     for each 5-min BackgroundWindow during waking hours
 
-stress_load = (actual_suppression_area / max_possible_suppression_area) × 100
+stress_load = clamp(actual_suppression_area / daily_capacity × 100, 0, 100)
 ```
 
-### Recovery Score (0–100)
+### Waking Recovery Score (0–100)
 
-How much recovery credit deposited from yesterday's morning read to this morning's read. Window deliberately includes sleep — the primary recovery mechanism.
+How much RMSSD-above-baseline credit accumulated during waking hours (symmetric credit leg). Like stress, this is a **ratchet**: it can only increase during the day.
+
+```
+waking_recovery_capacity = (personal_rmssd_ceiling - personal_morning_avg_rmssd) × 960
+
+actual_recovery_area_waking =
+    Σ max(0, window_rmssd - personal_morning_avg_rmssd) × window_duration_minutes
+    for each 5-min waking BackgroundWindow
+
+waking_recovery_score = clamp(
+    actual_recovery_area_waking / waking_recovery_capacity × 100, 0, 100)
+```
+
+### Net Balance (−100 to +100) — Hero Metric
+
+The "credit card statement": how much recovery surplus or stress debt you have at any moment.
+
+```
+net_balance = waking_recovery_score - stress_load
+
+# negative → stress debt; positive → recovery surplus
+# -100 = max stress, zero recovery
+# +100 = max recovery, zero stress
+```
+
+**UI mapping:** `progress = (net_balance + 100) / 200` maps −100→0%, 0→50%, +100→100%.
+Color: `#39E27D` (green) when ≥0, `#19B5FE` (blue) when <0.
+
+### Overnight Recovery Score (0–100) — Feeds Readiness
+
+How much recovery credit deposited from yesterday's morning read to this morning's read. Window deliberately includes sleep — the primary recovery mechanism. Used ONLY to compute Readiness; not shown as a standalone metric on HomeScreen.
 
 **Weighted contributions:**
 - Sleep: weight 0.50 (largest recovery mechanism)

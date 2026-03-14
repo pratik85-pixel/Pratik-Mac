@@ -47,17 +47,19 @@ async def _tracking_svc(
 # ── Response models ────────────────────────────────────────────────────────────
 
 class DailySummaryResponse(BaseModel):
-    summary_date:      str
-    stress_load_score: Optional[float]
-    recovery_score:    Optional[float]
-    readiness_score:   Optional[float]
-    day_type:          Optional[str]
-    calibration_days:  int
-    is_estimated:      bool
-    is_partial_data:   bool
-    wake_ts:           Optional[str]
-    sleep_ts:          Optional[str]
-    waking_minutes:    Optional[float]
+    summary_date:          str
+    stress_load_score:     Optional[float]
+    recovery_score:        Optional[float]
+    readiness_score:       Optional[float]
+    waking_recovery_score: Optional[float] = None
+    net_balance:           Optional[float] = None
+    day_type:              Optional[str]
+    calibration_days:      int
+    is_estimated:          bool
+    is_partial_data:       bool
+    wake_ts:               Optional[str]
+    sleep_ts:              Optional[str]
+    waking_minutes:        Optional[float]
 
 
 class WaveformPoint(BaseModel):
@@ -161,17 +163,19 @@ async def get_today_summary(
     if row is not None:
         r = _build_summary_response(row)
         return DailySummaryResponse(
-            summary_date      = today.isoformat(),
-            stress_load_score = r.stress_load_score,
-            recovery_score    = r.recovery_score,
-            readiness_score   = r.readiness_score,
-            day_type          = r.day_type,
-            calibration_days  = r.calibration_days,
-            is_estimated      = True,
-            is_partial_data   = True,
-            wake_ts           = None,
-            sleep_ts          = None,
-            waking_minutes    = None,
+            summary_date          = today.isoformat(),
+            stress_load_score     = r.stress_load_score,
+            recovery_score        = r.recovery_score,
+            readiness_score       = r.readiness_score,
+            waking_recovery_score = r.waking_recovery_score,
+            net_balance           = r.net_balance,
+            day_type              = r.day_type,
+            calibration_days      = r.calibration_days,
+            is_estimated          = True,
+            is_partial_data       = True,
+            wake_ts               = None,
+            sleep_ts              = None,
+            waking_minutes        = None,
         )
 
     raise HTTPException(status_code=404, detail="No summary available yet.")
@@ -185,6 +189,8 @@ async def get_summary_by_date(
     """Return the three numbers for a specific date (YYYY-MM-DD)."""
     target = _parse_date(date_str)
     row    = await svc.get_daily_summary(target)
+    if row is None:
+        row = await svc.compute_live_summary(target)
     if row is None:
         raise HTTPException(status_code=404, detail=f"No summary found for {date_str}.")
     return _build_summary_response(row)
@@ -349,6 +355,7 @@ async def ingest_beats(
         except Exception:
             logger.exception("ingest_background_window failed for window %s", win_start)
 
+    logger.info("INGEST uid=%s windows_processed=%d beats=%d", svc._uid, windows_processed, len(beats))
     return IngestResponse(windows_processed=windows_processed, beats_received=len(beats))
 
 
@@ -377,12 +384,14 @@ class CloseDayRequest(BaseModel):
 
 
 class CloseDayResponse(BaseModel):
-    summary_date:      str
-    stress_load_score: Optional[float]
-    recovery_score:    Optional[float]
-    readiness_score:   Optional[float]
-    day_type:          Optional[str]
-    is_estimated:      bool
+    summary_date:          str
+    stress_load_score:     Optional[float]
+    recovery_score:        Optional[float]
+    readiness_score:       Optional[float]
+    waking_recovery_score: Optional[float] = None
+    net_balance:           Optional[float] = None
+    day_type:              Optional[str]
+    is_estimated:          bool
 
 
 @router.post("/close-day", response_model=CloseDayResponse)
@@ -408,12 +417,14 @@ async def close_day(
         raise HTTPException(status_code=500, detail=f"close_day failed: {exc}") from exc
 
     return CloseDayResponse(
-        summary_date      = target.isoformat(),
-        stress_load_score = result.stress_load_score,
-        recovery_score    = result.recovery_score,
-        readiness_score   = result.readiness_score,
-        day_type          = result.day_type,
-        is_estimated      = result.is_estimated,
+        summary_date          = target.isoformat(),
+        stress_load_score     = result.stress_load_score,
+        recovery_score        = result.recovery_score,
+        readiness_score       = result.readiness_score,
+        waking_recovery_score = result.waking_recovery_score,
+        net_balance           = result.net_balance,
+        day_type              = result.day_type,
+        is_estimated          = result.is_estimated,
     )
 
 
@@ -446,15 +457,17 @@ async def get_history(
 
 def _build_summary_response(row) -> DailySummaryResponse:
     return DailySummaryResponse(
-        summary_date      = row.summary_date.date().isoformat() if row.summary_date else "",
-        stress_load_score = row.stress_load_score,
-        recovery_score    = row.recovery_score,
-        readiness_score   = row.readiness_score,
-        day_type          = row.day_type,
-        calibration_days  = row.calibration_days or 0,
-        is_estimated      = row.is_estimated,
-        is_partial_data   = row.is_partial_data,
-        wake_ts           = _fmt_ts(row.wake_ts),
-        sleep_ts          = _fmt_ts(row.sleep_ts),
-        waking_minutes    = row.waking_minutes,
+        summary_date          = row.summary_date.date().isoformat() if row.summary_date else "",
+        stress_load_score     = row.stress_load_score,
+        recovery_score        = row.recovery_score,
+        readiness_score       = row.readiness_score,
+        waking_recovery_score = getattr(row, 'waking_recovery_score', None),
+        net_balance           = getattr(row, 'net_balance', None),
+        day_type              = row.day_type,
+        calibration_days      = row.calibration_days or 0,
+        is_estimated          = row.is_estimated,
+        is_partial_data       = row.is_partial_data,
+        wake_ts               = _fmt_ts(row.wake_ts),
+        sleep_ts              = _fmt_ts(row.sleep_ts),
+        waking_minutes        = row.waking_minutes,
     )

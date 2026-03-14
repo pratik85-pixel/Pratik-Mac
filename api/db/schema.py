@@ -703,12 +703,17 @@ class DailyStressSummary(Base):
     # "green" | "yellow" | "red" — derived from readiness_score
     day_type     = Column(String(10), nullable=True)
 
+    # Credit-card model scores (Option C, v2)
+    waking_recovery_score = Column(Float, nullable=True)  # RMSSD-above-baseline, 0-100
+    net_balance           = Column(Float, nullable=True)  # waking_recovery - stress_load, -100 to +100
+
     # Raw inputs (for recompute under new baseline)
-    raw_suppression_area      = Column(Float, nullable=False, default=0.0)
-    raw_recovery_area_sleep   = Column(Float, nullable=False, default=0.0)
-    raw_recovery_area_zenflow = Column(Float, nullable=False, default=0.0)
-    raw_recovery_area_daytime = Column(Float, nullable=False, default=0.0)
-    max_possible_suppression  = Column(Float, nullable=False, default=0.0)
+    raw_suppression_area       = Column(Float, nullable=False, default=0.0)
+    raw_recovery_area_sleep    = Column(Float, nullable=False, default=0.0)
+    raw_recovery_area_zenflow  = Column(Float, nullable=False, default=0.0)
+    raw_recovery_area_daytime  = Column(Float, nullable=False, default=0.0)
+    raw_recovery_area_waking   = Column(Float, nullable=False, default=0.0)
+    max_possible_suppression   = Column(Float, nullable=False, default=0.0)
 
     # Baseline versioning
     capacity_floor_used = Column(Float, nullable=True)

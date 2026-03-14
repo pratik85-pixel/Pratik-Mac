@@ -8,28 +8,38 @@ Outputs three numbers:
     - Recovery Score (0–100): how much recovery credit was deposited
     - Readiness (0–100): net position, calibrated by morning read
 
-Formulas:
+Formulas ("Credit Card" model v2):
 
-    max_possible_suppression_area =
-        (personal_morning_avg - personal_floor) × waking_minutes
+    STRESS LOAD — cumulative ratchet, fixed denominator:
 
-    actual_suppression_area =
-        Σ max(0, personal_morning_avg - window_rmssd) × window_duration_min
-        for each BackgroundWindow during waking hours
+        daily_capacity = (personal_morning_avg - personal_floor)
+                         × DAILY_CAPACITY_WAKING_MINUTES (960 min)
 
-    stress_load = clamp(actual_suppression / max_possible × 100, 0, 100)
+        actual_suppression_area =
+            Σ max(0, personal_morning_avg - window_rmssd) × window_duration_min
+            for each waking BackgroundWindow  (never decreases — true ratchet)
 
-    ---
+        stress_load = clamp(actual_suppression / daily_capacity × 100, 0, 100)
 
-    Recovery uses weighted contributions from three buckets:
-        sleep_area      → weight RECOVERY_WEIGHT_SLEEP
-        zenflow_area    → weight RECOVERY_WEIGHT_ZENFLOW
-        daytime_area    → weight RECOVERY_WEIGHT_DAYTIME
+    WAKING RECOVERY SCORE — symmetric credit, fixed denominator:
 
-    Each bucket's area is normalized independently against the total max possible
-    recovery area across all contexts, then recombined with weights.
+        waking_recovery_capacity = (personal_ceiling - personal_morning_avg)
+                                   × DAILY_CAPACITY_WAKING_MINUTES (960 min)
 
-    recovery_score = clamp(weighted_sum × 100, 0, 100)
+        actual_recovery_area_waking =
+            Σ max(0, window_rmssd - personal_morning_avg) × window_duration_min
+            for each waking BackgroundWindow  (never decreases — true ratchet)
+
+        waking_recovery_score = clamp(
+            actual_recovery_area_waking / waking_recovery_capacity × 100, 0, 100)
+
+    NET BALANCE (the "credit card statement"):
+
+        net_balance = waking_recovery_score - stress_load  ∈ [-100, +100]
+        positive → recovery surplus; negative → stress debt
+
+    OVERNIGHT RECOVERY SCORE (unchanged — feeds Readiness only):
+        Weighted sum of sleep / zenflow / daytime recovery buckets, 0–100.
 
     ---
 
@@ -86,13 +96,18 @@ class DailySummaryResult:
     day_type:             Optional[str]       # "green" | "yellow" | "red"
 
     # ── Raw inputs (for recompute under new baseline) ──────────────
-    raw_suppression_area:       float = 0.0
-    raw_recovery_area_sleep:    float = 0.0
-    raw_recovery_area_zenflow:  float = 0.0
-    raw_recovery_area_daytime:  float = 0.0
-    max_possible_suppression:   float = 0.0
-    capacity_floor_used:        Optional[float] = None
-    capacity_version:           int = 0
+    raw_suppression_area:         float = 0.0
+    raw_recovery_area_sleep:      float = 0.0
+    raw_recovery_area_zenflow:    float = 0.0
+    raw_recovery_area_daytime:    float = 0.0
+    raw_recovery_area_waking:     float = 0.0   # RMSSD-above-baseline during waking hours
+    max_possible_suppression:     float = 0.0
+    capacity_floor_used:          Optional[float] = None
+    capacity_version:             int = 0
+
+    # ── Credit-card scores ─────────────────────────────────────────
+    waking_recovery_score:        Optional[float] = None   # symmetric credit (0–100)
+    net_balance:                  Optional[float] = None   # recovery − stress (−100 to +100)
 
     # ── Calibration metadata ───────────────────────────────────────
     calibration_days:     int = 0               # how many baseline days were available
@@ -158,11 +173,12 @@ def compute_daily_summary(
     # ── Gap analysis ────────────────────────────────────────────────────────
     is_partial = _check_partial_data(background_windows, cfg.GAP_PARTIAL_DATA_MINUTES)
 
-    # ── Stress Load ─────────────────────────────────────────────────────────
-    # Max possible: (avg - floor) × waking_minutes
+    # ── Stress Load (Option C — fixed denominator, true ratchet) ────────────
+    # Denominator is always a full 16-hour waking day, not elapsed minutes.
+    # This prevents the score from drifting DOWN just because time passes.
     max_possible_suppression = max(
         0.0,
-        (personal_morning_avg - cap_floor) * waking_minutes
+        (personal_morning_avg - cap_floor) * cfg.DAILY_CAPACITY_WAKING_MINUTES
     )
 
     # Actual suppression area from all background windows in waking hours
@@ -184,14 +200,32 @@ def compute_daily_summary(
     # Fill stress window contributions
     compute_stress_contributions(stress_windows, max_possible_suppression)
 
-    # ── Recovery Score ───────────────────────────────────────────────────────
+    # ── Waking Recovery Score (credit-card credit leg) ───────────────────────
+    # Symmetric to stress: RMSSD above morning_avg during waking hours.
+    # Same fixed denominator (960 min) so scores are directly comparable.
+    waking_recovery_capacity = max(
+        0.0,
+        (personal_ceiling - personal_morning_avg) * cfg.DAILY_CAPACITY_WAKING_MINUTES
+    )
+    actual_recovery_area_waking = _compute_recovery_area_waking(
+        windows=background_windows,
+        personal_morning_avg=personal_morning_avg,
+        wake_ts=boundary.wake_ts,
+        sleep_ts=boundary.sleep_ts,
+        window_duration=cfg.BACKGROUND_WINDOW_MINUTES,
+    )
+    waking_recovery_score: Optional[float] = None
+    if waking_recovery_capacity > 0:
+        waking_recovery_score = round(
+            _clamp(actual_recovery_area_waking / waking_recovery_capacity * 100.0, 0.0, 100.0), 1
+        )
+
+    # ── Overnight Recovery Score (feeds Readiness — unchanged) ───────────────
     # Max possible recovery area (ceiling - avg) × total recovery window time
-    # We use the same max possible suppression denominator for symmetry
-    # (floor ↔ ceiling inverted)
     max_possible_recovery = max(
         0.0,
         (personal_ceiling - personal_morning_avg) * (waking_minutes + 480.0)
-        # +480 min (~8h) for sleep — recovery window is longer than stress window
+        # +480 min (~8h) for sleep — overnight recovery window is longer
     )
 
     raw_sleep = sum(
@@ -243,6 +277,13 @@ def compute_daily_summary(
         )
         recovery_score = round(_clamp(recovery_weighted * 100.0, 0.0, 100.0), 1)
 
+    # ── Net Balance = waking_recovery − stress_load ─────────────────────────
+    net_balance: Optional[float] = None
+    if stress_load is not None and waking_recovery_score is not None:
+        net_balance = round(
+            _clamp(waking_recovery_score - stress_load, -100.0, 100.0), 1
+        )
+
     # ── Readiness ────────────────────────────────────────────────────────────
     readiness_score: Optional[float] = None
     if morning_rmssd is not None and stress_load is not None and recovery_score is not None:
@@ -292,15 +333,43 @@ def compute_daily_summary(
         raw_recovery_area_sleep=round(raw_sleep, 2),
         raw_recovery_area_zenflow=round(raw_zenflow, 2),
         raw_recovery_area_daytime=round(raw_daytime, 2),
+        raw_recovery_area_waking=round(actual_recovery_area_waking, 2),
         max_possible_suppression=round(max_possible_suppression, 2),
         capacity_floor_used=cap_floor,
         capacity_version=capacity_version,
+        waking_recovery_score=waking_recovery_score,
+        net_balance=net_balance,
         calibration_days=calibration_days,
         is_estimated=is_estimated,
         is_partial_data=is_partial,
         top_stress_window_id=None,   # DB layer fills FK
         top_recovery_window_id=None,
     )
+
+
+def _compute_recovery_area_waking(
+    windows: list[BackgroundWindowResult],
+    personal_morning_avg: float,
+    wake_ts: Optional[datetime],
+    sleep_ts: Optional[datetime],
+    window_duration: int,
+) -> float:
+    """Sum of max(0, rmssd - avg) × duration for valid waking windows.
+
+    This is the symmetric credit leg of the credit-card model:
+    windows where RMSSD is *above* morning baseline accumulate recovery credit.
+    Like stress_balance, this only ever increases — a true ratchet.
+    """
+    total = 0.0
+    for w in windows:
+        if not w.is_valid or w.context != "background" or w.rmssd_ms is None:
+            continue
+        if wake_ts is not None and w.window_start < wake_ts:
+            continue
+        if sleep_ts is not None and w.window_end > sleep_ts:
+            continue
+        total += max(0.0, w.rmssd_ms - personal_morning_avg) * window_duration
+    return total
 
 
 def _compute_suppression_area(

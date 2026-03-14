@@ -27,6 +27,7 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Optional, Sequence
 
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from tracking.background_processor import BackgroundWindowResult, aggregate_background_window
@@ -344,6 +345,14 @@ class TrackingService:
 
         Returns the BackgroundWindowResult for the caller (e.g. live UI push).
         """
+        # Auto-create the user row if it doesn't exist yet (avoids FK violation
+        # on background_windows when the user has never called /user/register).
+        await self._db.execute(
+            pg_insert(db.User)
+            .values(id=self._uid, name="User")
+            .on_conflict_do_nothing(index_elements=["id"])
+        )
+
         result = aggregate_background_window(
             user_id      = self._uid,
             ppi_ms       = np.array(ppi_ms, dtype=float),
@@ -553,6 +562,7 @@ class TrackingService:
         row.raw_recovery_area_sleep    = result.raw_recovery_area_sleep
         row.raw_recovery_area_zenflow  = result.raw_recovery_area_zenflow
         row.raw_recovery_area_daytime  = result.raw_recovery_area_daytime
+        row.raw_recovery_area_waking   = result.raw_recovery_area_waking
         row.max_possible_suppression   = result.max_possible_suppression
         row.capacity_floor_used        = capacity_floor
         row.capacity_version           = capacity_version
@@ -561,6 +571,8 @@ class TrackingService:
         row.is_partial_data            = result.is_partial_data
         row.top_stress_window_id       = top_stress_id
         row.top_recovery_window_id     = top_recovery_id
+        row.waking_recovery_score      = result.waking_recovery_score
+        row.net_balance                = result.net_balance
 
         await self._db.commit()
         logger.info("Closed day %s for user %s: readiness=%.0f day_type=%s",
