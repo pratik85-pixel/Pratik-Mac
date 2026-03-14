@@ -175,6 +175,28 @@ def create_app() -> FastAPI:
             "active_sessions": app.state.session_service.active_count(),
         }
 
+    # ── TEMP admin reset — remove after use ───────────────────────────────────
+    from fastapi import Depends, HTTPException
+    from sqlalchemy.ext.asyncio import AsyncSession
+    from api.db.database import get_db
+
+    @app.delete("/admin/reset-calibration/{user_id}", tags=["meta"])
+    async def reset_calibration(user_id: str, token: str, db: AsyncSession = Depends(get_db)):
+        import uuid as _uuid
+        if token != "zenflow-reset-2026":
+            raise HTTPException(status_code=403, detail="forbidden")
+        try:
+            uid = _uuid.UUID(user_id)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="bad uuid")
+        from sqlalchemy import text as _text
+        await db.execute(_text("DELETE FROM capacity_snapshot      WHERE user_id = :u"), {"u": str(uid)})
+        await db.execute(_text("DELETE FROM daily_stress_summaries WHERE user_id = :u"), {"u": str(uid)})
+        await db.execute(_text("DELETE FROM personal_models        WHERE user_id = :u"), {"u": str(uid)})
+        await db.commit()
+        return {"deleted": True, "user_id": str(uid)}
+    # ── END TEMP ──────────────────────────────────────────────────────────────
+
     # ── Global error handler ──────────────────────────────────────────────────
     @app.exception_handler(Exception)
     async def _unhandled(request: Request, exc: Exception) -> JSONResponse:
