@@ -623,6 +623,63 @@ class TrackingService:
     ) -> Optional[db.DailyStressSummary]:
         return await self._load_day_summary(target_date)
 
+    async def compute_live_summary(
+        self, target_date: date
+    ) -> Optional[DailySummaryResult]:
+        """
+        Compute the three scores on-the-fly from today's existing intraday windows
+        WITHOUT writing anything to the database.
+
+        Returns None if there are no background windows yet (band not worn).
+        Always marks is_partial_data=True since the day is not finalized.
+        """
+        day_start = datetime(target_date.year, target_date.month, target_date.day, tzinfo=UTC)
+        day_end   = day_start + timedelta(days=1)
+
+        bg_windows = await _load_today_background(self._db, self._uid, day_start, day_end)
+        if not bg_windows:
+            return None
+
+        personal         = await _bootstrap_personal_model(self._db, self._uid)
+        morning_rmssd    = personal.rmssd_morning_avg
+        capacity_floor   = personal.stress_capacity_floor_rmssd or personal.rmssd_floor
+        capacity_ceiling = personal.rmssd_ceiling
+        capacity_version = personal.capacity_version or 0
+
+        # Use already-detected intraday windows (kept fresh by ingest_background_window)
+        stress_db        = await _load_existing_stress_windows(self._db, self._uid, day_start, day_end)
+        recovery_db      = await _load_existing_recovery_windows(self._db, self._uid, day_start, day_end)
+        stress_results   = self._db_stress_to_results(stress_db)
+        recovery_results = self._db_recovery_to_results(recovery_db)
+
+        last_bg_ts = bg_windows[-1].window_end
+        boundary   = detect_wake_sleep_boundary(
+            day_date                  = day_start,
+            user_id                   = self._uid,
+            typical_wake_time         = personal.typical_wake_time,
+            typical_sleep_time        = personal.typical_sleep_time,
+            last_background_window_ts = last_bg_ts,
+        )
+
+        calibration_days = await self._count_days_with_data()
+
+        result = compute_daily_summary(
+            user_id              = self._uid,
+            summary_date         = day_start,
+            background_windows   = bg_windows,
+            stress_windows       = stress_results,
+            recovery_windows     = recovery_results,
+            boundary             = boundary,
+            personal_morning_avg = morning_rmssd or 0.0,
+            personal_floor       = capacity_floor or 0.0,
+            personal_ceiling     = capacity_ceiling or (morning_rmssd or 0.0),
+            capacity_version     = capacity_version,
+            calibration_days     = calibration_days,
+            capacity_floor_used  = capacity_floor,
+        )
+        result.is_partial_data = True  # always partial — day is not closed yet
+        return result
+
     async def get_stress_windows(
         self, target_date: date
     ) -> list[db.StressWindow]:

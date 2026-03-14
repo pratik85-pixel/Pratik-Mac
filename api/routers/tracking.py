@@ -15,7 +15,7 @@ GET  /tracking/history                 — readiness trend (last N days, default
 from __future__ import annotations
 
 import logging
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Annotated, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Response
@@ -134,12 +134,47 @@ def _fmt_ts(ts: Optional[datetime]) -> Optional[str]:
 async def get_today_summary(
     svc: TrackingService = Depends(_tracking_svc),
 ) -> DailySummaryResponse:
-    """Return the three numbers (stress / recovery / readiness) for today."""
+    """
+    Return the three numbers (stress / recovery / readiness) for today.
+
+    Fallback chain:
+    1. Persisted DailyStressSummary row for today (finalized or partial).
+    2. Live on-the-fly computation from today's intraday windows (no DB write).
+    3. Yesterday's finalized summary carried forward (is_partial_data=True).
+    4. 404 — no data at all yet.
+    """
     today = datetime.now(UTC).date()
-    row   = await svc.get_daily_summary(today)
-    if row is None:
-        raise HTTPException(status_code=404, detail="No summary available for today yet.")
-    return _build_summary_response(row)
+
+    # 1. Persisted summary
+    row = await svc.get_daily_summary(today)
+    if row is not None:
+        return _build_summary_response(row)
+
+    # 2. Live computation from today's background windows (no DB write)
+    live = await svc.compute_live_summary(today)
+    if live is not None:
+        return _build_summary_response(live)
+
+    # 3. Carry-forward from yesterday
+    yesterday = (datetime.now(UTC) - timedelta(days=1)).date()
+    row = await svc.get_daily_summary(yesterday)
+    if row is not None:
+        r = _build_summary_response(row)
+        return DailySummaryResponse(
+            summary_date      = today.isoformat(),
+            stress_load_score = r.stress_load_score,
+            recovery_score    = r.recovery_score,
+            readiness_score   = r.readiness_score,
+            day_type          = r.day_type,
+            calibration_days  = r.calibration_days,
+            is_estimated      = True,
+            is_partial_data   = True,
+            wake_ts           = None,
+            sleep_ts          = None,
+            waking_minutes    = None,
+        )
+
+    raise HTTPException(status_code=404, detail="No summary available yet.")
 
 
 @router.get("/daily-summary/{date_str}", response_model=DailySummaryResponse)
