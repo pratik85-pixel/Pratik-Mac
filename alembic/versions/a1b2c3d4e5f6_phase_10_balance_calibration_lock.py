@@ -28,41 +28,30 @@ depends_on     = None
 
 
 def upgrade() -> None:
-    # ── daily_stress_summary ──────────────────────────────────────────────────
-    with op.batch_alter_table("daily_stress_summary") as batch_op:
-        batch_op.add_column(
-            sa.Column("opening_balance", sa.Float(), nullable=True,
-                      server_default=sa.text("0"))
-        )
-        batch_op.add_column(
-            sa.Column("closing_balance", sa.Float(), nullable=True)
-        )
-        batch_op.add_column(
-            sa.Column("stress_pct_raw", sa.Float(), nullable=True)
-        )
-        batch_op.add_column(
-            sa.Column("recovery_pct_raw", sa.Float(), nullable=True)
-        )
-        batch_op.add_column(
-            sa.Column("ns_capacity_used", sa.Float(), nullable=True,
-                      server_default=sa.text("0"))
-        )
+    # ── daily_stress_summaries ────────────────────────────────────────────────
+    op.add_column("daily_stress_summaries",
+        sa.Column("opening_balance", sa.Float(), nullable=True,
+                  server_default=sa.text("0")))
+    op.add_column("daily_stress_summaries",
+        sa.Column("closing_balance", sa.Float(), nullable=True))
+    op.add_column("daily_stress_summaries",
+        sa.Column("stress_pct_raw", sa.Float(), nullable=True))
+    op.add_column("daily_stress_summaries",
+        sa.Column("recovery_pct_raw", sa.Float(), nullable=True))
+    op.add_column("daily_stress_summaries",
+        sa.Column("ns_capacity_used", sa.Float(), nullable=True,
+                  server_default=sa.text("0")))
 
-    # ── personal_model ────────────────────────────────────────────────────────
-    with op.batch_alter_table("personal_model") as batch_op:
-        batch_op.add_column(
-            sa.Column("calibration_locked_at",
-                      sa.DateTime(timezone=True), nullable=True)
-        )
+    # ── personal_models ───────────────────────────────────────────────────────
+    op.add_column("personal_models",
+        sa.Column("calibration_locked_at",
+                  sa.DateTime(timezone=True), nullable=True))
 
 
 def downgrade() -> None:
-    with op.batch_alter_table("personal_model") as batch_op:
-        batch_op.drop_column("calibration_locked_at")
-
-    with op.batch_alter_table("daily_stress_summary") as batch_op:
-        batch_op.drop_column("ns_capacity_used")
-        batch_op.drop_column("recovery_pct_raw")
-        batch_op.drop_column("stress_pct_raw")
-        batch_op.drop_column("closing_balance")
-        batch_op.drop_column("opening_balance")
+    op.drop_column("personal_models", "calibration_locked_at")
+    op.drop_column("daily_stress_summaries", "ns_capacity_used")
+    op.drop_column("daily_stress_summaries", "recovery_pct_raw")
+    op.drop_column("daily_stress_summaries", "stress_pct_raw")
+    op.drop_column("daily_stress_summaries", "closing_balance")
+    op.drop_column("daily_stress_summaries", "opening_balance")
