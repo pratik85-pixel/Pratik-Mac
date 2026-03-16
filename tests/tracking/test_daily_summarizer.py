@@ -27,9 +27,6 @@ from tracking.stress_detector import StressWindowResult
 from tracking.recovery_detector import RecoveryWindowResult
 from tracking.daily_summarizer import DailySummaryResult, compute_daily_summary, _clamp
 from tracking.wake_detector import WakeSleepBoundary
-from config import CONFIG
-
-_cfg = CONFIG.tracking
 
 _DAY = datetime(2024, 1, 15, 0, 0, 0, tzinfo=UTC)
 _WAKE = datetime(2024, 1, 15, 7, 0, 0, tzinfo=UTC)
@@ -89,8 +86,9 @@ def _make_summary(
     personal_floor: float = 30.0,
     personal_ceiling: float = 100.0,
     capacity_version: int = 0,
-    calibration_days: int = 14,
-    morning_rmssd: Optional[float] = 60.0,
+    calibration_days: int = 3,
+    calibration_locked: bool = True,
+    day_type: Optional[str] = None,
     capacity_floor_used: Optional[float] = None,
 ) -> DailySummaryResult:
     return compute_daily_summary(
@@ -105,7 +103,8 @@ def _make_summary(
         personal_ceiling     = personal_ceiling,
         capacity_version     = capacity_version,
         calibration_days     = calibration_days,
-        morning_rmssd        = morning_rmssd,
+        calibration_locked   = calibration_locked,
+        day_type             = day_type,
         capacity_floor_used  = capacity_floor_used,
     )
 
@@ -168,88 +167,52 @@ class TestStressLoad:
         assert deep_score >= light_score
 
 
-# ── Recovery score ────────────────────────────────────────────────────────────
+# ── Recovery (waking) score ────────────────────────────────────────────────────
 
 class TestRecoveryScore:
 
-    def test_recovery_score_bounded_0_to_100(self):
+    def test_waking_recovery_score_bounded_0_to_100(self):
         result = _make_summary()
-        if result.recovery_score is not None:
-            assert 0.0 <= result.recovery_score <= 100.0
+        if result.waking_recovery_score is not None:
+            assert 0.0 <= result.waking_recovery_score <= 100.0
 
-    def test_zero_recovery_when_no_windows(self):
-        result = _make_summary(recovery_windows=[])
-        # With no recovery windows at all, score should be at low end
-        score = result.recovery_score or 0.0
-        assert score >= 0.0
+    def test_zero_waking_recovery_when_no_above_baseline_windows(self):
+        flat = _normal_windows(rmssd=30.0)
+        result = _make_summary(background_windows=flat, personal_morning_avg=60.0)
+        score = result.waking_recovery_score or 0.0
+        assert score == pytest.approx(0.0)
 
-    def test_sleep_recovery_increases_score(self):
-        """A realistic sleep recovery window should pull score > 0."""
-        from tracking.recovery_detector import RecoveryWindowResult
-        sleep_rw = RecoveryWindowResult(
-            user_id          = "user-1",
-            started_at       = datetime(2024, 1, 15, 0, 0, tzinfo=UTC),
-            ended_at         = datetime(2024, 1, 15, 7, 0, tzinfo=UTC),
-            duration_minutes = 420.0,
-            context          = "sleep",
-            rmssd_avg_ms     = 70.0,
-            recovery_contribution_pct = 100.0,
-            recovery_area    = 420.0 * 10.0,
-            tag              = "sleep",
-            tag_source       = "auto_confirmed",
-            zenflow_session_id = None,
-        )
-        result = _make_summary(recovery_windows=[sleep_rw])
-        assert (result.recovery_score or 0.0) >= 0.0
-
-
-# ── Readiness score ───────────────────────────────────────────────────────────
-
-class TestReadinessScore:
-
-    def test_readiness_none_when_no_morning_rmssd(self):
-        result = _make_summary(morning_rmssd=None)
-        assert result.readiness_score is None
-
-    def test_readiness_bounded_when_morning_rmssd_given(self):
-        result = _make_summary(morning_rmssd=60.0)
-        if result.readiness_score is not None:
-            assert 0.0 <= result.readiness_score <= 100.0
-
-    def test_day_type_green_for_high_readiness(self):
-        # Manufacture a result with readiness above green threshold
-        result = _make_summary(morning_rmssd=60.0)
-        if result.readiness_score is not None and result.readiness_score >= _cfg.READINESS_GREEN_THRESHOLD:
-            assert result.day_type == "green"
-
-    def test_day_type_red_for_very_low_readiness(self):
-        """Heavily suppressed day + low morning RMSSD → red."""
-        deep_windows = _normal_windows(rmssd=31.0)   # near floor all day
-        result = _make_summary(
-            background_windows   = deep_windows,
-            morning_rmssd        = 31.0,      # also low morning read
-            personal_morning_avg = 60.0,
-            personal_floor       = 30.0,
-        )
-        if result.readiness_score is not None and result.readiness_score < _cfg.READINESS_YELLOW_THRESHOLD:
-            assert result.day_type == "red"
+    def test_positive_waking_recovery_when_above_baseline(self):
+        """RMSSD above morning avg → waking recovery > 0."""
+        elevated = _normal_windows(rmssd=80.0)
+        result = _make_summary(background_windows=elevated, personal_morning_avg=60.0)
+        score = result.waking_recovery_score or 0.0
+        assert score > 0.0
 
 
 # ── Calibration ───────────────────────────────────────────────────────────────
 
 class TestCalibration:
 
-    def test_is_estimated_true_below_accuracy_days(self):
-        result = _make_summary(calibration_days=_cfg.CAPACITY_FULL_ACCURACY_DAYS - 1)
+    def test_is_estimated_true_when_not_locked(self):
+        result = _make_summary(calibration_locked=False)
         assert result.is_estimated is True
 
-    def test_is_estimated_false_at_accuracy_days(self):
-        result = _make_summary(calibration_days=_cfg.CAPACITY_FULL_ACCURACY_DAYS)
+    def test_is_estimated_false_when_locked(self):
+        result = _make_summary(calibration_locked=True)
         assert result.is_estimated is False
 
     def test_calibration_days_stored_correctly(self):
         result = _make_summary(calibration_days=7)
         assert result.calibration_days == 7
+
+    def test_day_type_propagated_from_param(self):
+        result = _make_summary(day_type="green")
+        assert result.day_type == "green"
+
+    def test_day_type_none_when_not_given(self):
+        result = _make_summary(day_type=None)
+        assert result.day_type is None
 
 
 # ── Partial data ──────────────────────────────────────────────────────────────

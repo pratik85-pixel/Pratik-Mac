@@ -157,7 +157,7 @@ async def rebuild_unified_profile(
     user_id: uuid_mod.UUID,
     *,
     llm_client: Optional[Any] = None,
-    readiness_score: Optional[int] = None,
+    net_balance: Optional[float] = None,
     stress_score: Optional[int] = None,
     recovery_score: Optional[int] = None,
     available_slugs: Optional[list[str]] = None,
@@ -214,7 +214,7 @@ async def rebuild_unified_profile(
     profile = run_layer2_plan(
         profile,
         llm_client=llm_client,
-        readiness_score=readiness_score,
+        net_balance=net_balance,
         stress_score=stress_score,
         recovery_score=recovery_score,
         available_slugs=slugs,
@@ -224,7 +224,7 @@ async def rebuild_unified_profile(
     validated = validate_plan(
         profile.suggested_plan,
         profile,
-        readiness_score=readiness_score,
+        net_balance=net_balance,
         stress_score=stress_score,
         recovery_score=recovery_score,
     )

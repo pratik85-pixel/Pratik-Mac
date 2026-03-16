@@ -49,8 +49,6 @@ async def _tracking_svc(
 class DailySummaryResponse(BaseModel):
     summary_date:          str
     stress_load_score:     Optional[float]
-    recovery_score:        Optional[float]
-    readiness_score:       Optional[float]
     waking_recovery_score: Optional[float] = None
     net_balance:           Optional[float] = None
     day_type:              Optional[str]
@@ -110,12 +108,12 @@ class TagWindowRequest(BaseModel):
 
 
 class HistoryEntry(BaseModel):
-    summary_date:      str
-    readiness_score:   Optional[float]
-    stress_load_score: Optional[float]
-    recovery_score:    Optional[float]
-    day_type:          Optional[str]
-    is_estimated:      bool
+    summary_date:          str
+    stress_load_score:     Optional[float]
+    waking_recovery_score: Optional[float]
+    net_balance:           Optional[float]
+    day_type:              Optional[str]
+    is_estimated:          bool
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -171,8 +169,6 @@ async def get_today_summary(
         return DailySummaryResponse(
             summary_date          = today.isoformat(),
             stress_load_score     = r.stress_load_score,
-            recovery_score        = r.recovery_score,
-            readiness_score       = r.readiness_score,
             waking_recovery_score = r.waking_recovery_score,
             net_balance           = r.net_balance,
             day_type              = r.day_type,
@@ -299,8 +295,10 @@ class IngestRequest(BaseModel):
 
 
 class IngestResponse(BaseModel):
-    windows_processed: int
-    beats_received:    int
+    windows_processed:  int
+    beats_received:     int
+    morning_day_type:   Optional[str] = None  # "green"|"yellow"|"red" — populated for context="morning"
+    morning_brief:      Optional[str] = None  # short coaching message for morning reads
 
 
 @router.post("/ingest", response_model=IngestResponse)
@@ -322,7 +320,7 @@ async def ingest_beats(
     if not body.beats:
         return IngestResponse(windows_processed=0, beats_received=0)
 
-    context = body.context if body.context in ("background", "sleep") else "background"
+    context = body.context if body.context in ("background", "sleep", "morning") else "background"
 
     # Sort by timestamp
     beats = sorted(body.beats, key=lambda b: b.ts)
@@ -385,7 +383,24 @@ async def ingest_beats(
             logger.exception("sleep-triggered close_day failed uid=%s date=%s", svc._uid, day_to_close)
 
     logger.info("INGEST uid=%s context=%s windows_processed=%d beats=%d", svc._uid, context, windows_processed, len(beats))
-    return IngestResponse(windows_processed=windows_processed, beats_received=len(beats))
+
+    # Gap 7 fix: return morning day_type + brief when a morning read was processed
+    morning_day_type: Optional[str] = None
+    morning_brief:    Optional[str] = None
+    if context == "morning" and windows_processed > 0:
+        try:
+            brief_result = await svc.get_today_morning_brief()
+            if brief_result:
+                morning_day_type, morning_brief = brief_result
+        except Exception:
+            logger.exception("morning brief generation failed uid=%s", svc._uid)
+
+    return IngestResponse(
+        windows_processed=windows_processed,
+        beats_received=len(beats),
+        morning_day_type=morning_day_type,
+        morning_brief=morning_brief,
+    )
 
 
 @router.post("/tag-window", status_code=204, response_model=None)
@@ -434,7 +449,7 @@ async def close_day(
     This writes the stress / recovery / readiness scores to the database
     and makes them available from GET /tracking/daily-summary.
 
-    Triggered automatically by the 02:00 UTC nightly scheduler.
+    Triggered automatically by the 00:00 IST (18:30 UTC) nightly scheduler.
     Can also be called manually (e.g. from the app when sleep boundary
     is detected, or by a developer to force a day close).
     """
@@ -448,8 +463,8 @@ async def close_day(
     return CloseDayResponse(
         summary_date          = target.isoformat(),
         stress_load_score     = result.stress_load_score,
-        recovery_score        = result.recovery_score,
-        readiness_score       = result.readiness_score,
+        recovery_score        = None,  # deprecated — kept for API compat
+        readiness_score       = None,  # deprecated — kept for API compat
         waking_recovery_score = result.waking_recovery_score,
         net_balance           = result.net_balance,
         day_type              = result.day_type,
@@ -471,12 +486,12 @@ async def get_history(
     rows = await svc.get_history(days=days)
     return [
         HistoryEntry(
-            summary_date      = row.summary_date.date().isoformat() if row.summary_date else "",
-            readiness_score   = row.readiness_score,
-            stress_load_score = row.stress_load_score,
-            recovery_score    = row.recovery_score,
-            day_type          = row.day_type,
-            is_estimated      = row.is_estimated,
+            summary_date          = row.summary_date.date().isoformat() if row.summary_date else "",
+            stress_load_score     = row.stress_load_score,
+            waking_recovery_score = getattr(row, 'waking_recovery_score', None),
+            net_balance           = getattr(row, 'net_balance', None),
+            day_type              = row.day_type,
+            is_estimated          = row.is_estimated,
         )
         for row in rows
     ]
@@ -488,8 +503,6 @@ def _build_summary_response(row, personal=None) -> DailySummaryResponse:
     return DailySummaryResponse(
         summary_date          = row.summary_date.date().isoformat() if row.summary_date else "",
         stress_load_score     = row.stress_load_score,
-        recovery_score        = row.recovery_score,
-        readiness_score       = row.readiness_score,
         waking_recovery_score = getattr(row, 'waking_recovery_score', None),
         net_balance           = getattr(row, 'net_balance', None),
         day_type              = row.day_type,

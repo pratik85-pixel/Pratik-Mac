@@ -57,7 +57,7 @@ class Settings(BaseSettings):
         If only DATABASE_URL was set (Railway pattern), derive DATABASE_SYNC_URL
         automatically so Alembic migrations work without an extra env var.
         """
-        if "asyncpg" in self.DATABASE_URL and "psycopg2" not in self.DATABASE_SYNC_URL:
+        if "asyncpg" in self.DATABASE_URL and "localhost" in self.DATABASE_SYNC_URL:
             self.DATABASE_SYNC_URL = self.DATABASE_URL.replace(
                 "postgresql+asyncpg://", "postgresql+psycopg2://"
             )

@@ -210,8 +210,15 @@ class PersonalModel(Base):
     # ── Phase 10: Calibration lock ────────────────────────────────────────────
     # Set when calibration_days reaches BASELINE_STABLE_DAYS (3).
     # Once set, floor/ceiling/morning_avg are frozen — no more EWM updates.
-    # Capacity grows only via explicit capacity-increase trigger.
+    # Capacity grows only via explicit capacity-increase trigger (Step 6).
     calibration_locked_at    = Column(DateTime(timezone=True), nullable=True)
+
+    # ── Step 6: Capacity growth streak ───────────────────────────────────────
+    # Incremented each day yesterday's peak valid RMSSD exceeds
+    # rmssd_ceiling * (1 + CAPACITY_GROWTH_THRESHOLD_PCT / 100).
+    # Resets to 0 if threshold not met for a day (band worn).
+    # Triggers re-lock when it reaches CAPACITY_GROWTH_CONFIRM_DAYS (7).
+    capacity_growth_streak   = Column(Integer, default=0, nullable=True)
 
     user = relationship("User", back_populates="personal_model")
 
@@ -225,6 +232,45 @@ class ModelSnapshot(Base):
     snapshot_at = Column(DateTime(timezone=True), server_default=func.now())
     model_version = Column(Integer, nullable=False)
     snapshot_json = Column(JSON, nullable=False)   # full fingerprint at that point in time
+
+
+class CalibrationSnapshot(Base):
+    """
+    Audit record for each end-of-day calibration batch (Days 1–3).
+
+    Written by `_run_calibration_batch()` in tracking_service.py.
+    Never deleted after lock — used for production debugging and future
+    ML training data. One row per day_number per user during calibration.
+    """
+    __tablename__ = "calibration_snapshots"
+
+    id          = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id     = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    snapshot_at = Column(DateTime(timezone=True), server_default=func.now())
+    day_number  = Column(Integer, nullable=False)   # 1, 2, or 3
+
+    # --- Raw values (before 3-pass artifact filter) ---
+    rmssd_floor_raw       = Column(Float, nullable=True)
+    rmssd_ceiling_raw     = Column(Float, nullable=True)
+    rmssd_morning_avg_raw = Column(Float, nullable=True)
+
+    # --- Clean values (after filter) ---
+    rmssd_floor_clean       = Column(Float, nullable=True)
+    rmssd_ceiling_clean     = Column(Float, nullable=True)
+    rmssd_morning_avg_clean = Column(Float, nullable=True)
+
+    # --- Filter stats ---
+    windows_total    = Column(Integer, nullable=True)   # total windows considered
+    windows_rejected = Column(Integer, nullable=True)   # rejected by artifact filter
+    confidence       = Column(Float, nullable=True)     # 0.0–1.0
+
+    # --- Outcome flags ---
+    committed     = Column(Boolean, nullable=False, default=False)  # pushed to personal_model
+    sanity_passed = Column(Boolean, nullable=False, default=True)   # morning_avg >= floor + 10% range
+
+    __table_args__ = (
+        Index("ix_calibration_snapshots_user_day", "user_id", "day_number"),
+    )
 
 
 # ── Habits ─────────────────────────────────────────────────────────────────────
@@ -703,10 +749,12 @@ class DailyStressSummary(Base):
 
     # The three numbers (0–100)
     stress_load_score  = Column(Float, nullable=True)
+    # DEPRECATED: never written, kept NULL. Waking recovery replaces this.
     recovery_score     = Column(Float, nullable=True)
-    readiness_score    = Column(Float, nullable=True)   # None until next morning's read
+    # DEPRECATED: never written, kept NULL. Net balance replaces readiness.
+    readiness_score    = Column(Float, nullable=True)
 
-    # "green" | "yellow" | "red" — derived from readiness_score
+    # "green" | "yellow" | "red" — sourced from MorningRead.day_type at day close
     day_type     = Column(String(10), nullable=True)
 
     # Credit-card model scores (Phase 10)
@@ -715,6 +763,8 @@ class DailyStressSummary(Base):
 
     # Continuous balance thread — carries across day boundaries
     opening_balance       = Column(Float, nullable=True, server_default='0')  # carried from prev closing_balance
+    opening_recovery      = Column(Float, nullable=True)   # positive component: max(0, opening_balance) — prior surplus
+    opening_stress        = Column(Float, nullable=True)   # negative component: min(0, opening_balance) — prior debt
     closing_balance       = Column(Float, nullable=True)   # = net_balance at day close
 
     # Raw unclamped percentages (for carry-forward integrity)

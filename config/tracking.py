@@ -59,12 +59,6 @@ class TrackingConfig(BaseSettings):
     # Minimum consecutive windows above threshold to declare a recovery window
     RECOVERY_MIN_WINDOWS: int = 4
 
-    # ── Recovery Score Weights ─────────────────────────────────────────────
-    # downstream: tracking/daily_summarizer
-    # Must sum to 1.0
-    RECOVERY_WEIGHT_SLEEP: float = 0.50
-    RECOVERY_WEIGHT_ZENFLOW: float = 0.25
-    RECOVERY_WEIGHT_DAYTIME: float = 0.25
 
     # ── Credit-Card Scoring Model ──────────────────────────────────────────
     # downstream: tracking/daily_summarizer
@@ -76,17 +70,11 @@ class TrackingConfig(BaseSettings):
     #   - users can directly compare across time-of-day
     DAILY_CAPACITY_WAKING_MINUTES: int = 960  # 16 h × 60 min
 
-    # ── Readiness Formula ──────────────────────────────────────────────────
-    # downstream: tracking/daily_summarizer
-    # readiness_prior = READINESS_CENTER + (net × READINESS_SCALE)
-    READINESS_CENTER: float = 50.0
-    READINESS_SCALE: float = 0.50
-
-    # ── Day Type Thresholds (Readiness → green/yellow/red) ─────────────────
-    # downstream: api/services/tracking_service, coach/plan_replanner
-    READINESS_GREEN_THRESHOLD: int = 70    # ≥ 70 → green day
-    READINESS_YELLOW_THRESHOLD: int = 45   # 45–69 → yellow day
-    # < 45 → red day
+    # ── Day Type Thresholds (MorningRead → green/yellow/red) ───────────────────
+    # downstream: api/services/tracking_service (morning read ingest)
+    # vs_personal_avg_pct thresholds for day_type classification on MorningRead.
+    # These live in tracking_service._classify_morning_day_type().
+    # Net balance drives plan guardrails — see profile/plan_guardrails.py.
 
     # ── Adaptive Capacity Baseline ─────────────────────────────────────────
     # downstream: tracking/daily_summarizer, model/personal_distributions
@@ -96,18 +84,6 @@ class TrackingConfig(BaseSettings):
     # Floor shift must sustain for this many consecutive days before updating
     CAPACITY_UPDATE_MIN_SUSTAINED_DAYS: int = 7
 
-    # Number of calibration days before "(estimated)" label is removed
-    CAPACITY_FULL_ACCURACY_DAYS: int = 14
-
-    # ── Nudge Cap ──────────────────────────────────────────────────────────
-    # downstream: api/services/tracking_service (nudge scheduler)
-    MAX_TAGGING_NUDGES_PER_DAY: int = 3
-
-    # A single event contributing more than this fraction of daily capacity
-    # can trigger one nudge even if the daily cap was reached
-    NUDGE_SIGNIFICANT_SPIKE_OVERRIDE_PCT: float = 0.25
-
-    # ── Gap Handling ────────────────────────────────────────────────────────
     # downstream: tracking/background_processor
     # Gaps shorter than this (minutes) are treated as continuous
     GAP_CONTINUITY_MINUTES: int = 30
@@ -135,6 +111,13 @@ class TrackingConfig(BaseSettings):
 
     # Auto-tagging only activates after this many days of wear data
     AUTOTAG_MIN_DAYS: int = 28
+
+    # ── Morning Read ──────────────────────────────────────────────────────
+    # downstream: api/services/tracking_service
+    # Exponential weight for EWM update of rmssd_morning_avg from morning reads.
+    # α=0.2 means each new reading has 20% weight; accumulated history has 80%.
+    # Active pre-calibration-lock only.
+    MORNING_EWM_ALPHA: float = 0.2
 
     class Config:
         env_prefix = "TRACKING_"

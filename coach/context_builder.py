@@ -134,12 +134,12 @@ class CoachContext:
     prescription: DailyPrescription
     session_data: Optional[dict] = field(default_factory=lambda: None)
 
-    # ── Today's scores (0–100, user-facing) ──────────────────────────────────
+    # ── Today's scores (user-facing) ─────────────────────────────────────────
     # These are the ONLY numbers the coach cites in responses.
     # Raw metric values (RMSSD, RSA, etc.) must never reach the LLM.
-    readiness_score: Optional[int] = field(default=None)   # 0–100
-    stress_score:    Optional[int] = field(default=None)   # 0–100
-    recovery_score:  Optional[int] = field(default=None)   # 0–100
+    net_balance:     Optional[float] = field(default=None)  # unbounded ±; drives day colour
+    stress_score:    Optional[int]   = field(default=None)  # 0–100
+    recovery_score:  Optional[int]   = field(default=None)  # 0–100 (waking recovery)
 
     # ── Psychological profile insight ─────────────────────────────────────────
     psych_insight:   Optional[str] = field(default=None)   # pre-built 1-sentence insight
@@ -180,7 +180,8 @@ def build_coach_context(
     extracted_signals: Optional[list[str]] = None,
     session_data: Optional[dict] = None,
     schedule_note: str = "",
-    readiness_score: Optional[int] = None,
+    readiness_score: Optional[int] = None,   # DEPRECATED — kept for call-site compat; ignored
+    net_balance:     Optional[float] = None,
     stress_score:    Optional[int] = None,
     recovery_score:  Optional[int] = None,
     psych_insight:   Optional[str] = None,
@@ -229,12 +230,14 @@ def build_coach_context(
         Post-session physiological summary — post_session trigger only.
     schedule_note : str
         Free-text schedule context (e.g. "travel day tomorrow").
-    readiness_score : int | None
-        0–100 readiness score — cited by coach in responses.
+    net_balance : float | None
+        Net Balance (unbounded ±) — day colour + coach framing. Drives guardrails.
     stress_score : int | None
-        0–100 stress level score — cited by coach in responses.
+        0–100 Stress Load score — cited by coach in responses.
     recovery_score : int | None
-        0–100 recovery score — cited by coach in responses.
+        0–100 Waking Recovery score — cited by coach in responses.
+    readiness_score : int | None
+        DEPRECATED. Kept for call-site compat only — ignored by CoachContext.
     psych_insight : str | None
         Pre-built 1-sentence insight from PsychProfile.coach_insight.
 
@@ -309,7 +312,7 @@ def build_coach_context(
         tone                   = tone,
         prescription           = prescription,
         session_data           = session_data,
-        readiness_score        = readiness_score,
+        net_balance            = net_balance,
         stress_score           = stress_score,
         recovery_score         = recovery_score,
         psych_insight          = psych_insight,

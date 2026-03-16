@@ -111,7 +111,7 @@ def update_rmssd_stats(
     if not calibration_locked:
         morning_vals = [
             r.value for r in rmssd
-            if 4 <= r.ts.hour < 10
+            if r.context == "morning"
         ]
         if morning_vals and fp.rmssd_morning_avg is not None:
             alpha = 0.2   # weight of new observation

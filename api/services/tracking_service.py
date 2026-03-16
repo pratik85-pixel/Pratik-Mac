@@ -34,7 +34,7 @@ from tracking.background_processor import BackgroundWindowResult, aggregate_back
 from tracking.stress_detector import StressWindowResult, detect_stress_windows, compute_stress_contributions
 from tracking.recovery_detector import RecoveryWindowResult, detect_recovery_windows, compute_recovery_contributions
 from tracking.daily_summarizer import DailySummaryResult, compute_daily_summary
-from tracking.wake_detector import WakeSleepBoundary, detect_wake_sleep_boundary
+from tracking.wake_detector import WakeSleepBoundary, ContextTransition, detect_wake_sleep_boundary
 
 import numpy as np
 
@@ -188,12 +188,70 @@ async def _load_existing_recovery_windows(
 # PersonalModel bootstrap (Phase 1 — unblocks detection pipeline on first wear)
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Population-average seeds (conservative HRV reference values)
-_SEED_RMSSD_FLOOR    = 28.0   # ms  — 10th-pct adult resting
-_SEED_RMSSD_CEILING  = 75.0   # ms  — 90th-pct adult resting
-_SEED_RMSSD_MORNING  = 45.0   # ms  — median adult morning
-_SEED_CAPACITY_FLOOR = 32.0   # ms  — seed stress detection threshold
-_MIN_WINDOWS_FOR_REFINE = 3   # need ≥3 valid 5-min windows before refining
+# Population-average seeds — now tiered by onboarding fitness level.
+# exercise_frequency values come from users.onboarding JSON (set at onboarding).
+_TIER_SEDENTARY = {"floor": 18.0, "ceiling": 45.0, "morning": 28.0}  # "rarely"
+_TIER_MODERATE  = {"floor": 22.0, "ceiling": 65.0, "morning": 38.0}  # "1-3x/week"
+_TIER_ATHLETIC  = {"floor": 35.0, "ceiling": 95.0, "morning": 55.0}  # "4+/week"
+_EXERCISE_FREQ_TIERS: dict = {
+    "rarely":    _TIER_SEDENTARY,
+    "1-3x/week": _TIER_MODERATE,
+    "4+/week":   _TIER_ATHLETIC,
+}
+
+_SEED_CAPACITY_FLOOR = 32.0   # ms  — seed stress detection threshold (unchanged)
+_MIN_WINDOWS_FOR_REFINE = 3   # legacy constant kept for reference
+
+
+def _seed_from_onboarding(onboarding: "Optional[dict]") -> "tuple[float, float, float]":
+    """Return (floor_ms, ceiling_ms, morning_ms) from the user's fitness tier."""
+    if onboarding is None:
+        tier = _TIER_MODERATE
+    else:
+        freq = onboarding.get("exercise_frequency", "1-3x/week")
+        tier = _EXERCISE_FREQ_TIERS.get(freq, _TIER_MODERATE)
+    return tier["floor"], tier["ceiling"], tier["morning"]
+
+# ── Morning read day-type thresholds ────────────────────────────────────────
+# Based on vs_personal_avg_pct (morning RMSSD vs personal morning average).
+_MORNING_GREEN_PCT:  float = -5.0   # ≥ -5% → green (at or near baseline)
+_MORNING_YELLOW_PCT: float = -20.0  # -5% to -20% → yellow; < -20% → red
+
+
+def _classify_morning_day_type(vs_avg_pct: "Optional[float]") -> "Optional[str]":
+    """Classify a morning read as green/yellow/red from vs_personal_avg_pct."""
+    if vs_avg_pct is None:
+        return None
+    if vs_avg_pct >= _MORNING_GREEN_PCT:
+        return "green"
+    if vs_avg_pct >= _MORNING_YELLOW_PCT:
+        return "yellow"
+    return "red"
+
+
+def _morning_brief_text(day_type: str, vs_avg_pct: "Optional[float]") -> str:
+    """Generate a short deterministic morning brief from day_type + deviation."""
+    if day_type == "green":
+        if vs_avg_pct is not None and vs_avg_pct >= 0:
+            detail = f" (+{vs_avg_pct:.0f}% above your baseline)"
+        else:
+            detail = " (at your baseline)"
+        return (
+            "Your HRV is tracking well this morning" + detail + ". "
+            "Good conditions — a focused breathing session will serve you well today."
+        )
+    elif day_type == "yellow":
+        pct_str = f"{abs(vs_avg_pct):.0f}%" if vs_avg_pct is not None else ""
+        return (
+            f"Your HRV is {pct_str} below your morning average. "
+            "A lighter session or short resonance breathing is ideal today."
+        )
+    else:  # red
+        pct_str = f"{abs(vs_avg_pct):.0f}%" if vs_avg_pct is not None else ""
+        return (
+            f"Your HRV is {pct_str} below your morning baseline — a significant dip. "
+            "This is a recovery day. Rest is productive; a gentle breathing session if you choose."
+        )
 
 
 async def _load_all_background_for_model(
@@ -238,25 +296,33 @@ async def _bootstrap_personal_model(
     """
     Guarantee a PersonalModel row exists for `user_id`.
 
-    If no row exists: create one with conservative population-average seed
-    values so the detection pipeline can run immediately on first wear.
+    If no row exists: create one with tiered population-average seed values
+    (derived from onboarding fitness level) so the detection pipeline can run
+    immediately on first wear.
 
-    While still in bootstrap phase (capacity_version == 0): refine the seed
-    values with actual observed RMSSD statistics from BackgroundWindow rows
-    whenever ≥ 3 valid windows are available.
+    Real-time intra-day refinement has been DISABLED. The model is only updated
+    at day-close via `_run_calibration_batch()` on Days 1–3. This prevents a
+    single noisy window from permanently poisoning the ceiling.
 
-    Once capacity_version > 0 (set by fingerprint_updater after proper
-    calibration), this function leaves the model untouched.
+    Once calibration_locked_at is set (Day 3 close), this function leaves the
+    model completely untouched.
     """
     personal = await _load_personal_model(db_session, user_id)
     is_new   = personal is None
 
     if is_new:
+        # Derive seeds from onboarding fitness tier.
+        user_result = await db_session.execute(
+            select(db.User.onboarding).where(db.User.id == user_id)
+        )
+        onboarding_json = user_result.scalar_one_or_none()
+        seed_floor, seed_ceiling, seed_morning = _seed_from_onboarding(onboarding_json)
+
         personal = db.PersonalModel(
             user_id                      = user_id,
-            rmssd_floor                  = _SEED_RMSSD_FLOOR,
-            rmssd_ceiling                = _SEED_RMSSD_CEILING,
-            rmssd_morning_avg            = _SEED_RMSSD_MORNING,
+            rmssd_floor                  = seed_floor,
+            rmssd_ceiling                = seed_ceiling,
+            rmssd_morning_avg            = seed_morning,
             stress_capacity_floor_rmssd  = _SEED_CAPACITY_FLOOR,
             capacity_version             = 0,
             prf_status                   = "PRF_UNKNOWN",
@@ -272,36 +338,123 @@ async def _bootstrap_personal_model(
             personal = await _load_personal_model(db_session, user_id)
             if personal is None:
                 raise
-            is_new = False
         else:
-            logger.info("Seeded population-average PersonalModel for user %s", user_id)
-
-    # Refine from real data while still in bootstrap phase
-    if (personal.capacity_version or 0) == 0:
-        windows = await _load_all_background_for_model(db_session, user_id)
-        rmssd_values = [
-            w.rmssd_ms for w in windows
-            if w.rmssd_ms is not None and w.rmssd_ms > 10.0
-        ]
-        if len(rmssd_values) >= _MIN_WINDOWS_FOR_REFINE:
-            arr       = np.array(rmssd_values, dtype=float)
-            floor     = float(np.percentile(arr, 10))
-            ceiling   = float(np.percentile(arr, 90))
-            morning   = float(np.median(arr))
-            cap_floor = max(floor + 0.1 * (ceiling - floor), 20.0)
-
-            personal.rmssd_floor                = round(floor,   1)
-            personal.rmssd_ceiling              = round(ceiling, 1)
-            personal.rmssd_morning_avg          = round(morning, 1)
-            personal.stress_capacity_floor_rmssd= round(cap_floor, 1)
-            await db_session.flush()
-            logger.debug(
-                "Bootstrap PersonalModel user=%s floor=%.1f ceiling=%.1f "
-                "morning=%.1f n_windows=%d",
-                user_id, floor, ceiling, morning, len(rmssd_values),
+            logger.info(
+                "Seeded PersonalModel for user %s (floor=%.1f ceiling=%.1f morning=%.1f)",
+                user_id, seed_floor, seed_ceiling, seed_morning,
             )
 
     return personal
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Calibration batch (called at close_day() on Days 1–3)
+# ──────────────────────────────────────────────────────────────────────────────
+
+async def _run_calibration_batch(
+    db_session: AsyncSession,
+    user_id: str,
+    day_number: int,
+    personal: "db.PersonalModel",
+) -> None:
+    """
+    End-of-day calibration pass. Runs on every day_close while
+    calibration_locked_at is None (i.e. Days 1, 2, and 3).
+
+    1. Load ALL historical background_windows for the user.
+    2. Run 3-pass artifact filter (calibration_filter.py).
+    3. Compute floor=P10, ceiling=P90, morning_avg from clean windows.
+    4. Apply sanity check (morning_avg >= floor + 10% range).
+    5. Write CalibrationSnapshot audit row.
+    6. If confidence >= 0.65: update personal_model (committed=True).
+
+    The lock itself is applied by close_day() after this function returns.
+    """
+    from model.calibration_filter import filter_calibration_windows
+
+    windows = await _load_all_background_for_model(db_session, user_id)
+    if not windows:
+        logger.warning("Calibration batch day=%d user=%s: no background windows", day_number, user_id)
+        return
+
+    # --- Raw stats (before filtering) ---
+    raw_rmssd = [w.rmssd_ms for w in windows if w.rmssd_ms is not None]
+    raw_morning = [w.rmssd_ms for w in windows if w.rmssd_ms is not None and w.context == "morning"]
+    rmssd_floor_raw    = float(np.percentile(raw_rmssd, 10))   if len(raw_rmssd) >= 3 else None
+    rmssd_ceiling_raw  = float(np.percentile(raw_rmssd, 90))   if len(raw_rmssd) >= 3 else None
+    rmssd_morning_avg_raw = float(np.median(raw_morning))      if raw_morning else None
+
+    # --- 3-pass artifact filter ---
+    filter_result = filter_calibration_windows(windows)
+    clean = filter_result.clean_windows
+
+    if not clean:
+        logger.warning(
+            "Calibration batch day=%d user=%s: all %d windows rejected by filter",
+            day_number, user_id, len(windows),
+        )
+        return
+
+    clean_rmssd   = [w.rmssd_ms for w in clean if w.rmssd_ms is not None]
+    clean_morning = [w.rmssd_ms for w in clean if w.rmssd_ms is not None and w.context == "morning"]
+
+    rmssd_floor_clean  = float(np.percentile(clean_rmssd, 10)) if len(clean_rmssd) >= 3 else rmssd_floor_raw
+    rmssd_ceiling_clean = float(np.percentile(clean_rmssd, 90)) if len(clean_rmssd) >= 3 else rmssd_ceiling_raw
+    # Extra hard-cap: 110ms is the 99th pct of healthy adult RMSSD
+    if rmssd_ceiling_clean is not None:
+        rmssd_ceiling_clean = min(rmssd_ceiling_clean, 110.0)
+    rmssd_morning_avg_clean = float(np.median(clean_morning)) if clean_morning else None
+
+    # --- Sanity check: morning_avg must be within the floor–ceiling range ---
+    sanity_passed = True
+    if (rmssd_floor_clean is not None and rmssd_ceiling_clean is not None
+            and rmssd_morning_avg_clean is not None):
+        min_morning = rmssd_floor_clean + 0.10 * (rmssd_ceiling_clean - rmssd_floor_clean)
+        if rmssd_morning_avg_clean < min_morning:
+            rmssd_morning_avg_clean = round(min_morning, 1)
+            sanity_passed = False
+            logger.warning(
+                "Calibration sanity fail day=%d user=%s: morning_avg corrected to %.1f",
+                day_number, user_id, rmssd_morning_avg_clean,
+            )
+
+    # --- Write audit snapshot (committed=False initially) ---
+    snap = db.CalibrationSnapshot(
+        user_id               = user_id,
+        day_number            = day_number,
+        rmssd_floor_raw       = rmssd_floor_raw,
+        rmssd_ceiling_raw     = rmssd_ceiling_raw,
+        rmssd_morning_avg_raw = rmssd_morning_avg_raw,
+        rmssd_floor_clean     = rmssd_floor_clean,
+        rmssd_ceiling_clean   = rmssd_ceiling_clean,
+        rmssd_morning_avg_clean = rmssd_morning_avg_clean,
+        windows_total         = filter_result.windows_total,
+        windows_rejected      = filter_result.rejected_count,
+        confidence            = filter_result.confidence,
+        committed             = False,
+        sanity_passed         = sanity_passed,
+    )
+    db_session.add(snap)
+
+    # --- Update personal model if confidence is adequate ---
+    if filter_result.confidence >= 0.65 and rmssd_floor_clean is not None and rmssd_ceiling_clean is not None:
+        cap_floor = max(rmssd_floor_clean + 0.1 * (rmssd_ceiling_clean - rmssd_floor_clean), 20.0)
+        personal.rmssd_floor                 = round(rmssd_floor_clean, 1)
+        personal.rmssd_ceiling               = round(rmssd_ceiling_clean, 1)
+        if rmssd_morning_avg_clean is not None:
+            personal.rmssd_morning_avg       = round(rmssd_morning_avg_clean, 1)
+        personal.stress_capacity_floor_rmssd = round(cap_floor, 1)
+        snap.committed = True
+        await db_session.flush()
+
+    logger.info(
+        "Calibration batch day=%d user=%s: raw_ceil=%.1f clean_ceil=%.1f "
+        "rejected=%d/%d confidence=%.2f committed=%s sanity=%s",
+        day_number, user_id,
+        rmssd_ceiling_raw or 0.0, rmssd_ceiling_clean or 0.0,
+        filter_result.rejected_count, filter_result.windows_total,
+        filter_result.confidence, snap.committed, sanity_passed,
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -373,9 +526,71 @@ class TrackingService:
         day_end   = day_start + timedelta(days=1)
         await self._recompute_day_windows(day_start, day_end)
 
+        # Morning read: save MorningRead row + EWM-update rmssd_morning_avg (pre-lock only)
+        if context == "morning" and result.is_valid and result.rmssd_ms is not None:
+            personal = await _load_personal_model(self._db, self._uid)
+            if personal is not None:
+                existing_mr = await self._db.execute(
+                    select(db.MorningRead)
+                    .where(db.MorningRead.user_id == self._uid)
+                    .where(db.MorningRead.read_date >= day_start)
+                    .where(db.MorningRead.read_date < day_end)
+                    .limit(1)
+                )
+                morning_row = existing_mr.scalar_one_or_none()
+                if morning_row is None:
+                    morning_row = db.MorningRead(
+                        user_id   = self._uid,
+                        read_date = window_start,
+                    )
+                    self._db.add(morning_row)
+                morning_row.rmssd_ms   = round(result.rmssd_ms, 1)
+                morning_row.hr_bpm     = result.hr_bpm
+                morning_row.lf_hf      = result.lf_hf
+                morning_row.confidence = result.confidence
+                if personal.calibration_locked_at is None:
+                    alpha       = CONFIG.tracking.MORNING_EWM_ALPHA
+                    current_avg = personal.rmssd_morning_avg or result.rmssd_ms
+                    new_avg     = alpha * result.rmssd_ms + (1.0 - alpha) * current_avg
+                    personal.rmssd_morning_avg      = round(new_avg, 1)
+                    morning_row.vs_personal_avg_pct = round(
+                        (result.rmssd_ms - current_avg) / current_avg * 100.0, 1
+                    )
+                    logger.info(
+                        "Morning EWM update user=%s rmssd=%.1f new_avg=%.1f",
+                        self._uid, result.rmssd_ms, new_avg,
+                    )
+                elif personal.rmssd_morning_avg:
+                    morning_row.vs_personal_avg_pct = round(
+                        (result.rmssd_ms - personal.rmssd_morning_avg)
+                        / personal.rmssd_morning_avg * 100.0, 1
+                    )
+                # Gap 6 fix: classify day immediately at morning read arrival
+                morning_row.day_type = _classify_morning_day_type(morning_row.vs_personal_avg_pct)
+                await self._db.flush()
+
         await self._db.commit()
         logger.debug("Ingested background window %s–%s valid=%s", window_start, window_end, result.is_valid)
         return result
+
+    async def get_today_morning_brief(self) -> "Optional[tuple[str, str]]":
+        """
+        Return (day_type, brief_message) for today's morning read, or None.
+        Called by the ingest router to populate IngestResponse for context="morning".
+        """
+        day_start = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+        day_end   = day_start + timedelta(days=1)
+        result    = await self._db.execute(
+            select(db.MorningRead)
+            .where(db.MorningRead.user_id == self._uid)
+            .where(db.MorningRead.read_date >= day_start)
+            .where(db.MorningRead.read_date < day_end)
+            .limit(1)
+        )
+        row = result.scalar_one_or_none()
+        if row is None or row.day_type is None:
+            return None
+        return row.day_type, _morning_brief_text(row.day_type, row.vs_personal_avg_pct)
 
     # ── Recompute intraday ──────────────────────────────────────────────────────
 
@@ -480,13 +695,39 @@ class TrackingService:
         if not bg_windows:
             logger.warning("close_day: no background windows for %s user=%s", target_date, self._uid)
 
-        # Wake/sleep boundary — derive from PersonalModel typical times
+        # Build context transitions from consecutive BackgroundWindow context changes.
+        # These feed detect_wake_sleep_boundary() priority-1 chain (sleep_transition method).
+        context_transitions: list[ContextTransition] = []
+        prev_ctx: Optional[str] = None
+        for w in bg_windows:
+            if prev_ctx is not None and w.context != prev_ctx:
+                context_transitions.append(ContextTransition(
+                    ts           = w.window_start,
+                    from_context = prev_ctx,
+                    to_context   = w.context,
+                ))
+            prev_ctx = w.context
+
+        # Fetch today's morning read timestamp (wake anchor — fallback priority 3).
+        mr_result = await self._db.execute(
+            select(db.MorningRead.captured_at)
+            .where(db.MorningRead.user_id == self._uid)
+            .where(db.MorningRead.read_date >= day_start)
+            .where(db.MorningRead.read_date < day_end)
+            .order_by(db.MorningRead.captured_at)
+            .limit(1)
+        )
+        morning_read_ts: Optional[datetime] = mr_result.scalar_one_or_none()
+
+        # Wake/sleep boundary — derive from context transitions, morning read, and PersonalModel typical times
         last_bg_ts = bg_windows[-1].window_end if bg_windows else None
         boundary = detect_wake_sleep_boundary(
-            day_date              = day_start,
-            user_id               = self._uid,
-            typical_wake_time     = personal.typical_wake_time,
-            typical_sleep_time    = personal.typical_sleep_time,
+            day_date                  = day_start,
+            user_id                   = self._uid,
+            context_transitions       = context_transitions or None,
+            typical_wake_time         = personal.typical_wake_time,
+            typical_sleep_time        = personal.typical_sleep_time,
+            morning_read_ts           = morning_read_ts,
             last_background_window_ts = last_bg_ts,
         )
 
@@ -511,6 +752,13 @@ class TrackingService:
 
         # Count calibration days
         calibration_days = await self._count_days_with_data()
+
+        # ── Calibration batch (Days 1–3): run before lock check so the batch
+        # can update personal_model before the lock timestamp is written.
+        if personal.calibration_locked_at is None:
+            await _run_calibration_batch(self._db, self._uid, calibration_days, personal)
+            # Reload model fields updated by the batch before passing to summarizer
+            await self._db.refresh(personal)
 
         # ── Phase 10: continuous balance thread ───────────────────────────────
         # Fetch previous day's closing_balance for carry-forward.
@@ -569,8 +817,7 @@ class TrackingService:
         row.sleep_detection_method     = boundary.sleep_detection_method
         row.waking_minutes             = boundary.waking_minutes
         row.stress_load_score          = result.stress_load_score
-        row.recovery_score             = result.recovery_score
-        row.readiness_score            = result.readiness_score
+        # recovery_score and readiness_score columns kept NULL (deprecated)
         row.day_type                   = result.day_type
         row.raw_suppression_area       = result.raw_suppression_area
         row.raw_recovery_area_sleep    = result.raw_recovery_area_sleep
@@ -589,14 +836,16 @@ class TrackingService:
         row.net_balance                = result.net_balance
         # Phase 10: continuous balance + raw percentage fields
         row.opening_balance            = opening_balance
+        row.opening_recovery           = result.opening_recovery
+        row.opening_stress             = result.opening_stress
         row.closing_balance            = result.closing_balance
         row.ns_capacity_used           = result.ns_capacity_used
         row.stress_pct_raw             = result.stress_pct_raw
         row.recovery_pct_raw           = result.recovery_pct_raw
 
         await self._db.commit()
-        logger.info("Closed day %s for user %s: readiness=%.0f day_type=%s",
-                    target_date, self._uid, result.readiness_score or 0, result.day_type)
+        logger.info("Closed day %s for user %s: net_balance=%.1f day_type=%s",
+                    target_date, self._uid, result.net_balance or 0.0, result.day_type)
 
         # Wire evening assessor 
         try:
@@ -704,6 +953,19 @@ class TrackingService:
         prev_summary = await self._load_day_summary(prev_date)
         opening_balance = float(prev_summary.closing_balance or 0.0) if prev_summary else 0.0
 
+        # Fetch day_type from today's MorningRead (live display)
+        mr_daytype_result = await self._db.execute(
+            select(db.MorningRead.day_type)
+            .where(db.MorningRead.user_id == self._uid)
+            .where(db.MorningRead.read_date >= day_start)
+            .where(db.MorningRead.read_date < day_end)
+            .order_by(db.MorningRead.captured_at.desc())
+            .limit(1)
+        )
+        morning_day_type: Optional[str] = mr_daytype_result.scalar_one_or_none()
+
+        calibration_locked = personal.calibration_locked_at is not None
+
         result = compute_daily_summary(
             user_id              = self._uid,
             summary_date         = day_start,
@@ -716,6 +978,8 @@ class TrackingService:
             personal_ceiling     = capacity_ceiling or (morning_rmssd or 0.0),
             capacity_version     = capacity_version,
             calibration_days     = calibration_days,
+            calibration_locked   = calibration_locked,
+            day_type             = morning_day_type,
             capacity_floor_used  = capacity_floor,
             opening_balance      = opening_balance,
         )

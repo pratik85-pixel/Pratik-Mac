@@ -137,6 +137,161 @@ async def _auto_tag_pass(session, user_id) -> int:
     return 0
 
 
+# ── Capacity growth detection ─────────────────────────────────────────────────
+
+async def _check_capacity_growth(session, user_id) -> dict:
+    """
+    Detect genuine NS capacity growth and trigger re-calibration when confirmed.
+
+    Design (CONTEXT.md Step 6 / config/model.py):
+    - Only runs post-calibration-lock (calibration_locked_at IS NOT NULL).
+    - Each day yesterday's peak valid RMSSD > locked_ceiling * growth_threshold
+      increments capacity_growth_streak.
+    - Any day below threshold (band worn, data present) resets streak to 0.
+    - No data (band not worn) is neutral — streak does not advance or reset.
+    - When streak reaches CAPACITY_GROWTH_CONFIRM_DAYS:
+        1. Snapshot current PersonalModel state.
+        2. Update rmssd_ceiling to the new max RMSSD over the confirm window.
+        3. Update rmssd_morning_avg to recent morning read average (if available).
+        4. Reset calibration_locked_at = now() (re-lock at new ceiling).
+        5. Increment capacity_version.
+        6. Reset capacity_growth_streak = 0.
+
+    Returns dict with keys: ran, triggered, new_ceiling, streak_after.
+    """
+    from sqlalchemy import select, func, and_
+    import api.db.schema as db
+    from config import CONFIG
+
+    result: dict = {
+        "ran": False, "triggered": False,
+        "new_ceiling": None, "streak_after": 0,
+    }
+
+    # Fetch personal model
+    pm_res = await session.execute(
+        select(db.PersonalModel).where(db.PersonalModel.user_id == user_id)
+    )
+    personal = pm_res.scalar_one_or_none()
+
+    # Only run post-lock, and only if floor+ceiling are established
+    if (personal is None
+            or personal.calibration_locked_at is None
+            or personal.rmssd_ceiling is None
+            or personal.rmssd_floor is None):
+        return result
+
+    result["ran"] = True
+    locked_ceiling   = personal.rmssd_ceiling
+    growth_threshold = 1.0 + CONFIG.model.CAPACITY_GROWTH_THRESHOLD_PCT / 100.0
+    confirm_days     = CONFIG.model.CAPACITY_GROWTH_CONFIRM_DAYS
+
+    # Query yesterday's peak valid RMSSD
+    yesterday       = (datetime.now(UTC) - timedelta(days=1)).date()
+    yesterday_start = datetime.combine(yesterday, datetime.min.time()).replace(tzinfo=UTC)
+    yesterday_end   = datetime.combine(yesterday, datetime.max.time()).replace(tzinfo=UTC)
+
+    peak_res = await session.execute(
+        select(func.max(db.BackgroundWindow.rmssd_ms)).where(
+            and_(
+                db.BackgroundWindow.user_id  == user_id,
+                db.BackgroundWindow.window_start >= yesterday_start,
+                db.BackgroundWindow.window_start <= yesterday_end,
+                db.BackgroundWindow.is_valid     == True,
+                db.BackgroundWindow.rmssd_ms.isnot(None),
+            )
+        )
+    )
+    yesterday_peak = peak_res.scalar_one_or_none()
+
+    # No valid data for yesterday → band not worn; don't advance or reset streak
+    if yesterday_peak is None:
+        result["streak_after"] = personal.capacity_growth_streak or 0
+        return result
+
+    if yesterday_peak > locked_ceiling * growth_threshold:
+        # Growth signal — advance streak
+        new_streak = (personal.capacity_growth_streak or 0) + 1
+        personal.capacity_growth_streak = new_streak
+        result["streak_after"] = new_streak
+        log.debug(
+            "capacity_growth_streak user=%s streak=%d peak_rmssd=%.1f ceiling=%.1f",
+            user_id, new_streak, yesterday_peak, locked_ceiling,
+        )
+
+        if new_streak >= confirm_days:
+            # ── Trigger re-lock ───────────────────────────────────────────────
+            # New ceiling = max valid RMSSD across the entire confirm window
+            window_start = datetime.now(UTC) - timedelta(days=confirm_days + 1)
+            new_peak_res = await session.execute(
+                select(func.max(db.BackgroundWindow.rmssd_ms)).where(
+                    and_(
+                        db.BackgroundWindow.user_id     == user_id,
+                        db.BackgroundWindow.window_start >= window_start,
+                        db.BackgroundWindow.is_valid     == True,
+                        db.BackgroundWindow.rmssd_ms.isnot(None),
+                    )
+                )
+            )
+            new_ceiling = new_peak_res.scalar_one_or_none() or yesterday_peak
+
+            # New morning_avg = mean of recent valid morning reads
+            morning_res = await session.execute(
+                select(func.avg(db.MorningRead.rmssd_ms)).where(
+                    and_(
+                        db.MorningRead.user_id   == user_id,
+                        db.MorningRead.read_date >= window_start,
+                        db.MorningRead.rmssd_ms.isnot(None),
+                    )
+                )
+            )
+            new_morning_avg = morning_res.scalar_one_or_none()
+
+            # Snapshot state before mutation
+            snapshot = db.ModelSnapshot(
+                user_id=user_id,
+                model_version=personal.capacity_version or 0,
+                snapshot_json={
+                    "rmssd_floor":       personal.rmssd_floor,
+                    "rmssd_ceiling":     locked_ceiling,
+                    "rmssd_morning_avg": personal.rmssd_morning_avg,
+                    "capacity_version":  personal.capacity_version,
+                    "trigger":           "capacity_growth",
+                    "confirmed_streak":  new_streak,
+                },
+            )
+            session.add(snapshot)
+
+            # Apply growth: update ceiling, morning avg, re-lock
+            personal.rmssd_ceiling         = new_ceiling
+            if new_morning_avg is not None:
+                personal.rmssd_morning_avg = float(new_morning_avg)
+            personal.calibration_locked_at  = datetime.now(UTC)
+            personal.capacity_version       = (personal.capacity_version or 0) + 1
+            personal.capacity_growth_streak = 0
+
+            result["triggered"]   = True
+            result["new_ceiling"] = new_ceiling
+            result["streak_after"] = 0
+            log.info(
+                "capacity_growth TRIGGERED user=%s old_ceiling=%.1f new_ceiling=%.1f "
+                "new_capacity_version=%d",
+                user_id, locked_ceiling, new_ceiling, personal.capacity_version,
+            )
+    else:
+        # Below threshold — reset streak
+        if (personal.capacity_growth_streak or 0) > 0:
+            log.debug(
+                "capacity_growth_streak RESET user=%s (peak %.1f ≤ threshold %.1f)",
+                user_id, yesterday_peak, locked_ceiling * growth_threshold,
+            )
+        personal.capacity_growth_streak = 0
+        result["streak_after"] = 0
+
+    await session.flush()
+    return result
+
+
 # ── Per-user rebuild ──────────────────────────────────────────────────────────
 
 async def _rebuild_one_user(
@@ -156,13 +311,14 @@ async def _rebuild_one_user(
     result: dict = {
         "user_id": str(user_id),
         "status":  "ok",
-        "day_closed":         False,
-        "narrative_version": None,
-        "engagement_tier":   None,
-        "plan_items":        0,
-        "streak_incremented": False,
-        "auto_tagged":       0,
-        "error":             None,
+        "day_closed":               False,
+        "narrative_version":        None,
+        "engagement_tier":          None,
+        "plan_items":               0,
+        "streak_incremented":       False,
+        "auto_tagged":              0,
+        "capacity_growth_triggered": False,
+        "error":                    None,
     }
 
     try:
@@ -188,16 +344,16 @@ async def _rebuild_one_user(
             .limit(1)
         )
         summary = summary_res.scalar_one_or_none()
-        readiness = int(summary.readiness_score) if summary and summary.readiness_score else None
-        stress    = int(summary.stress_load_score) if summary and summary.stress_load_score else None
-        recovery  = int(summary.recovery_score) if summary and summary.recovery_score else None
+        net_balance = round(float(summary.net_balance), 1) if summary and summary.net_balance is not None else None
+        stress      = int(summary.stress_load_score) if summary and summary.stress_load_score else None
+        recovery    = int(summary.waking_recovery_score) if summary and summary.waking_recovery_score else None
 
         # Full rebuild
         profile = await rebuild_unified_profile(
             session,
             user_id,
             llm_client=llm_client,
-            readiness_score=readiness,
+            net_balance=net_balance,
             stress_score=stress,
             recovery_score=recovery,
         )
@@ -212,6 +368,15 @@ async def _rebuild_one_user(
         # Auto-tag pass
         tagged = await _auto_tag_pass(session, user_id)
         result["auto_tagged"] = tagged
+
+        # Capacity growth detection (post-lock only; no-ops pre-calibration)
+        growth = await _check_capacity_growth(session, user_id)
+        result["capacity_growth_triggered"] = growth["triggered"]
+        if growth["triggered"]:
+            log.info(
+                "nightly_rebuild capacity_growth user=%s new_ceiling=%.1f",
+                user_id, growth["new_ceiling"],
+            )
 
     except Exception as exc:
         log.error("nightly_rebuild failed user=%s error=%s", user_id, exc, exc_info=True)

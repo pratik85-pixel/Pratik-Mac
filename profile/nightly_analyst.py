@@ -116,7 +116,7 @@ def run_layer2_plan(
     profile: UnifiedProfile,
     *,
     llm_client: Optional[Any] = None,
-    readiness_score: Optional[int] = None,
+    net_balance: Optional[float] = None,
     stress_score: Optional[int] = None,
     recovery_score: Optional[int] = None,
     available_slugs: Optional[list[str]] = None,
@@ -133,12 +133,12 @@ def run_layer2_plan(
     profile.plan_for_date = today
 
     if llm_client is None:
-        profile.suggested_plan = _fallback_plan(profile, readiness_score)
+        profile.suggested_plan = _fallback_plan(profile, net_balance)
         return profile
 
     user_prompt = _build_layer2_user_prompt(
         profile,
-        readiness_score=readiness_score,
+        net_balance=net_balance,
         stress_score=stress_score,
         recovery_score=recovery_score,
         available_slugs=available_slugs or [],
@@ -156,7 +156,7 @@ def run_layer2_plan(
             log.exception("Layer 2 LLM call attempt %d failed", attempt + 1)
 
     if not plan_items:
-        plan_items = _fallback_plan(profile, readiness_score)
+        plan_items = _fallback_plan(profile, net_balance)
         profile.plan_guardrail_notes.append("layer2_fallback: LLM unavailable")
 
     profile.suggested_plan = plan_items
@@ -329,7 +329,7 @@ WATCH TODAY
 def _build_layer2_user_prompt(
     profile: UnifiedProfile,
     *,
-    readiness_score: Optional[int],
+    net_balance: Optional[float],
     stress_score: Optional[int],
     recovery_score: Optional[int],
     available_slugs: list[str],
@@ -338,11 +338,12 @@ def _build_layer2_user_prompt(
     narrative = profile.coach_narrative or "(narrative unavailable)"
     slugs_str = ", ".join(available_slugs) if available_slugs else "walking, breathing, stretching, book_reading, nap"
 
+    nb_str = f"{net_balance:+.1f}" if net_balance is not None else "Unknown"
     return f"""
 TODAY: {today.isoformat()}
-READINESS SCORE: {readiness_score if readiness_score is not None else 'Unknown'}/100
+NET BALANCE: {nb_str} (positive = surplus, negative = debt; drives day colour)
 STRESS SCORE: {stress_score if stress_score is not None else 'Unknown'}/100
-RECOVERY SCORE: {recovery_score if recovery_score is not None else 'Unknown'}/100
+WAKING RECOVERY SCORE: {recovery_score if recovery_score is not None else 'Unknown'}/100
 
 USER PERSONALITY SNAPSHOT:
 {narrative}
@@ -462,48 +463,48 @@ WATCH TODAY
 
 def _fallback_plan(
     profile: UnifiedProfile,
-    readiness_score: Optional[int],
+    net_balance: Optional[float],
 ) -> list[PlanItem]:
     """
     Deterministic fallback plan when LLM is unavailable.
-    Based on readiness score only — a minimal safe plan.
+    Based on net_balance: ≥10 = green, ≥-20 = yellow, else rest.
     """
-    rs = readiness_score or 50
+    nb = net_balance if net_balance is not None else 0.0
 
     items: list[PlanItem] = []
 
-    if rs >= 70:
+    if nb >= 10.0:
         items.append(PlanItem(
             slug="breathing",
             priority="must_do",
             duration_min=10,
-            reason="Green day — establish morning anchor with a short breathing session.",
+            reason="Green balance — establish morning anchor with a short breathing session.",
         ))
         items.append(PlanItem(
             slug="walking",
             priority="recommended",
             duration_min=20,
-            reason="Good readiness — daytime walk supports recovery.",
+            reason="Positive balance — daytime walk supports recovery.",
         ))
-    elif rs >= 45:
+    elif nb >= -20.0:
         items.append(PlanItem(
             slug="breathing",
             priority="must_do",
             duration_min=10,
-            reason="Yellow day — one grounding session is the priority.",
+            reason="Yellow balance — one grounding session is the priority.",
         ))
         items.append(PlanItem(
             slug="stretching",
             priority="optional",
             duration_min=10,
-            reason="Light movement on a moderate-readiness day.",
+            reason="Light movement on a moderate-balance day.",
         ))
     else:
         items.append(PlanItem(
             slug="breathing",
             priority="must_do",
             duration_min=5,
-            reason="Red day — keep it minimal. 5-minute breathing only.",
+            reason="Negative balance — keep it minimal. 5-minute breathing only.",
         ))
 
     return items

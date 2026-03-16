@@ -86,7 +86,7 @@ def validate_plan(
     items: list[PlanItem],
     profile: UnifiedProfile,
     *,
-    readiness_score: Optional[int] = None,
+    net_balance: Optional[float] = None,
     stress_score: Optional[int] = None,
     recovery_score: Optional[int] = None,
 ) -> ValidatedPlan:
@@ -97,7 +97,7 @@ def validate_plan(
     The plan after all rules is guaranteed non-empty.
     """
     result   = ValidatedPlan(items=list(items))
-    rs       = readiness_score if readiness_score is not None else 50
+    nb       = net_balance if net_balance is not None else 0.0
     ss       = stress_score    if stress_score    is not None else 50
     disc     = profile.psych.discipline_index
     social   = profile.psych.social_energy_type
@@ -144,15 +144,15 @@ def validate_plan(
             )
             result.was_modified = True
 
-    # ── R4: Red day — restorative items only ──────────────────────────────────
-    if rs < 40:
+    # ── R4: Red balance — restorative items only ───────────────────────────────────────
+    if nb < -20.0:
         performance_slugs = {"work_sprint", "sports", "cold_shower"}
         before = len(result.items)
         result.items = [i for i in result.items if i.slug not in performance_slugs]
         removed = before - len(result.items)
         if removed:
             result.guardrail_notes.append(
-                f"R4_red_day: removed {removed} performance items (readiness={rs})"
+                f"R4_red_balance: removed {removed} performance items (net_balance={nb:.1f})"
             )
             result.was_modified = True
 
