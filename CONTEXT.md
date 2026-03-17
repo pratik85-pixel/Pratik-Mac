@@ -1,6 +1,6 @@
 # ZenFlow Verity — Project Context
 
-**Last updated:** 17 March 2026 — overnight day-boundary + P4 wake-detector fix
+**Last updated:** 17 March 2026 — overnight day-boundary + P4 wake-detector fix — deployed to Railway
 **Hardware:** Polar Verity Sense (optical armband)
 **Status:** DEPLOYED & WORKING — API live on Railway, dev client APK on test phone (hot reload active)
 **Parent project:** ZenFlow_project (H10 chest strap, running and stable — do not touch)
@@ -908,11 +908,11 @@ This matches the design: midnight is invisible to the user; scores continue accu
 | Wake detector wired | `api/services/tracking_service.py` — `compute_live_summary()` | as above |
 | Remove carry-forward step-3 | `api/routers/tracking.py` — `get_today_summary()` | as above |
 
-### Next: deploy to Railway
+### Deployment
 
-```bash
-railway up
-```
+`railway up` from `~/Desktop/Zenflow_backend` (linked project). Build: 14.85s. Migrations ran clean (`alembic upgrade head`). Health check confirmed: `{"status":"ok","version":"0.1.0"}`.
+
+Note: `railway up` CLI reported "Deploy failed" due to its 2-min health-check retry window expiring before the container was ready — this is a CLI display issue. The service came up healthy. Always confirm with `curl https://api-production-8195d.up.railway.app/health` rather than trusting the CLI exit code.
 
 ---
 
