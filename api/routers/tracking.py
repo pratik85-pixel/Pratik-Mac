@@ -141,11 +141,14 @@ async def get_today_summary(
     """
     Return the three numbers (stress / recovery / readiness) for today.
 
+    Day boundary is the MORNING READ, not calendar midnight.
+    compute_live_summary() spans from yesterday's morning read when no
+    morning read has arrived yet, so scores keep accumulating overnight.
+
     Fallback chain:
     1. Persisted DailyStressSummary row for today (finalized or partial).
-    2. Live on-the-fly computation from today's intraday windows (no DB write).
-    3. Yesterday's finalized summary carried forward (is_partial_data=True).
-    4. 404 — no data at all yet.
+    2. Live on-the-fly computation spanning from last morning read (no DB write).
+    3. 404 — band not worn at all yet.
     """
     today = datetime.now(UTC).date()
 
@@ -156,32 +159,10 @@ async def get_today_summary(
     if row is not None:
         return _build_summary_response(row, personal)
 
-    # 2. Live computation from today's background windows (no DB write)
+    # 2. Live computation from background windows (spans midnight if needed)
     live = await svc.compute_live_summary(today)
     if live is not None:
         return _build_summary_response(live, personal)
-
-    # 3. Carry-forward from yesterday
-    yesterday = (datetime.now(UTC) - timedelta(days=1)).date()
-    row = await svc.get_daily_summary(yesterday)
-    if row is not None:
-        r = _build_summary_response(row, personal)
-        return DailySummaryResponse(
-            summary_date          = today.isoformat(),
-            stress_load_score     = r.stress_load_score,
-            waking_recovery_score = r.waking_recovery_score,
-            net_balance           = r.net_balance,
-            day_type              = r.day_type,
-            calibration_days      = r.calibration_days,
-            is_estimated          = True,
-            is_partial_data       = True,
-            wake_ts               = None,
-            sleep_ts              = None,
-            waking_minutes        = None,
-            ns_capacity_used      = r.ns_capacity_used,
-            rmssd_morning_avg     = r.rmssd_morning_avg,
-            rmssd_ceiling         = r.rmssd_ceiling,
-        )
 
     raise HTTPException(status_code=404, detail="No summary available yet.")
 

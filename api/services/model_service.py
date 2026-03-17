@@ -181,9 +181,12 @@ class ModelService:
             row = PersonalModel(user_id=uid)
             self._db.add(row)
 
-        row.rmssd_floor             = fp.rmssd_floor
-        row.rmssd_ceiling           = fp.rmssd_ceiling
-        row.rmssd_morning_avg       = fp.rmssd_morning_avg
+        # rmssd_floor, rmssd_ceiling, rmssd_morning_avg are INTENTIONALLY NOT
+        # written here. Those fields are owned exclusively by:
+        #   - _run_calibration_batch() (floor, ceiling, morning_avg)
+        #   - ingest_background_window() morning EWM update (morning_avg)
+        # Writing them here would silently overwrite calibration results with
+        # stale fingerprint values loaded before the batch committed.
         row.recovery_arc_mean_hours = fp.recovery_arc_mean_hours
         row.recovery_arc_fast_hours = fp.recovery_arc_fast_hours
         row.recovery_arc_slow_hours = fp.recovery_arc_slow_hours

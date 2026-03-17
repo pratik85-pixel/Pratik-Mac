@@ -912,14 +912,62 @@ class TrackingService:
         self, target_date: date
     ) -> Optional[DailySummaryResult]:
         """
-        Compute the three scores on-the-fly from today's existing intraday windows
+        Compute the three scores on-the-fly from existing intraday windows
         WITHOUT writing anything to the database.
+
+        Day boundary is the MORNING READ, not calendar midnight.  When no
+        morning read has arrived for target_date yet (overnight / early
+        morning window), the query spans from yesterday's morning read
+        timestamp through now so that scores keep accumulating across
+        midnight with no visible reset.  opening_balance is only applied
+        once today's morning read has landed (matching close_day() logic).
 
         Returns None if there are no background windows yet (band not worn).
         Always marks is_partial_data=True since the day is not finalized.
         """
-        day_start = datetime(target_date.year, target_date.month, target_date.day, tzinfo=UTC)
-        day_end   = day_start + timedelta(days=1)
+        now       = datetime.now(UTC)
+        cal_start = datetime(target_date.year, target_date.month, target_date.day, tzinfo=UTC)
+        cal_end   = cal_start + timedelta(days=1)
+
+        # ── Determine whether today's morning read has arrived ────────────────
+        mr_today_result = await self._db.execute(
+            select(db.MorningRead.captured_at)
+            .where(db.MorningRead.user_id == self._uid)
+            .where(db.MorningRead.read_date >= cal_start)
+            .where(db.MorningRead.read_date < cal_end)
+            .order_by(db.MorningRead.captured_at)
+            .limit(1)
+        )
+        today_morning_read_ts: Optional[datetime] = mr_today_result.scalar_one_or_none()
+
+        if today_morning_read_ts:
+            # Normal day in progress: query calendar day as usual.
+            day_start      = cal_start
+            day_end        = cal_end
+            opening_balance_fn = True   # carry prev closing_balance → opening_balance
+        else:
+            # Overnight / pre-morning-read window: span from yesterday's morning
+            # read through now so scores don't reset at calendar midnight.
+            prev_date  = target_date - timedelta(days=1)
+            prev_start = datetime(prev_date.year, prev_date.month, prev_date.day, tzinfo=UTC)
+            prev_end   = prev_start + timedelta(days=1)
+            mr_prev_result = await self._db.execute(
+                select(db.MorningRead.captured_at)
+                .where(db.MorningRead.user_id == self._uid)
+                .where(db.MorningRead.read_date >= prev_start)
+                .where(db.MorningRead.read_date < prev_end)
+                .order_by(db.MorningRead.captured_at)
+                .limit(1)
+            )
+            prev_morning_read_ts: Optional[datetime] = mr_prev_result.scalar_one_or_none()
+
+            # Query from yesterday's morning read (or yesterday calendar start as
+            # fallback) through the current moment.
+            day_start      = prev_morning_read_ts if prev_morning_read_ts else prev_start
+            day_end        = now
+            # No opening_balance until morning read arrives — all windows are
+            # already included in the span so double-counting must be avoided.
+            opening_balance_fn = False
 
         bg_windows = await _load_today_background(self._db, self._uid, day_start, day_end)
         if not bg_windows:
@@ -931,34 +979,51 @@ class TrackingService:
         capacity_ceiling = personal.rmssd_ceiling
         capacity_version = personal.capacity_version or 0
 
-        # Use already-detected intraday windows (kept fresh by ingest_background_window)
+        # Use already-detected intraday windows across the same span.
         stress_db        = await _load_existing_stress_windows(self._db, self._uid, day_start, day_end)
         recovery_db      = await _load_existing_recovery_windows(self._db, self._uid, day_start, day_end)
         stress_results   = self._db_stress_to_results(stress_db)
         recovery_results = self._db_recovery_to_results(recovery_db)
 
+        # Build context transitions (same as close_day()) for accurate boundary.
+        context_transitions: list[ContextTransition] = []
+        prev_ctx: Optional[str] = None
+        for w in bg_windows:
+            if prev_ctx is not None and w.context != prev_ctx:
+                context_transitions.append(ContextTransition(
+                    ts           = w.window_start,
+                    from_context = prev_ctx,
+                    to_context   = w.context,
+                ))
+            prev_ctx = w.context
+
         last_bg_ts = bg_windows[-1].window_end
         boundary   = detect_wake_sleep_boundary(
-            day_date                  = day_start,
+            day_date                  = cal_start,
             user_id                   = self._uid,
+            context_transitions       = context_transitions or None,
             typical_wake_time         = personal.typical_wake_time,
             typical_sleep_time        = personal.typical_sleep_time,
+            morning_read_ts           = today_morning_read_ts,
             last_background_window_ts = last_bg_ts,
         )
 
         calibration_days = await self._count_days_with_data()
 
-        # Fetch today's opening balance for accurate live net_balance display
-        prev_date    = target_date - timedelta(days=1)
-        prev_summary = await self._load_day_summary(prev_date)
-        opening_balance = float(prev_summary.closing_balance or 0.0) if prev_summary else 0.0
+        # opening_balance: only apply once today's morning read has landed.
+        if opening_balance_fn:
+            prev_date    = target_date - timedelta(days=1)
+            prev_summary = await self._load_day_summary(prev_date)
+            opening_balance = float(prev_summary.closing_balance or 0.0) if prev_summary else 0.0
+        else:
+            opening_balance = 0.0
 
-        # Fetch day_type from today's MorningRead (live display)
+        # Fetch day_type from today's MorningRead (live display).
         mr_daytype_result = await self._db.execute(
             select(db.MorningRead.day_type)
             .where(db.MorningRead.user_id == self._uid)
-            .where(db.MorningRead.read_date >= day_start)
-            .where(db.MorningRead.read_date < day_end)
+            .where(db.MorningRead.read_date >= cal_start)
+            .where(db.MorningRead.read_date < cal_end)
             .order_by(db.MorningRead.captured_at.desc())
             .limit(1)
         )
@@ -968,7 +1033,7 @@ class TrackingService:
 
         result = compute_daily_summary(
             user_id              = self._uid,
-            summary_date         = day_start,
+            summary_date         = cal_start,
             background_windows   = bg_windows,
             stress_windows       = stress_results,
             recovery_windows     = recovery_results,
