@@ -1,11 +1,509 @@
 # ZenFlow Verity — Project Context
 
-**Last updated:** 17 March 2026 — overnight day-boundary + P4 wake-detector fix — deployed to Railway
+**Last updated:** 19 March 2026 — Stuck morning context fix + DB cleanup + score re-materialisation
+
+---
+
+## Handoff Note — Session of 19 March 2026 (Part 2) — Stuck Morning Context Fix
+
+### Root Cause
+After taking a "morning read" at 20:30 IST (15:01 UTC), `PolarService.ts` transitioned `_sleepState` to `'morning_pending'`. The state only reset to `'background'` after a **successful POST** inside the `try` block. If the app was backgrounded or network flaked at that moment, the reset line never ran — so every subsequent window (69 total) was sent as `context='morning'` instead of `'background'`.
+
+Scoring impact: both `_compute_suppression_area()` and `_compute_recovery_area_waking()` filter `w.context == "background"` only → morning-labelled windows contributed zero → scores collapsed to Recovery 1–3, Stress 5+.
+
+---
+
+### Fix 1 — PolarService.ts: move state reset before POST
+
+**File:** `Zenflow_front/src/services/PolarService.ts`, `_flushBeats()` function
+
+**Before:** state reset was inside the `try` block, after `await getClient().post(...)` — it only ran on POST success.
+
+**After:** state reset moved to immediately after `flushContext` is captured (before the `try {`). `flushContext` already holds `'morning'` so the POST still sends the correct context. The reset now fires regardless of POST success/failure — state can never get stuck.
+
+```typescript
+// flushContext captured first (unchanged)
+const flushContext = this._sleepState === 'morning_pending' ? 'morning' : ...
+
+// ← reset moved HERE, before try block
+if (this._sleepState === 'morning_pending') {
+  this._sleepState = 'background';
+  console.log('[Polar] morning context flushed — context returned to background');
+}
+
+try {
+  await getClient().post('/tracking/ingest', { context: flushContext, ... });
+  // (reset block removed from here)
+```
+
+Deploy: Metro hot-reload (TS logic only, no EAS build). TS clean.
+
+---
+
+### Fix 2 — DB cleanup: relabel 69 stuck `morning` windows → `background`
+
+```sql
+UPDATE background_windows
+SET context = 'background'
+WHERE user_id = '8e8715c6-c6ab-45c1-a7da-f037207cf689'
+  AND context = 'morning'
+  AND window_start > '2026-03-19 15:02:00+00';
+-- Result: UPDATE 69
+```
+
+Verified: `SELECT COUNT(*)` on same predicate → 0.
+
+---
+
+### Fix 3 — Re-materialised daily scores
+
+Ran `scripts/replay_daily_scores.py` against Railway DB. Also fixed a query bug in the script (broken `(:uids)::text IS NULL` parameter pattern with asyncpg replaced with a two-branch Python-level ORM approach + Python-side filter).
+
+| Date | net_balance | waking_recovery_score | stress_load_score |
+|---|---|---|---|
+| 2026-03-19 | **7.2** | **6.2** | 0 |
+| 2026-03-18 | 1.0 | 0 | 0 |
+| 2026-03-17 | 1.0 | 1.0 | 0 |
+
+Mar 19 jumped from collapsed ~−1.6 to +7.2 — fix confirmed working.
+
+---
+
+### Parked Plan — Time-of-day guard for morning reads
+
+**Not implemented this session. Tracked here for future work.**
+
+A "morning read" taken in the evening (e.g. 20:30 IST) is a design flaw separate from the stuck-state bug above. It corrupts `rmssd_morning_avg` by seeding it with an evening baseline. Future fix: add a time-of-day guard in `PolarService.ts` — only allow `morning_pending` transitions between 05:00–11:00 local IST (22:00–04:00 UTC window). Outside that window, a WAKE event from `sleep` state should return directly to `background` without setting `morning` context and without triggering a morning read.
+
+---
+
+### Files changed this session
+
+| File | Change |
+|---|---|
+| `Zenflow_front/src/services/PolarService.ts` | Move `_sleepState` reset before `try` block in `_flushBeats()` |
+| `scripts/replay_daily_scores.py` | Fix broken asyncpg array-param query; use text() + Python-side filter |
+| **Railway DB** | `UPDATE background_windows SET context='background' WHERE context='morning' AND window_start > '2026-03-19 15:02:00+00'` (69 rows) |
+
+---
+
+
+
+## Handoff Note — Session of 19 March 2026 — Sleep Detection + Materialised Scoring + Chart
+
+### What was done this session
+
+#### Phase 1 — Artifact floor gate (symmetric to ceiling gate)
+
+**Problem:** No lower-bound gate on RMSSD. Contact-loss windows with near-zero RMSSD would inflate stress scores.
+
+- **`config/tracking.py`:** Added `RMSSD_POPULATION_FLOOR: float = 3.0` after `RMSSD_POPULATION_CEILING`
+- **`tracking/background_processor.py`:** Floor gate in `__post_init__` — symmetric to ceiling: `and (self.context != "background" or self.rmssd_ms >= CONFIG.tracking.RMSSD_POPULATION_FLOOR)`
+- **`tracking/daily_summarizer.py`:** Both `_compute_suppression_area()` and `_compute_recovery_area_waking()` gained `personal_floor: Optional[float] = None` param + clamp: `effective_rmssd = max(effective_rmssd, personal_floor)`. Both call-sites in `compute_daily_summary()` pass `personal_floor`.
+
+---
+
+#### Phase 2A — Server-side sleep relabelling (SUBSEQUENTLY REMOVED — see below)
+
+Added in `api/services/tracking_service.py`: if context=background, window valid, HR < 75 bpm, UTC hour in 16–01 window → relabel context to `sleep`. **This was removed in the same session** (see "Fix: Remove Fix A" below) — it caused score fluctuation by creating false sleep→wake transitions in the evening.
+
+---
+
+#### Phase 2B — Client-side threshold relaxation (`Zenflow_front/src/services/PolarService.ts`)
+
+Made sleep detection more sensitive to catch overnight wear without a morning read:
+
+| Threshold | Before | After |
+|---|---|---|
+| `SLEEP_HR_THRESHOLD` | 60 | 70 |
+| `SLEEP_CV_THRESHOLD` | 0.06 | 0.10 |
+| `SLEEP_CONFIRM_BEATS` | 45 | 20 |
+| `WAKE_HR_THRESHOLD` | 65 | 75 |
+| `WAKE_CV_THRESHOLD` | 0.10 | 0.12 |
+| `WAKE_CONFIRM_BEATS` | 15 | 10 |
+
+Hard resets replaced with soft half-decrements: `Math.floor(count / 2)` — avoids thrashing on noisy transitions.
+
+---
+
+#### Phase 3 — Materialised scoring (scores persist to DB on every ingest)
+
+**Problem:** `compute_live_summary()` re-ran from scratch on every API call — no caching, scores could drift if wake boundary shifted.
+
+- **`api/db/schema.py`:** Added `updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())` to `DailyStressSummary`
+- **`api/services/tracking_service.py`:** Added `_materialise_daily_score()` method — upserts `DailyStressSummary` from `compute_live_summary(today)`, skips finalised rows (`is_partial_data=False`). Called non-fatally after every `ingest_background_window()` commit.
+- **`alembic/versions/g2h3i4j5k6l7_materialised_score_updated_at.py`:** Migration adding `updated_at` column. `down_revision = 'f1a2b3c4d5e6'`. Applied: `railway run alembic upgrade head`.
+
+---
+
+#### Phase 4 — Replay script
+
+- **`scripts/replay_daily_scores.py`:** Iterates all (user, date) pairs with `background_windows` data, skips finalised rows, calls `compute_live_summary()` and upserts `DailyStressSummary`. Supports `--user` and `--dry-run` flags.
+- Run successfully: 11 (user, date) pairs replayed, 0 errors. Test user (8e87…) got Mar 17=−3.0, Mar 18=−3.0, Mar 19=−1.6.
+
+---
+
+#### Fix: Remove Fix A (score fluctuation root cause)
+
+**Root cause analysis:** Fix A was relabelling evening resting windows (low HR, valid) as `sleep`. This created spurious `sleep→background` context transitions in the evening. `detect_wake_sleep_boundary()` Priority 1 chain picked up these transitions as the "morning wake" event, setting `wake_ts` to an evening timestamp → all daytime windows thrown out → scores collapsed → next window had no sleep label → `wake_ts` reverted to `typical_wake_time` → scores recovered → loop repeated.
+
+**Fix:** Removed the entire Fix A block (18 lines) from `api/services/tracking_service.py`. Sleep context is now purely client-side (Polar band `PolarService.ts` thresholds from Phase 2B). Deploy: `railway up --detach` — commit `a92c967`.
+
+---
+
+#### Feature: Diverging Window Chart on ReadinessOverlay screen
+
+**New component `DivergingWindowChart`** added to `Zenflow_front/src/ui/zenflow-ui-kit.tsx`:
+- Props: `windows: DivergingWindowPoint[]`, `morningAvg: number`, `title?: string`
+- Filters to `is_valid=true` + `context="background"` only
+- Centre line = `morningAvg` baseline
+- Green bars (`ZEN.colors.recovery`) above centre = windows where RMSSD > baseline
+- Stress-colour bars (`ZEN.colors.stress`) below centre = windows where RMSSD < baseline
+- Near-baseline nub (2px) for `|delta| < 1ms`
+- X-axis time labels (`HH:MM`), scrollable, design-system compliant (palette, radius, spacing)
+
+**`ReadinessOverlayScreen` updated** (`Zenflow_front/src/screens/ReadinessOverlayScreen.tsx`):
+- Added `morningAvg` and `waveformData` state
+- Extracts `rmssd_morning_avg` from existing `getDailySummary()` call
+- Promotes waveform array (fetched every 60s) to state
+- Renders `DivergingWindowChart` between the score card and 7-day `CombinedBalanceChart`
+- Gated: only shown when `waveformData.length > 0 && morningAvg !== null`
+
+---
+
+### Infrastructure state (19 March 2026)
+
+| Resource | Value |
+|---|---|
+| Backend API (Railway) | `https://api-production-8195d.up.railway.app` |
+| Railway PORT | `8080` (injected by Railway; `start.sh` uses `${PORT:-8000}`) |
+| DB public URL | `postgresql://postgres:lStXwgKefGXXShUSTPXvxTmKluKPcLmE@switchyard.proxy.rlwy.net:35936/railway` |
+| Test user | `8e8715c6-c6ab-45c1-a7da-f037207cf689` |
+| Personal model | floor=22, ceiling=65, morning_avg=24.6 (seed values — nightly calibration not yet run) |
+| Calibration locked | ❌ Not yet (needs 3 morning reads post close_day) |
+| close_day ever fired | ❌ Not yet — all rows `is_partial_data=true`, first run tonight 18:30 UTC |
+| Frontend dev server | Metro on `http://192.168.1.107:8081` (port may vary — check `npx expo start --port 8081`) |
+| Dev APK | Installed on device; scan QR or open `exp+zenflow-verity://expo-development-client/?url=http%3A%2F%2F192.168.1.107%3A8081` |
+| Latest backend commit | `a92c967` — "Remove server-side sleep relabelling (Fix A)" |
+
+---
+
+### Files changed this session
+
+| File | Change |
+|---|---|
+| `config/tracking.py` | Added `RMSSD_POPULATION_FLOOR = 3.0` |
+| `tracking/background_processor.py` | Floor gate symmetric to ceiling gate |
+| `tracking/daily_summarizer.py` | `personal_floor` param + clamp in both scoring functions |
+| `api/services/tracking_service.py` | Added `_materialise_daily_score()` + ingest trigger; removed Fix A block |
+| `api/db/schema.py` | `updated_at` column on `DailyStressSummary` |
+| `alembic/versions/g2h3i4j5k6l7_…` | Migration for `updated_at` — applied ✅ |
+| `scripts/replay_daily_scores.py` | NEW — replay/backfill script |
+| `start.sh` | `--port "${PORT:-8000}"` (Railway PORT injection fix) |
+| `railway.toml` | `healthcheckTimeout = 300` |
+| `Zenflow_front/src/services/PolarService.ts` | Sleep/wake threshold relaxation (Phase 2B) |
+| `Zenflow_front/src/ui/zenflow-ui-kit.tsx` | Added `DivergingWindowChart` component |
+| `Zenflow_front/src/screens/ReadinessOverlayScreen.tsx` | Wired `DivergingWindowChart` + `morningAvg` state |
+
+### Status tracker
+
+| Change | Status |
+|---|---|
+| Phase 1: Floor gate | ✅ Done |
+| Phase 2A: Fix A (server relabelling) | ✅ Removed — caused fluctuation |
+| Phase 2B: PolarService thresholds | ✅ Done |
+| Phase 3: Materialised scoring + schema | ✅ Done + migration applied |
+| Phase 4: Replay script | ✅ Done — 11 rows backfilled |
+| Fix A removal + Railway deploy | ✅ `a92c967` deployed |
+| Diverging window chart | ✅ Done — hot-reload active |
+| Score fluctuation | ✅ Fixed (Fix A removed) |
+| Close_day / nightly calibration | ⏳ Tonight 18:30 UTC first run |
+| Calibration lock (3 morning reads) | ⏳ Pending |
+
+---
+
+**Last updated:** 17 March 2026 (Part 6 + DB recovery) — LLM plan wiring + sleep artefact gate + Postgres data fully recovered
+
+---
+
+## Handoff Note — Session of 17 March 2026 (DB Recovery)
+
+### What happened
+
+Railway Postgres service `Postgres-CiQD` entered a crash loop (volume corruption, same as Issue #4). During recovery the service was deleted and a new one provisioned — but the **old volume `postgres-volume-W8Qt` was not deleted**, retaining all data (116 MB).
+
+#### Recovery steps executed
+
+1. Swapped volume on new Postgres service from empty `Jh66` → `W8Qt`
+2. Hit PG17/PG18 version mismatch — changed Postgres service image to `postgres:17`
+3. Old pg_hba.conf had the old password hash (Postgres-CiQD credentials) — blocked connection
+4. Set custom start command to bypass pg_hba.conf with trust auth:
+   `bash -c "echo 'host all all 0.0.0.0/0 trust' > /tmp/ph.conf && chmod a+r /tmp/ph.conf && exec gosu postgres postgres -c hba_file=/tmp/ph.conf -D $PGDATA"`
+5. Connected with no password and reset: `ALTER USER postgres WITH PASSWORD 'lStXwgKefGXXShUSTPXvxTmKluKPcLmE'`
+6. Removed custom start command, redeployed — normal scram-sha-256 auth restored
+7. API `/health` ✅, old test user `2420112a-d69c-4938-972a-6598cc8526af` responding with real data ✅
+
+**All data fully recovered. No data was lost.**
+
+### Current infrastructure state
+
+| Resource | Value |
+|---|---|
+| Postgres service | `Postgres` (postgres:17) |
+| Volume | `postgres-volume-W8Qt` (116 MB, mounted) |
+| Internal URL | `postgresql://postgres:lStXwgKefGXXShUSTPXvxTmKluKPcLmE@postgres.railway.internal:5432/railway` |
+| Public URL | `postgresql://postgres:lStXwgKefGXXShUSTPXvxTmKluKPcLmE@switchyard.proxy.rlwy.net:35936/railway` |
+| API DATABASE_URL | set to internal URL above |
+| API DATABASE_SYNC_URL | `postgresql+psycopg2://postgres:lStXwgKefGXXShUSTPXvxTmKluKPcLmE@postgres.railway.internal:5432/railway` |
+| Test user ID | `2420112a-d69c-4938-972a-6598cc8526af` (unchanged) |
+
+### Empty volume
+
+`postgres-volume` (0 MB, unmounted) and `postgres-volume-Jh66` (198 MB, unmounted) — both safe to delete from Railway dashboard to avoid confusion.
+
+---
+
+## Handoff Note — Session of 17 March 2026 (Part 6) — LLM Plan Wiring + Sleep Gate Scoping
+
+### What was done this session
+
+#### Item 1 — LLM plan is now the primary plan source (not rule-based prescriber)
+
+**Root cause discovered in Part 5 design review:** `PlanService.get_or_create_today_plan()` always called `build_daily_plan(inputs)` (rule-based prescriber). `build_daily_plan_from_uup()` existed in `coach/prescriber.py` and was correctly wired in `coach_service.py` (coach chat) but was **never called from the plan generation flow**. The LLM Layer 2 plan from the nightly rebuild was stored in `user_unified_profiles` but never served to the user via `GET /plan/today`.
+
+**Fix — `api/services/plan_service.py`:**
+
+1. Added `build_daily_plan_from_uup` to the `coach.prescriber` import
+2. Added `from api.services.profile_service import load_unified_profile`
+3. In `get_or_create_today_plan()`, before the rule-based path:
+
+```python
+# Try LLM plan first — nightly Layer 2 output from unified profile
+if uid is not None:
+    uup = await load_unified_profile(self._db, uid)
+    if uup is not None:
+        uup_plan = build_daily_plan_from_uup(
+            uup,
+            readiness_score=inputs.readiness_score,
+            stage=inputs.stage,
+        )
+        if uup_plan is not None:
+            await self._persist_plan(uid, uup_plan, today_dt)
+            logger.info("plan_source=uup user=%s", user_id)
+            return uup_plan.model_dump()
+
+# Fallback: rule-based prescriber
+plan: DailyPlan = build_daily_plan(inputs)
+```
+
+**Behaviour by user state:**
+- **Pre-calibration / no nightly rebuild yet:** `load_unified_profile` returns `None` → fallback fires → rule-based plan. No change for new users.
+- **Post-calibration:** `build_daily_plan_from_uup` checks `plan_for_date == today`; returns `None` if stale → fallback fires. Plan is only LLM if it was generated last night.
+- **Post-calibration, fresh nightly rebuild:** LLM plan served. `prescriber_notes` includes `"plan_source: unified_profile_layer2"` for audit.
+
+Rule-based prescriber is kept as permanent fallback — not removed.
+
+---
+
+#### Item 2 — Artefact gate scoped to background context only
+
+**Root cause:** The `RMSSD_POPULATION_CEILING = 110.0` gate added in Part 5 had no context guard. It applied to ALL window contexts including `"sleep"`. A deeply recovered sleeper with overnight RMSSD > 110 ms would have valid sleep windows incorrectly rejected.
+
+**Fix — `tracking/background_processor.py` — `__post_init__`:**
+```python
+self.is_valid = (
+    self.rmssd_ms is not None
+    and self.confidence >= 0.5
+    and self.n_beats >= CONFIG.tracking.BACKGROUND_MIN_BEATS
+    and (
+        self.context != "background"
+        or self.rmssd_ms <= CONFIG.tracking.RMSSD_POPULATION_CEILING
+    )
+)
+```
+The ceiling gate now fires **only for `context == "background"`** windows (waking, motion-artefact-prone). Sleep windows pass regardless of RMSSD — their biology supports high values (parasympathetic dominance during deep sleep).
+
+**Downstream scoring already correct:** `_compute_recovery_area_waking()` and `_compute_suppression_area()` already filter `context != "background"` before applying the `personal_ceiling` clamp. Only `__post_init__` needed the context guard.
+
+---
+
+#### Item 3 — Front-end sleep context labelling verified (no backend change needed)
+
+**Finding:** `src/services/PolarService.ts` already has automatic `background → sleep` context detection. `_sleepState` field auto-transitions based on `meanHR ≤ SLEEP_HR_THRESHOLD AND PPI CV < SLEEP_CV_THRESHOLD`. Ingest calls send `context="sleep"` during overnight wear. Server-side time-based fallback is not needed.
+
+---
+
+### Files changed this session
+
+| File | Change |
+|---|---|
+| `api/services/plan_service.py` | Added `build_daily_plan_from_uup` + `load_unified_profile` imports; LLM-first plan lookup before rule-based fallback |
+| `tracking/background_processor.py` | `__post_init__` ceiling gate wrapped in `self.context != "background" or ...` guard |
+
+### Status tracker
+
+| Change | Status | Notes |
+|---|---|---|
+| Item 1: LLM plan wiring in `plan_service.py` | ✅ Done | `api/services/plan_service.py` |
+| Item 2: Background-only artefact gate | ✅ Done | `tracking/background_processor.py` |
+| Item 3: Sleep context front-end verification | ✅ Done (no code) | PolarService.ts already handles it |
+
+### Deployment
+Both files passed `python3 -m py_compile`. `railway up --detach` completed. Health confirmed: `{"status": "ok"}` at `https://api-production-8195d.up.railway.app/health`.
+
+---
+
+**Last updated:** 17 March 2026 (Part 5) — Artifact spike fix + Plan lifecycle + Assessor integration — deployed to Railway
 **Hardware:** Polar Verity Sense (optical armband)
 **Status:** DEPLOYED & WORKING — API live on Railway, dev client APK on test phone (hot reload active)
 **Parent project:** ZenFlow_project (H10 chest strap, running and stable — do not touch)
 
 ---
+
+## Handoff Note — Session of 17 March 2026 (Part 5) — Artifact Fix + Plan Lifecycle + Assessor
+
+### What was done this session
+
+#### Phase A — RMSSD artifact spike fix (live scoring accuracy)
+
+**Root cause confirmed:** DB screenshots showed background windows at 168–352 ms with `confidence = 0.417–1.0` and `is_valid = True`. Optical PPG motion artefacts at this RMSSD range pass the existing confidence + n_beats gates because artefact detection operates at beat level, not variance level. One 171 ms window generates the same recovery credit as ~22 legitimate windows.
+
+**A1 — `config/tracking.py`:** Added new constant:
+```python
+# Population-level ceiling for RMSSD validity gate.
+# Windows above this threshold are optical-PPG motion artefacts, not genuine HRV.
+RMSSD_POPULATION_CEILING: float = 110.0
+```
+
+**A2 — `tracking/background_processor.py` — `__post_init__` gate:**
+```python
+self.is_valid = (
+    self.rmssd_ms is not None
+    and self.confidence >= 0.5
+    and self.n_beats >= CONFIG.tracking.BACKGROUND_MIN_BEATS
+    and self.rmssd_ms <= CONFIG.tracking.RMSSD_POPULATION_CEILING   # ← NEW
+)
+```
+Any window with RMSSD > 110 ms is immediately marked invalid. This is a hard reject — the window is still stored in the DB for audit but excluded from all scoring.
+
+**A3 — `tracking/daily_summarizer.py` — area clamp:**
+Both `_compute_recovery_area_waking()` and `_compute_suppression_area()` gained a `personal_ceiling: Optional[float] = None` parameter. When present:
+```python
+effective_rmssd = min(w.rmssd_ms, personal_ceiling) if personal_ceiling is not None else w.rmssd_ms
+```
+This second layer ensures that even a window which barely slipped under the 110 ms population gate (e.g. 95 ms) cannot generate more recovery credit than the user's calibrated ceiling (52.3 ms) permits. Both call-sites in `compute_daily_summary()` now pass `personal_ceiling`.
+
+**No data reset required.** Existing `is_valid = True` rows in the DB are not mutated — the `is_valid` flag is set at ingest time, so all future windows use the new gate. Historic bad rows are capped by the area clamp even if they remain `is_valid = True` in the DB.
+
+---
+
+#### Phase B — Plan lifecycle (morning trigger + 09:00 IST fallback)
+
+**Problem:** Plan was generated on-demand only — the user only got a `DailyPlan` after explicitly calling `GET /plan/today`. No proactive generation on morning read, no safety net for users who don't do a morning read.
+
+**B1 — `api/services/tracking_service.py` — morning read plan trigger:**
+After the `morning_row.day_type` classification and `flush()`, the morning read ingest now immediately generates today's plan:
+```python
+try:
+    from api.services.model_service import ModelService
+    from api.services.plan_service import PlanService
+    model_svc = ModelService(self._db)
+    plan_svc  = PlanService(self._db, model_svc)
+    await plan_svc.get_or_create_today_plan(str(self._uid), force_regen=True)
+except Exception as _plan_exc:
+    logger.warning("Morning-read plan trigger failed user=%s: %s", ...)
+```
+Wrapped in try/except — a plan failure never blocks window ingest.
+
+**B2 — `jobs/plan_reset.py` (NEW FILE):**
+`force_plan_reset_for_all_users()` — iterates users active in the last 48 h.  
+For each: checks whether a `DailyPlan` already exists for today (B1 fired) → if yes, skips; if no, calls `get_or_create_today_plan(force_regen=True)`. Per-user `AsyncSessionLocal` sessions isolate failures.
+
+**B3 — `api/main.py` — second APScheduler cron:**
+```python
+scheduler.add_job(
+    force_plan_reset_for_all_users,
+    CronTrigger(hour=3, minute=30, timezone="UTC"),   # 09:00 IST
+    id="morning_plan_reset",
+    ...
+)
+```
+Runs at 03:30 UTC (09:00 IST) — covers users who wore the band overnight but sent no morning read. The existing 18:30 UTC nightly rebuild job is unchanged.
+
+**Plan read-after-generation:** `GET /plan/today` calls `get_or_create_today_plan(force_regen=False)` — returns the cached row. Plan is never regenerated on a read. Stable for the entire day once generated.
+
+---
+
+#### Phase C — Assessor integration + adherence context in Layer 2
+
+**Problem:** `coach/assessor.py` was fully implemented (3-gate system: adherence ≥ 60%, readiness trend 14d, session quality ≥ 0.25) but never called. The Layer 2 LLM prompt only received `net_balance / stress_score / recovery_score` — no behavioural/adherence context.
+
+**C1 — `jobs/nightly_rebuild.py` — `_run_assessor()` helper + call:**
+New async helper `_run_assessor(session, user_id)`:
+- Fetches last 10 `Session` rows → `SessionRecord` list
+- Fetches 28-day `DailyStressSummary` → `ReadinessRecord` list (readiness = `waking_recovery_score`)
+- Fetches 30-day `PlanDeviation` rows → `DeviationRecord` list
+- Computes 7-day per-category adherence from `DailyPlan.items_json` + `adherence_pct`
+- Reads `TagPatternModel.sport_stressor_slugs`
+- Reads `User.training_level` as `current_stage`
+- Calls synchronous `assess_user()` (pure Python — no `asyncio.to_thread` needed)
+
+Called in `_rebuild_one_user()` after `close_day()`, before profile rebuild. Assessor failure is non-fatal (logged as warning, assessment passed as `None`).
+
+**C2 — `api/services/profile_service.py`:**
+`rebuild_unified_profile()` gains `assessment: Optional[Any] = None` parameter. Passes `assessment.adherence_7d` and `assessment.summary_note` down to `run_layer2_plan()`.
+
+**C3 — `profile/nightly_analyst.py`:**
+`run_layer2_plan()` and `_build_layer2_user_prompt()` gain `adherence: Optional[dict]` and `assessment_note: Optional[str]` params. When present, the Layer 2 prompt now includes:
+```
+ADHERENCE LAST 7 DAYS (by category):
+  breathing: 80%
+  movement: 50%
+  recovery: 30%
+COACHING NOTE: {assessment.summary_note}
+```
+The LLM now has real behavioural data alongside physiological scores to personalise the plan.
+
+**Stage write:** Assessor outputs `ready=True/False` only. Stage number is NOT incremented by this job — that decision is deferred (explicitly out of scope for this session).
+
+---
+
+### Files changed this session
+
+| File | Change |
+|---|---|
+| `config/tracking.py` | Added `RMSSD_POPULATION_CEILING: float = 110.0` |
+| `tracking/background_processor.py` | `__post_init__` ceiling gate `and self.rmssd_ms <= CONFIG.tracking.RMSSD_POPULATION_CEILING` |
+| `tracking/daily_summarizer.py` | `personal_ceiling` param + `effective_rmssd = min(...)` clamp in `_compute_recovery_area_waking()` and `_compute_suppression_area()`; both call-sites in `compute_daily_summary()` updated |
+| `api/services/tracking_service.py` | Morning read → `get_or_create_today_plan(force_regen=True)` trigger after `flush()` |
+| `jobs/plan_reset.py` | NEW — `force_plan_reset_for_all_users()` 09:00 IST fallback |
+| `api/main.py` | Second APScheduler job at `CronTrigger(hour=3, minute=30)` for morning plan reset |
+| `jobs/nightly_rebuild.py` | `_run_assessor()` helper; calls `assess_user()`; passes `assessment=` to `rebuild_unified_profile()` |
+| `api/services/profile_service.py` | `rebuild_unified_profile()` + `assessment` param, threads to `run_layer2_plan()` |
+| `profile/nightly_analyst.py` | `run_layer2_plan()` + `_build_layer2_user_prompt()` with `adherence` + `assessment_note` |
+
+### Status tracker
+
+| Change | Status | Notes |
+|---|---|---|
+| A1: `RMSSD_POPULATION_CEILING` config constant | ✅ Done | `config/tracking.py` |
+| A2: `is_valid` ceiling gate | ✅ Done | `tracking/background_processor.py` |
+| A3: Area clamp with `personal_ceiling` | ✅ Done | `tracking/daily_summarizer.py` |
+| B1: Morning read → plan trigger | ✅ Done | `api/services/tracking_service.py` |
+| B2: `jobs/plan_reset.py` | ✅ Done | New file |
+| B3: 03:30 UTC cron in scheduler | ✅ Done | `api/main.py` |
+| C1: `_run_assessor()` + call in nightly rebuild | ✅ Done | `jobs/nightly_rebuild.py` |
+| C2: `assessment` param in `rebuild_unified_profile` | ✅ Done | `api/services/profile_service.py` |
+| C3: Adherence block in Layer 2 prompt | ✅ Done | `profile/nightly_analyst.py` |
+| Change 3 (out-of-bounds gate) | 🅿 PARKED | Explicitly deferred |
+| Stage advancement write on gate pass | 🅿 PARKED | Assessor outputs ready flag only |
+| Coach push on capacity growth trigger | 🅿 PARKED | P5 item |
+
+### Deployment
+All 9 files passed `python3 -m py_compile`. `railway up --service api` completed. Health confirmed: `{"status": "ok"}` at `https://api-production-8195d.up.railway.app/health`.
+
+---
+
 
 ## ~~⚠️ NEXT SESSION MUST-FIX~~ ✅ FIXED 17 March 2026 — Read before touching any score/boundary code
 
@@ -63,6 +561,267 @@ When morning read arrives:
 | Midnight (00:00 IST) | `close_day()` writes DB row for yesterday — INTERNAL ONLY. No UI change. |
 | User wears band overnight | Windows keep streaming, live scores keep moving — no reset |
 | Morning read arrives (~9am) | Scores reset to 0, opening_balance applied, new day begins for the user |
+
+---
+
+---
+
+## Handoff Note — Session of 17 March 2026 (Part 4) — Scoring Redesign v2: Split Denominator + Sleep Baseline
+
+### What was done this session
+
+**Diagnosis:** After Part 3 fixes, scores were still inflated: `net_balance ≈ 226`, `waking_recovery_score = 100.0`. Two root causes identified:
+1. **Overnight path spans 33+ hours** (no prior `close_day` row, so `day_start = prev_morning_read_ts` from 2 days ago). Thousands of extra windows against a 16h denominator → massive inflation.
+2. **Sleep RMSSD scored against waking baseline** — sleep RMSSD (~40–60 ms) always above waking avg (28.7 ms) → recovery score locked at 100 every night.
+
+**Design approved by user:** Split denominators (stress = 960 min, recovery = 1440 min), separate sleep RMSSD baseline, no-band fallback defaults, synthetic wake boundary.
+
+---
+
+### Change 1 — Split denominator (`config/tracking.py`, `tracking/daily_summarizer.py`)
+
+```python
+# config/tracking.py
+DAILY_CAPACITY_WAKING_MINUTES: int = 960    # 16h × 60 — stress budget (waking only)
+DAILY_CAPACITY_RECOVERY_MINUTES: int = 1440  # 24h × 60 — recovery budget (full day)
+```
+
+```python
+# daily_summarizer.compute_daily_summary()
+rmssd_range = max(0.0, personal_ceiling - personal_floor)
+ns_capacity_stress   = rmssd_range * cfg.DAILY_CAPACITY_WAKING_MINUTES    # 960
+ns_capacity_recovery = rmssd_range * cfg.DAILY_CAPACITY_RECOVERY_MINUTES  # 1440
+
+stress_pct_raw   = round(actual_suppression   / ns_capacity_stress   * 100.0, 2)
+recovery_pct_raw = round(total_recovery_area  / ns_capacity_recovery * 100.0, 2)
+```
+
+`DailySummaryResult` gained `ns_capacity_recovery_used` field. DB column `daily_stress_summaries.ns_capacity_recovery` added.
+
+---
+
+### Change 2 — Sleep RMSSD baseline (`api/db/schema.py`, `api/services/tracking_service.py`, `tracking/daily_summarizer.py`)
+
+New columns on `personal_models`: `rmssd_sleep_avg`, `rmssd_sleep_ceiling`.
+New columns on `calibration_snapshots`: `rmssd_sleep_avg_clean`, `sleep_windows_count`.
+
+`_run_calibration_batch()` now computes:
+```python
+sleep_wins = [w for w in windows if w.context == "sleep" and w.rmssd_ms is not None and w.is_valid]
+if len(sleep_wins) >= 12:
+    rmssd_sleep_avg_clean = float(np.median([w.rmssd_ms for w in sleep_wins]))   # median
+    # P90 reserved as sleep_ceiling for future gate
+```
+
+When `rmssd_sleep_avg` is populated, `compute_daily_summary()` uses a sleep-specific helper `_compute_recovery_area_sleep_raw()` that scores each sleep window against `rmssd_sleep_avg` instead of the waking floor. Until the user sleeps with the band (after calibration), `rmssd_sleep_avg` remains NULL and scores fall back to the previous area computation.
+
+---
+
+### Phase 0a — No-band sleep default (`tracking/wake_detector.py`)
+
+Absolute last resort when both `typical_sleep_time` IS NULL and no `last_background_window_ts`:
+```python
+# 22:00 IST = 16:30 UTC
+if sleep_ts is None:
+    sleep_ts = day_date.replace(hour=16, minute=30, second=0, microsecond=0)
+    if sleep_ts <= wake_ts:
+        sleep_ts = sleep_ts + timedelta(days=1)
+    sleep_method = "no_band_default"
+```
+
+---
+
+### Phase 0b — Synthetic wake boundary (`api/services/tracking_service.py`)
+
+Prevents 25h+ inflation when band is worn overnight but no morning read has arrived yet. Added in `compute_live_summary()` overnight branch:
+```python
+# Phase 0b: if band worn past typical wake + 2 h but no morning read,
+# treat as a fresh day to prevent 25h+ score inflation.
+if personal.typical_wake_time:
+    _h, _m = (int(x) for x in personal.typical_wake_time.split(":"))
+    _synthetic_wake = cal_start.replace(hour=_h, minute=_m, second=0, microsecond=0)
+    if now > _synthetic_wake + timedelta(hours=2):
+        day_start          = cal_start
+        day_end            = now
+        opening_balance_fn = True
+```
+
+---
+
+### Alembic migration — `f1a2b3c4d5e6` (chained from `d1e2f3a4b5c6`)
+
+- `personal_models`: adds `rmssd_sleep_avg FLOAT`, `rmssd_sleep_ceiling FLOAT`
+- `calibration_snapshots`: adds `rmssd_sleep_avg_clean FLOAT`, `sleep_windows_count INT`
+- `daily_stress_summaries`: adds `ns_capacity_recovery FLOAT`
+
+---
+
+### Data reset required after deploy
+
+Old `net_balance` values were computed with the wrong denominator (155-ms ceiling). After migration:
+```sql
+UPDATE daily_stress_summaries
+SET opening_balance=0, closing_balance=0, net_balance=0, recovery_pct_raw=NULL
+WHERE user_id='2420112a-d69c-4938-972a-6598cc8526af';
+```
+
+---
+
+### Status tracker
+
+| Step | Status | Notes |
+|---|---|---|
+| Phase 0a — no-band sleep default 22:00 IST | ✅ Done | `tracking/wake_detector.py` |
+| Phase 0b — synthetic wake boundary | ✅ Done | `compute_live_summary()` |
+| Phase 1 — split denominator config | ✅ Done | `config/tracking.py` |
+| Phase 2 — Alembic migration + ORM columns | ✅ Done | `f1a2b3c4d5e6` |
+| Phase 3 — sleep baseline in calibration | ✅ Done | `_run_calibration_batch()` |
+| Phase 4 — daily_summarizer split logic | ✅ Done | `compute_daily_summary()` helper |
+| Phase 5 — close_day + compute_live_summary sleep params | ✅ Done | `tracking_service.py` |
+| Phase 6 — data reset SQL | ⏳ Run after deploy | SQL above |
+| Change 3 — out-of-bounds gate | 🅿 PARKED | Explicitly deferred by user |
+
+---
+
+### Deployment note
+
+```bash
+railway run alembic upgrade head --service api
+# …then data reset SQL…
+railway up --service api
+```
+
+---
+
+
+
+### What was done this session
+
+#### Bug Fix 1 — `wake_ts` fallback was 07:00 UTC = 12:30pm IST (`tracking/wake_detector.py`)
+
+`detect_wake_sleep_boundary()` absolute fallback was `hour=7, minute=0` (07:00 UTC). The user's morning reads arrive at ~03:30 UTC (09:00 IST), before that fallback → `wake_ts` was set to 12:30pm IST → every morning window was treated as pre-wake → `_compute_suppression_area` and `_compute_recovery_area_waking` both returned 0.0 → `stress_load_score = 0`, `waking_recovery_score = 0` all morning.
+
+**Fix:** Absolute fallback changed from `hour=7, minute=0` → `hour=1, minute=30` (01:30 UTC = 07:00 IST). Morning reads at 03:30 UTC are now after `wake_ts` and are counted correctly.
+
+```python
+# Absolute fallback: 07:00 IST = 01:30 UTC  (app is IST-based)
+if wake_ts is None:
+    wake_ts = day_date.replace(hour=1, minute=30, second=0, microsecond=0)
+    wake_method = "morning_read_anchor"
+```
+
+#### Bug Fix 2 — Overnight branch needed `wake_ts = day_start` override (`api/services/tracking_service.py`)
+
+In the overnight path of `compute_live_summary()`, `day_start` is yesterday's morning read (~03:30 UTC yesterday). Even after Fix 1, the new fallback `wake_ts = 01:30 UTC today` is still AFTER `day_start` → `_compute_suppression_area` and `_compute_recovery_area_waking` skip all overnight windows (they only count windows after `wake_ts`).
+
+**Fix:** After `detect_wake_sleep_boundary(...)`, the overnight branch now overrides `boundary.wake_ts = day_start` so all overnight windows are counted:
+
+```python
+# Overnight branch: override wake_ts to day_start so the entire span counts.
+if not opening_balance_fn:
+    boundary.wake_ts        = day_start
+    boundary.waking_minutes = (
+        ((boundary.sleep_ts or now) - day_start).total_seconds() / 60.0
+    )
+```
+
+#### Database recovery (mid-session)
+
+Railway Postgres service had stopped and DATABASE_URL on the API service was wiped to `postgresql://` (empty) during a failed deploy cycle. Both were restored:
+- Postgres: `railway redeploy --service Postgres-CiQD` — data intact (volume-backed)
+- DATABASE_URL: `railway variables set DATABASE_URL=postgresql+asyncpg://...`
+- DATABASE_SYNC_URL: `railway variables set DATABASE_SYNC_URL=postgresql+psycopg2://...`
+
+#### Old CLI worktree removed
+
+VS Code Copilot CLI agent had created `copilot-worktree-2026-03-17T04-24-37` on the wrong branch with pre-fix code. Would have reverted the `opening_balance` fix if merged. Removed with `git worktree remove --force`.
+
+#### Expected behaviour after these fixes
+
+Scores accumulate from morning read onward. Verified API response (17 March 2026, ~15:00 IST):
+```json
+{
+    "stress_load_score": 26.9,
+    "waking_recovery_score": 100.0,
+    "net_balance": 219.6
+}
+```
+`net_balance: 219.6` is temporarily inflated — `waking_minutes` covers the full overnight span (~21h) because no prior `close_day` row exists. Will normalise after tonight's midnight IST cron writes the finalized close-day row.
+
+#### Pending (low urgency) — Fix 3: opening_balance NULL fallback
+
+When `prev_summary.opening_balance IS NULL` (pre-column rows), the overnight branch falls back to 0 instead of trying `closing_balance` first. Recommend applying before tonight's midnight cron:
+
+```python
+# In compute_live_summary() overnight branch (~line 1025)
+else:
+    if prev_summary is not None:
+        val = prev_summary.opening_balance
+        if val is None:
+            val = prev_summary.closing_balance
+        opening_balance = float(val or 0.0)
+    else:
+        opening_balance = 0.0
+```
+
+#### Deployment
+`railway up --service api` from local disk. Health confirmed: `{"status":"ok"}` at `https://api-production-8195d.up.railway.app/health`. Scores live.
+
+### Status tracker
+| Step | Status | Notes |
+|---|---|---|
+| `wake_ts` fallback 07:00 UTC → 01:30 UTC | ✅ Fixed 17 Mar | `tracking/wake_detector.py` |
+| Overnight `boundary.wake_ts = day_start` override | ✅ Fixed 17 Mar | `api/services/tracking_service.py` `compute_live_summary()` |
+| DATABASE_URL / Postgres restored | ✅ Fixed 17 Mar | Railway variables restored manually |
+| Stale CLI worktree removed | ✅ Fixed 17 Mar | git worktree remove --force |
+| `opening_balance` NULL → try `closing_balance` | ⏳ Pending | Low urgency, apply before midnight cron |
+
+---
+
+---
+
+## Handoff Note — Session of 17 March 2026 (Part 2) — Overnight Balance + Sleep Recovery Fix
+
+### What was done this session
+
+#### Bug Fix 1 — Overnight `opening_balance = 0.0` (`api/services/tracking_service.py`)
+
+`compute_live_summary()` overnight branch was setting `opening_balance = 0.0`. This dropped the entire historical carry-forward whenever no morning read had arrived yet (i.e. from midnight through ~9am). The live `net_balance` during that window was computed as `yesterday_recovery + sleep_recovery − yesterday_stress + 0`, completely losing the previous days' accumulated surplus or deficit.
+
+**Fix:** The overnight branch now calls `_load_day_summary(prev_date)` (same call as the morning-read branch) and sets:
+```python
+opening_balance = float(prev_summary.opening_balance or 0.0) if prev_summary else 0.0
+```
+
+With this fix, `net_balance` at 01:00am ≈ yesterday's `closing_balance` + sleep recovery accumulated so far — the correct continuous thread.
+
+#### Bug Fix 2 — Sleep recovery not counted in score (`tracking/daily_summarizer.py`)
+
+`recovery_pct_raw` was computed from `actual_recovery_area_waking` only. Sleep recovery windows (`context="sleep"`) were detected by `detect_recovery_windows()`, stored in `recovery_windows`, and written to audit as `raw_sleep` — but never added to the actual score. Result: net_balance stayed flat overnight even as sleep recovery accumulated in the DB.
+
+**Fix:**
+```python
+actual_recovery_area_sleep = sum(
+    rw.recovery_area for rw in recovery_windows if rw.context == "sleep"
+)
+total_recovery_area = actual_recovery_area_waking + actual_recovery_area_sleep
+recovery_pct_raw = round(total_recovery_area / ns_capacity * 100.0, 2)
+```
+
+The audit variable `raw_sleep` now reuses `actual_recovery_area_sleep` (no duplicate iteration).
+
+#### Expected behaviour after these fixes
+
+```
+23:30 — stress=22, recovery=47, net_balance=+25   (pre-midnight)
+00:01 — stress=24, recovery=47, net_balance=+23   ← continuous, no reset
+02:00 — stress=26, recovery=52, net_balance=+26   ← sleep recovery accumulating in score
+06:00 — stress=26, recovery=68, net_balance=+42   ← good night's sleep visible in numbers
+09:00 — MORNING READ → new day begins, opening_balance = +42
+```
+
+#### Deployment
+`railway up --service api` from local disk. Health confirmed: `{"status":"ok"}` at `https://api-production-8195d.up.railway.app/health`.
 
 ---
 
@@ -146,6 +905,8 @@ Restored `personal_models` for user `2420112a` by reading the committed `calibra
 | `_persist_fingerprint` overwrites calibration fields | ✅ Fixed 17 Mar | Three lines removed from `api/services/model_service.py` |
 | DB corrupted ceiling 155.2ms | ✅ Fixed 17 Mar | Patched from committed snapshot via direct SQL |
 | Day boundary = morning read, not midnight | ✅ Fixed 17 Mar | `compute_live_summary()` now queries from last morning read ts when no morning read today; `opening_balance=0` overnight; step-3 carry-forward removed from router. |
+| Overnight `opening_balance = 0.0` bug | ✅ Fixed 17 Mar | Overnight branch now sets `opening_balance = yesterday.opening_balance` to preserve the continuous balance thread across midnight. |
+| Sleep recovery not counted in score | ✅ Fixed 17 Mar | `actual_recovery_area_sleep` added to `total_recovery_area` before `recovery_pct_raw` in `daily_summarizer.py`. Sleep recovery windows now accumulate in the score overnight. |
 
 ---
 
