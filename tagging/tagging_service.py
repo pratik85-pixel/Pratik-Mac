@@ -35,23 +35,8 @@ class PatternModelBuildResult:
 
 
 def validate_tag(slug: str, window_type: str) -> Tuple[bool, str]:
-    catalog = {
-        "running": "stress",
-        "yoga": "recovery",
-        "work_sprint": "stress",
-        "walking": "mixed"
-    }
-    
-    if slug not in catalog:
-        return False, f"Unknown slug: {slug}"
-        
-    slug_type = catalog[slug]
-    if slug_type == "mixed":
-        return True, ""
-        
-    if slug_type != window_type:
-        return False, f"Invalid tag for {window_type}: {slug_type}"
-        
+    if not slug or not slug.strip():
+        return False, "Tag slug must not be empty."
     return True, ""
 
 
