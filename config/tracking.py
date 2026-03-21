@@ -34,6 +34,17 @@ class TrackingConfig(BaseSettings):
     # downstream: tracking/background_processor (min beats for valid RMSSD)
     BACKGROUND_MIN_BEATS: int = 25
 
+    # Population-level ceiling for RMSSD validity gate.
+    # Windows above this threshold are optical-PPG motion artefacts, not genuine HRV.
+    # downstream: tracking/background_processor (is_valid), tracking/daily_summarizer (area clamp)
+    RMSSD_POPULATION_CEILING: float = 110.0
+
+    # Population-level floor for RMSSD validity gate.
+    # Windows below this are dead-signal contact loss — no living NS produces <3 ms RMSSD.
+    # Only applied to context="background" windows (mirrors ceiling gate symmetrically).
+    # downstream: tracking/background_processor (is_valid), tracking/daily_summarizer (area clamp)
+    RMSSD_POPULATION_FLOOR: float = 3.0
+
     # ── Stress Detection ────────────────────────────────────────────────────
     # downstream: tracking/stress_detector
     # RMSSD must fall below this fraction of personal morning average to breach threshold
@@ -68,7 +79,8 @@ class TrackingConfig(BaseSettings):
     #   - score never drifts DOWN just because time passes (old bug)
     #   - early-morning events are honest (small % of full-day budget)
     #   - users can directly compare across time-of-day
-    DAILY_CAPACITY_WAKING_MINUTES: int = 960  # 16 h × 60 min
+    DAILY_CAPACITY_WAKING_MINUTES: int = 960    # 16 h × 60 min — stress budget (waking only)
+    DAILY_CAPACITY_RECOVERY_MINUTES: int = 1440  # 24 h × 60 min — recovery budget (full day)
 
     # ── Day Type Thresholds (MorningRead → green/yellow/red) ───────────────────
     # downstream: api/services/tracking_service (morning read ingest)
@@ -90,6 +102,10 @@ class TrackingConfig(BaseSettings):
 
     # Gaps longer than this (minutes) mark the day as partial data
     GAP_PARTIAL_DATA_MINUTES: int = 120
+
+    # Gap threshold (minutes) used to detect band removal and close a BandWearSession.
+    # When no background window arrives for this long, the session is considered ended.
+    BAND_GAP_CLOSE_MINUTES: int = 90
 
     # ── Motion Thresholds ──────────────────────────────────────────────────
     # downstream: tracking/stress_detector (physical vs emotional classification)

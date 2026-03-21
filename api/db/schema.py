@@ -220,6 +220,13 @@ class PersonalModel(Base):
     # Triggers re-lock when it reaches CAPACITY_GROWTH_CONFIRM_DAYS (7).
     capacity_growth_streak   = Column(Integer, default=0, nullable=True)
 
+    # ── Sleep scoring v2: personal sleep baseline ─────────────────────────────
+    # Populated by _run_calibration_batch() when band is worn overnight
+    # (requires >= 12 sleep windows = 60 min). NULL until then.
+    # Used as baseline for sleep recovery/stress scoring instead of waking avg.
+    rmssd_sleep_avg          = Column(Float, nullable=True)   # median sleep RMSSD (ms)
+    rmssd_sleep_ceiling      = Column(Float, nullable=True)   # P90 sleep RMSSD (ms)
+
     user = relationship("User", back_populates="personal_model")
 
 
@@ -267,6 +274,10 @@ class CalibrationSnapshot(Base):
     # --- Outcome flags ---
     committed     = Column(Boolean, nullable=False, default=False)  # pushed to personal_model
     sanity_passed = Column(Boolean, nullable=False, default=True)   # morning_avg >= floor + 10% range
+
+    # --- Sleep scoring v2 audit ---
+    rmssd_sleep_avg_clean = Column(Float, nullable=True)    # sleep median from this day's windows
+    sleep_windows_count   = Column(Integer, nullable=True)  # how many sleep windows were available
 
     __table_args__ = (
         Index("ix_calibration_snapshots_user_day", "user_id", "day_number"),
@@ -739,6 +750,7 @@ class DailyStressSummary(Base):
     user_id      = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
     summary_date = Column(DateTime(timezone=True), nullable=False)   # date only
     computed_at  = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at   = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
     # Day boundary
     wake_ts      = Column(DateTime(timezone=True), nullable=True)
@@ -781,6 +793,8 @@ class DailyStressSummary(Base):
     ns_capacity_used           = Column(Float, nullable=False, default=0.0)
     # Legacy field — kept for backward compat, equals ns_capacity_used
     max_possible_suppression   = Column(Float, nullable=False, default=0.0)
+    # Sleep scoring v2: denominator used for recovery score (= range x 1440)
+    ns_capacity_recovery       = Column(Float, nullable=True)
 
     # Baseline versioning
     capacity_floor_used = Column(Float, nullable=True)
@@ -1129,3 +1143,55 @@ class Tag(Base):
     
     source = Column(String(50), nullable=False, default="manual")
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+# ── Band Wear Sessions ─────────────────────────────────────────────────────────
+
+class BandWearSession(Base):
+    """
+    One row per continuous band wear period.
+
+    A session opens when the first background window arrives after either:
+      - A gap > BAND_GAP_CLOSE_MINUTES (default 90) since the last window, OR
+      - The very first window ever for this user.
+
+    A session closes when:
+      - A gap > BAND_GAP_CLOSE_MINUTES elapses (detected on the NEXT ingest),
+        at which point is_closed=True, ended_at and final scores are written.
+
+    Balance carry-forward:
+      - On the first sleep→background context transition within this session,
+        the accumulated pre-wake score (sleep recovery + prior evening stress)
+        is snapshotted as opening_balance and opening_balance_locked=True.
+      - Subsequent sleep→background transitions within the same session do NOT
+        trigger another carry-forward (opening_balance_locked prevents it).
+      - On band-off close (>90 min gap): no carry-forward. Fresh start next time.
+
+    has_sleep_data: True if any sleep-context window exists within this session.
+    """
+    __tablename__ = "band_wear_sessions"
+
+    id         = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id    = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+
+    started_at = Column(DateTime(timezone=True), nullable=False)   # first window start
+    ended_at   = Column(DateTime(timezone=True), nullable=True)    # last window end (null while open)
+    is_closed  = Column(Boolean, nullable=False, default=False)
+
+    # Final scores (written at close)
+    stress_pct    = Column(Float, nullable=True)
+    recovery_pct  = Column(Float, nullable=True)
+    net_balance   = Column(Float, nullable=True)
+    has_sleep_data = Column(Boolean, nullable=False, default=False)
+
+    # Carry-forward state (live, updated each ingest while open)
+    opening_balance        = Column(Float, nullable=False, default=0.0)
+    opening_balance_locked = Column(Boolean, nullable=False, default=False)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        Index("ix_band_wear_sessions_user_started", "user_id", "started_at"),
+        Index("ix_band_wear_sessions_user_open", "user_id", "is_closed"),
+    )

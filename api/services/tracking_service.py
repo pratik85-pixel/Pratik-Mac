@@ -199,7 +199,6 @@ _EXERCISE_FREQ_TIERS: dict = {
     "4+/week":   _TIER_ATHLETIC,
 }
 
-_SEED_CAPACITY_FLOOR = 32.0   # ms  — seed stress detection threshold (unchanged)
 _MIN_WINDOWS_FOR_REFINE = 3   # legacy constant kept for reference
 
 
@@ -211,47 +210,6 @@ def _seed_from_onboarding(onboarding: "Optional[dict]") -> "tuple[float, float, 
         freq = onboarding.get("exercise_frequency", "1-3x/week")
         tier = _EXERCISE_FREQ_TIERS.get(freq, _TIER_MODERATE)
     return tier["floor"], tier["ceiling"], tier["morning"]
-
-# ── Morning read day-type thresholds ────────────────────────────────────────
-# Based on vs_personal_avg_pct (morning RMSSD vs personal morning average).
-_MORNING_GREEN_PCT:  float = -5.0   # ≥ -5% → green (at or near baseline)
-_MORNING_YELLOW_PCT: float = -20.0  # -5% to -20% → yellow; < -20% → red
-
-
-def _classify_morning_day_type(vs_avg_pct: "Optional[float]") -> "Optional[str]":
-    """Classify a morning read as green/yellow/red from vs_personal_avg_pct."""
-    if vs_avg_pct is None:
-        return None
-    if vs_avg_pct >= _MORNING_GREEN_PCT:
-        return "green"
-    if vs_avg_pct >= _MORNING_YELLOW_PCT:
-        return "yellow"
-    return "red"
-
-
-def _morning_brief_text(day_type: str, vs_avg_pct: "Optional[float]") -> str:
-    """Generate a short deterministic morning brief from day_type + deviation."""
-    if day_type == "green":
-        if vs_avg_pct is not None and vs_avg_pct >= 0:
-            detail = f" (+{vs_avg_pct:.0f}% above your baseline)"
-        else:
-            detail = " (at your baseline)"
-        return (
-            "Your HRV is tracking well this morning" + detail + ". "
-            "Good conditions — a focused breathing session will serve you well today."
-        )
-    elif day_type == "yellow":
-        pct_str = f"{abs(vs_avg_pct):.0f}%" if vs_avg_pct is not None else ""
-        return (
-            f"Your HRV is {pct_str} below your morning average. "
-            "A lighter session or short resonance breathing is ideal today."
-        )
-    else:  # red
-        pct_str = f"{abs(vs_avg_pct):.0f}%" if vs_avg_pct is not None else ""
-        return (
-            f"Your HRV is {pct_str} below your morning baseline — a significant dip. "
-            "This is a recovery day. Rest is productive; a gentle breathing session if you choose."
-        )
 
 
 async def _load_all_background_for_model(
@@ -323,7 +281,6 @@ async def _bootstrap_personal_model(
             rmssd_floor                  = seed_floor,
             rmssd_ceiling                = seed_ceiling,
             rmssd_morning_avg            = seed_morning,
-            stress_capacity_floor_rmssd  = _SEED_CAPACITY_FLOOR,
             capacity_version             = 0,
             prf_status                   = "PRF_UNKNOWN",
             typical_wake_time            = "07:00",
@@ -379,10 +336,8 @@ async def _run_calibration_batch(
 
     # --- Raw stats (before filtering) ---
     raw_rmssd = [w.rmssd_ms for w in windows if w.rmssd_ms is not None]
-    raw_morning = [w.rmssd_ms for w in windows if w.rmssd_ms is not None and w.context == "morning"]
-    rmssd_floor_raw    = float(np.percentile(raw_rmssd, 10))   if len(raw_rmssd) >= 3 else None
-    rmssd_ceiling_raw  = float(np.percentile(raw_rmssd, 90))   if len(raw_rmssd) >= 3 else None
-    rmssd_morning_avg_raw = float(np.median(raw_morning))      if raw_morning else None
+    rmssd_floor_raw   = float(np.percentile(raw_rmssd, 10)) if len(raw_rmssd) >= 3 else None
+    rmssd_ceiling_raw = float(np.percentile(raw_rmssd, 90)) if len(raw_rmssd) >= 3 else None
 
     # --- 3-pass artifact filter ---
     filter_result = filter_calibration_windows(windows)
@@ -395,44 +350,38 @@ async def _run_calibration_batch(
         )
         return
 
-    clean_rmssd   = [w.rmssd_ms for w in clean if w.rmssd_ms is not None]
-    clean_morning = [w.rmssd_ms for w in clean if w.rmssd_ms is not None and w.context == "morning"]
+    clean_rmssd = [w.rmssd_ms for w in clean if w.rmssd_ms is not None]
 
-    rmssd_floor_clean  = float(np.percentile(clean_rmssd, 10)) if len(clean_rmssd) >= 3 else rmssd_floor_raw
+    rmssd_floor_clean   = float(np.percentile(clean_rmssd, 10)) if len(clean_rmssd) >= 3 else rmssd_floor_raw
     rmssd_ceiling_clean = float(np.percentile(clean_rmssd, 90)) if len(clean_rmssd) >= 3 else rmssd_ceiling_raw
     # Extra hard-cap: 110ms is the 99th pct of healthy adult RMSSD
     if rmssd_ceiling_clean is not None:
         rmssd_ceiling_clean = min(rmssd_ceiling_clean, 110.0)
-    rmssd_morning_avg_clean = float(np.median(clean_morning)) if clean_morning else None
 
-    # --- Sanity check: morning_avg must be within the floor–ceiling range ---
-    sanity_passed = True
-    if (rmssd_floor_clean is not None and rmssd_ceiling_clean is not None
-            and rmssd_morning_avg_clean is not None):
-        min_morning = rmssd_floor_clean + 0.10 * (rmssd_ceiling_clean - rmssd_floor_clean)
-        if rmssd_morning_avg_clean < min_morning:
-            rmssd_morning_avg_clean = round(min_morning, 1)
-            sanity_passed = False
-            logger.warning(
-                "Calibration sanity fail day=%d user=%s: morning_avg corrected to %.1f",
-                day_number, user_id, rmssd_morning_avg_clean,
-            )
+    # --- morning_avg: derived from floor+ceiling range (no morning-window dependency) ---
+    # Formula: floor + 37% of range — matches the moderate-tier population seed ratio.
+    # Owned exclusively here; no other code path may overwrite this field.
+    rmssd_morning_avg_clean: Optional[float] = (
+        round(rmssd_floor_clean + 0.37 * (rmssd_ceiling_clean - rmssd_floor_clean), 1)
+        if rmssd_floor_clean is not None and rmssd_ceiling_clean is not None
+        else None
+    )
 
     # --- Write audit snapshot (committed=False initially) ---
     snap = db.CalibrationSnapshot(
-        user_id               = user_id,
-        day_number            = day_number,
-        rmssd_floor_raw       = rmssd_floor_raw,
-        rmssd_ceiling_raw     = rmssd_ceiling_raw,
-        rmssd_morning_avg_raw = rmssd_morning_avg_raw,
-        rmssd_floor_clean     = rmssd_floor_clean,
-        rmssd_ceiling_clean   = rmssd_ceiling_clean,
+        user_id                 = user_id,
+        day_number              = day_number,
+        rmssd_floor_raw         = rmssd_floor_raw,
+        rmssd_ceiling_raw       = rmssd_ceiling_raw,
+        rmssd_morning_avg_raw   = None,           # no longer measured separately
+        rmssd_floor_clean       = rmssd_floor_clean,
+        rmssd_ceiling_clean     = rmssd_ceiling_clean,
         rmssd_morning_avg_clean = rmssd_morning_avg_clean,
-        windows_total         = filter_result.windows_total,
-        windows_rejected      = filter_result.rejected_count,
-        confidence            = filter_result.confidence,
-        committed             = False,
-        sanity_passed         = sanity_passed,
+        windows_total           = filter_result.windows_total,
+        windows_rejected        = filter_result.rejected_count,
+        confidence              = filter_result.confidence,
+        committed               = False,
+        sanity_passed           = True,           # formula always satisfies the range constraint
     )
     db_session.add(snap)
 
@@ -454,12 +403,9 @@ async def _run_calibration_batch(
 
     # --- Update personal model if confidence is adequate ---
     if filter_result.confidence >= 0.65 and rmssd_floor_clean is not None and rmssd_ceiling_clean is not None:
-        cap_floor = max(rmssd_floor_clean + 0.1 * (rmssd_ceiling_clean - rmssd_floor_clean), 20.0)
         personal.rmssd_floor                 = round(rmssd_floor_clean, 1)
         personal.rmssd_ceiling               = round(rmssd_ceiling_clean, 1)
-        if rmssd_morning_avg_clean is not None:
-            personal.rmssd_morning_avg       = round(rmssd_morning_avg_clean, 1)
-        personal.stress_capacity_floor_rmssd = round(cap_floor, 1)
+        personal.rmssd_morning_avg           = round(rmssd_morning_avg_clean, 1)  # always set with floor+ceiling
         # Persist sleep baseline if enough overnight data was available
         if rmssd_sleep_avg_clean is not None:
             personal.rmssd_sleep_avg     = round(rmssd_sleep_avg_clean, 1)
@@ -480,11 +426,11 @@ async def _run_calibration_batch(
 
     logger.info(
         "Calibration batch day=%d user=%s: raw_ceil=%.1f clean_ceil=%.1f "
-        "rejected=%d/%d confidence=%.2f committed=%s sanity=%s",
+        "rejected=%d/%d confidence=%.2f committed=%s",
         day_number, user_id,
         rmssd_ceiling_raw or 0.0, rmssd_ceiling_clean or 0.0,
         filter_result.rejected_count, filter_result.windows_total,
-        filter_result.confidence, snap.committed, sanity_passed,
+        filter_result.confidence, snap.committed,
     )
 
 
@@ -527,6 +473,14 @@ class TrackingService:
         Process one 5-min PPI chunk, persist BackgroundWindow, then recompute
         today's stress / recovery windows.
 
+        Also manages BandWearSession lifecycle:
+          - Opens a new session if none is open or if the gap since the last
+            window exceeds BAND_GAP_CLOSE_MINUTES (90 min).
+          - On band-off close: snapshot final scores, mark is_closed=True.
+          - On first sleep→background transition within a session: compute and
+            lock the opening_balance carry-forward.
+          - Subsequent sleep→background transitions do NOT reset (locked flag).
+
         Returns the BackgroundWindowResult for the caller (e.g. live UI push).
         """
         # Auto-create the user row if it doesn't exist yet (avoids FK violation
@@ -547,70 +501,23 @@ class TrackingService:
             gyro_samples = np.array([gyro_mean]) if gyro_mean is not None else None,
         )
 
+        # ── Band wear session management ──────────────────────────────────────
+        await self._manage_band_session(window_start, window_end, context)
+
         # Persist raw window
         row = _to_db_background(result)
         self._db.add(row)
         await self._db.flush()   # get the id without committing
 
-        # Recompute today's stress + recovery windows
-        day_start = window_start.replace(hour=0, minute=0, second=0, microsecond=0)
-        day_end   = day_start + timedelta(days=1)
-        await self._recompute_day_windows(day_start, day_end)
-
-        # Morning read: save MorningRead row + EWM-update rmssd_morning_avg (pre-lock only)
-        if context == "morning" and result.is_valid and result.rmssd_ms is not None:
-            personal = await _load_personal_model(self._db, self._uid)
-            if personal is not None:
-                existing_mr = await self._db.execute(
-                    select(db.MorningRead)
-                    .where(db.MorningRead.user_id == self._uid)
-                    .where(db.MorningRead.read_date >= day_start)
-                    .where(db.MorningRead.read_date < day_end)
-                    .limit(1)
-                )
-                morning_row = existing_mr.scalar_one_or_none()
-                if morning_row is None:
-                    morning_row = db.MorningRead(
-                        user_id   = self._uid,
-                        read_date = window_start,
-                    )
-                    self._db.add(morning_row)
-                morning_row.rmssd_ms   = round(result.rmssd_ms, 1)
-                morning_row.hr_bpm     = result.hr_bpm
-                morning_row.lf_hf      = result.lf_hf
-                morning_row.confidence = result.confidence
-                if personal.calibration_locked_at is None:
-                    alpha       = CONFIG.tracking.MORNING_EWM_ALPHA
-                    current_avg = personal.rmssd_morning_avg or result.rmssd_ms
-                    new_avg     = alpha * result.rmssd_ms + (1.0 - alpha) * current_avg
-                    personal.rmssd_morning_avg      = round(new_avg, 1)
-                    morning_row.vs_personal_avg_pct = round(
-                        (result.rmssd_ms - current_avg) / current_avg * 100.0, 1
-                    )
-                    logger.info(
-                        "Morning EWM update user=%s rmssd=%.1f new_avg=%.1f",
-                        self._uid, result.rmssd_ms, new_avg,
-                    )
-                elif personal.rmssd_morning_avg:
-                    morning_row.vs_personal_avg_pct = round(
-                        (result.rmssd_ms - personal.rmssd_morning_avg)
-                        / personal.rmssd_morning_avg * 100.0, 1
-                    )
-                # Gap 6 fix: classify day immediately at morning read arrival
-                morning_row.day_type = _classify_morning_day_type(morning_row.vs_personal_avg_pct)
-                await self._db.flush()
-
-                # Trigger plan generation immediately on morning read so users
-                # see a fresh DailyPlan the moment they open the app.
-                try:
-                    from api.services.model_service import ModelService
-                    from api.services.plan_service import PlanService
-                    model_svc = ModelService(self._db)
-                    plan_svc  = PlanService(self._db, model_svc)
-                    await plan_svc.get_or_create_today_plan(str(self._uid), force_regen=True)
-                    logger.debug("Morning-read plan generated for user %s", self._uid)
-                except Exception as _plan_exc:
-                    logger.warning("Morning-read plan trigger failed user=%s: %s", self._uid, _plan_exc)
+        # Recompute stress + recovery windows spanning the full open band session
+        band_session = await self._get_open_band_session()
+        if band_session is not None:
+            session_end = min(datetime.now(UTC), window_end + timedelta(minutes=5))
+            await self._recompute_day_windows(band_session.started_at, session_end)
+        else:
+            day_start = window_start.replace(hour=0, minute=0, second=0, microsecond=0)
+            day_end   = day_start + timedelta(days=1)
+            await self._recompute_day_windows(day_start, day_end)
 
         await self._db.commit()
 
@@ -624,26 +531,371 @@ class TrackingService:
         logger.debug("Ingested background window %s–%s valid=%s", window_start, window_end, result.is_valid)
         return result
 
+    # ── Band session helpers ───────────────────────────────────────────────────
+
+    async def _get_open_band_session(self) -> Optional[db.BandWearSession]:
+        """Return the current open BandWearSession for this user, or None."""
+        result = await self._db.execute(
+            select(db.BandWearSession)
+            .where(db.BandWearSession.user_id == self._uid)
+            .where(db.BandWearSession.is_closed == False)  # noqa: E712
+            .order_by(db.BandWearSession.started_at.desc())
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
+
+    async def _get_last_background_window_before(
+        self, before_ts: datetime
+    ) -> Optional[db.BackgroundWindow]:
+        """Return the most recent background window strictly before before_ts."""
+        result = await self._db.execute(
+            select(db.BackgroundWindow)
+            .where(db.BackgroundWindow.user_id == self._uid)
+            .where(db.BackgroundWindow.window_start < before_ts)
+            .order_by(db.BackgroundWindow.window_start.desc())
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
+
+    async def _manage_band_session(
+        self,
+        window_start: datetime,
+        window_end: datetime,
+        context: str,
+    ) -> None:
+        """
+        Core band-session state machine. Called before persisting each window.
+
+        State transitions:
+          - No open session → open one with started_at = window_start.
+          - Open session, gap since last window ≤ 90 min → continue session;
+            update has_sleep_data if context is sleep;
+            check for first sleep→background transition to lock opening_balance.
+          - Open session, gap > 90 min → close the session with final scores,
+            then open a new one. No carry-forward on band-off close.
+        """
+        from sqlalchemy import desc as sqldesc
+        GAP_MINUTES = CONFIG.tracking.BAND_GAP_CLOSE_MINUTES
+
+        open_session = await self._get_open_band_session()
+        prev_window  = await self._get_last_background_window_before(window_start)
+
+        # Determine gap since last window (in minutes)
+        gap_minutes: Optional[float] = None
+        if prev_window is not None:
+            gap_minutes = (window_start - prev_window.window_end).total_seconds() / 60.0
+
+        if open_session is None or (gap_minutes is not None and gap_minutes > GAP_MINUTES):
+            # ── Close the current session (if any) then open a new one ─────
+            if open_session is not None:
+                await self._close_band_session(open_session, carry_forward=False)
+
+            # Open fresh session — no opening balance, fresh slate
+            new_session = db.BandWearSession(
+                user_id                = self._uid,
+                started_at             = window_start,
+                ended_at               = None,
+                is_closed              = False,
+                has_sleep_data         = (context == "sleep"),
+                opening_balance        = 0.0,
+                opening_balance_locked = False,
+            )
+            self._db.add(new_session)
+            await self._db.flush()
+            logger.info(
+                "BandWearSession opened user=%s started_at=%s (gap=%.1f min after close)",
+                self._uid, window_start, gap_minutes or 0.0,
+            )
+            return
+
+        # ── Continuing an open session ────────────────────────────────────────
+        # Update has_sleep_data if this is a sleep window
+        if context == "sleep" and not open_session.has_sleep_data:
+            open_session.has_sleep_data = True
+
+        # Update ended_at to the latest window end (for gap detection correctness)
+        open_session.ended_at = window_end
+
+        # Check for sleep→background transition (carry-forward trigger)
+        if (
+            context == "background"
+            and not open_session.opening_balance_locked
+            and prev_window is not None
+            and prev_window.context == "sleep"
+        ):
+            # First wakeup within this session — compute opening balance from
+            # everything before this window (the sleep + prior evening period).
+            opening_bal = await self._compute_opening_balance(
+                session_start = open_session.started_at,
+                wake_ts       = window_start,
+            )
+            open_session.opening_balance        = opening_bal
+            open_session.opening_balance_locked = True
+            logger.info(
+                "BandWearSession carry-forward locked user=%s opening_balance=%.2f wake_ts=%s",
+                self._uid, opening_bal, window_start,
+            )
+
+        await self._db.flush()
+
+    async def _compute_opening_balance(
+        self,
+        session_start: datetime,
+        wake_ts: datetime,
+    ) -> float:
+        """
+        Compute the net balance for the period [session_start, wake_ts).
+        This captures the prior evening stress + any overnight sleep recovery
+        that occurred before the user's first detected wakeup.
+
+        Returns a float representing net_balance (positive = net recovery,
+        negative = net stress debt carried into the waking period).
+        """
+        personal = await _bootstrap_personal_model(self._db, self._uid)
+
+        pre_wake_windows = await _load_today_background(
+            self._db, self._uid, session_start, wake_ts
+        )
+        if not pre_wake_windows:
+            return 0.0
+
+        morning_rmssd    = personal.rmssd_morning_avg or (
+            ((personal.rmssd_floor or 22.0) + (personal.rmssd_ceiling or 65.0)) / 2.0
+        )
+        capacity_floor   = personal.rmssd_floor   or 22.0
+        capacity_ceiling = personal.rmssd_ceiling or 65.0
+        capacity_version = personal.capacity_version or 0
+
+        stress_db   = await _load_existing_stress_windows(self._db, self._uid, session_start, wake_ts)
+        recovery_db = await _load_existing_recovery_windows(self._db, self._uid, session_start, wake_ts)
+        stress_results   = TrackingService._db_stress_to_results_static(stress_db)
+        recovery_results = TrackingService._db_recovery_to_results_static(recovery_db)
+
+        # Build minimal boundary for pre-wake period
+        boundary = WakeSleepBoundary(
+            user_id                = self._uid,
+            day_date               = session_start,
+            wake_ts                = session_start,
+            sleep_ts               = wake_ts,
+            wake_detection_method  = "band_on_anchor",
+            sleep_detection_method = "sleep_transition",
+            waking_minutes         = (wake_ts - session_start).total_seconds() / 60.0,
+        )
+
+        calibration_days   = await self._count_days_with_data()
+        calibration_locked = personal.calibration_locked_at is not None
+
+        summary = compute_daily_summary(
+            user_id              = self._uid,
+            summary_date         = session_start,
+            background_windows   = pre_wake_windows,
+            stress_windows       = stress_results,
+            recovery_windows     = recovery_results,
+            boundary             = boundary,
+            personal_morning_avg = morning_rmssd,
+            personal_floor       = capacity_floor,
+            personal_ceiling     = capacity_ceiling,
+            capacity_version     = capacity_version,
+            calibration_days     = calibration_days,
+            calibration_locked   = calibration_locked,
+            day_type             = None,
+            capacity_floor_used  = capacity_floor,
+            opening_balance      = 0.0,
+            rmssd_sleep_avg      = personal.rmssd_sleep_avg,
+            sleep_ceiling        = personal.rmssd_sleep_ceiling,
+        )
+        return summary.net_balance or 0.0
+
+    async def _close_band_session(
+        self,
+        session: db.BandWearSession,
+        carry_forward: bool,
+    ) -> None:
+        """
+        Finalise a BandWearSession by computing the live summary at close time
+        and writing the final scores. Sets is_closed=True.
+
+        carry_forward=False means net_balance is recorded but NOT forwarded
+        (band-off close). carry_forward=True would be used for context-triggered
+        resets (not currently used — kept for future extensibility).
+        """
+        # Compute live scores at the moment of close
+        live = await self._compute_session_summary(
+            session_start = session.started_at,
+            session_end   = session.ended_at or datetime.now(UTC),
+            opening_balance = session.opening_balance,
+        )
+
+        if live is not None:
+            session.stress_pct   = live.stress_pct_raw
+            session.recovery_pct = live.recovery_pct_raw
+            session.net_balance  = live.net_balance
+
+        session.is_closed = True
+        await self._db.flush()
+
+        logger.info(
+            "BandWearSession closed user=%s started=%s ended=%s stress=%.1f%% recovery=%.1f%% net=%.2f carry_fwd=%s",
+            self._uid,
+            session.started_at,
+            session.ended_at,
+            session.stress_pct or 0.0,
+            session.recovery_pct or 0.0,
+            session.net_balance or 0.0,
+            carry_forward,
+        )
+
+    async def _compute_session_summary(
+        self,
+        session_start: datetime,
+        session_end: datetime,
+        opening_balance: float,
+    ) -> Optional[DailySummaryResult]:
+        """Compute a DailySummaryResult over a band session's full window range."""
+        personal = await _bootstrap_personal_model(self._db, self._uid)
+
+        bg_windows = await _load_today_background(self._db, self._uid, session_start, session_end)
+        if not bg_windows:
+            return None
+
+        morning_rmssd    = personal.rmssd_morning_avg or (
+            ((personal.rmssd_floor or 22.0) + (personal.rmssd_ceiling or 65.0)) / 2.0
+        )
+        capacity_floor   = personal.rmssd_floor   or 22.0
+        capacity_ceiling = personal.rmssd_ceiling or 65.0
+        capacity_version = personal.capacity_version or 0
+
+        stress_db   = await _load_existing_stress_windows(self._db, self._uid, session_start, session_end)
+        recovery_db = await _load_existing_recovery_windows(self._db, self._uid, session_start, session_end)
+        stress_results   = TrackingService._db_stress_to_results_static(stress_db)
+        recovery_results = TrackingService._db_recovery_to_results_static(recovery_db)
+
+        # Build context transitions for boundary detection
+        context_transitions: list[ContextTransition] = []
+        prev_ctx: Optional[str] = None
+        for w in bg_windows:
+            if prev_ctx is not None and w.context != prev_ctx:
+                context_transitions.append(ContextTransition(
+                    ts=w.window_start, from_context=prev_ctx, to_context=w.context,
+                ))
+            prev_ctx = w.context
+
+        boundary = detect_wake_sleep_boundary(
+            day_date                  = session_start,
+            user_id                   = self._uid,
+            context_transitions       = context_transitions or None,
+            typical_wake_time         = personal.typical_wake_time,
+            typical_sleep_time        = personal.typical_sleep_time,
+            morning_read_ts           = None,
+            last_background_window_ts = bg_windows[-1].window_end,
+        )
+        # Always anchor wake to band-on time within the session
+        boundary = WakeSleepBoundary(
+            user_id               = self._uid,
+            day_date              = session_start,
+            wake_ts               = bg_windows[0].window_start,
+            sleep_ts              = boundary.sleep_ts,
+            wake_detection_method = "band_on_anchor",
+            sleep_detection_method= boundary.sleep_detection_method,
+            waking_minutes        = (session_end - bg_windows[0].window_start).total_seconds() / 60.0,
+        )
+
+        calibration_days   = await self._count_days_with_data()
+        calibration_locked = personal.calibration_locked_at is not None
+
+        return compute_daily_summary(
+            user_id              = self._uid,
+            summary_date         = session_start,
+            background_windows   = bg_windows,
+            stress_windows       = stress_results,
+            recovery_windows     = recovery_results,
+            boundary             = boundary,
+            personal_morning_avg = morning_rmssd,
+            personal_floor       = capacity_floor,
+            personal_ceiling     = capacity_ceiling,
+            capacity_version     = capacity_version,
+            calibration_days     = calibration_days,
+            calibration_locked   = calibration_locked,
+            day_type             = None,
+            capacity_floor_used  = capacity_floor,
+            opening_balance      = opening_balance,
+            rmssd_sleep_avg      = personal.rmssd_sleep_avg,
+            sleep_ceiling        = personal.rmssd_sleep_ceiling,
+        )
+
+    @staticmethod
+    def _db_stress_to_results_static(rows) -> list[StressWindowResult]:
+        out = []
+        for row in rows:
+            out.append(StressWindowResult(
+                user_id          = str(row.user_id),
+                started_at       = row.started_at,
+                ended_at         = row.ended_at,
+                duration_minutes = row.duration_minutes,
+                rmssd_min_ms     = row.rmssd_min_ms,
+                suppression_pct  = row.suppression_pct,
+                stress_contribution_pct = row.stress_contribution_pct,
+                suppression_area        = row.suppression_area,
+                tag          = row.tag,
+                tag_candidate = row.tag_candidate,
+                tag_source   = row.tag_source,
+                nudge_sent   = row.nudge_sent,
+                nudge_responded = row.nudge_responded,
+            ))
+        return out
+
+    @staticmethod
+    def _db_recovery_to_results_static(rows) -> list[RecoveryWindowResult]:
+        out = []
+        for row in rows:
+            out.append(RecoveryWindowResult(
+                user_id          = str(row.user_id),
+                started_at       = row.started_at,
+                ended_at         = row.ended_at,
+                duration_minutes = row.duration_minutes,
+                context          = row.context,
+                rmssd_avg_ms     = row.rmssd_avg_ms,
+                recovery_contribution_pct = row.recovery_contribution_pct,
+                recovery_area    = row.recovery_area,
+                tag              = row.tag,
+                tag_source       = row.tag_source,
+                zenflow_session_id = row.zenflow_session_id,
+            ))
+        return out
+
     async def _materialise_daily_score(self) -> None:
         """Upsert a DailyStressSummary row for today using the live computation.
 
-        Called after every ingest.  Rows already closed (is_partial_data=False)
-        are left untouched so close_day() remains authoritative.
+        Called after every ingest.  Uses the open BandWearSession as the scope
+        so the row is always aligned to the current wear period, not UTC midnight.
+        Rows already closed (is_partial_data=False) are left untouched.
         """
-        today = datetime.now(UTC).date()
+        band_session = await self._get_open_band_session()
 
-        # If today's row is already finalised, nothing to do.
-        existing = await self._load_day_summary(today)
+        if band_session is not None:
+            # Scope to the band session's start date (NOT UTC today, which resets at 5:30 AM IST)
+            session_date = band_session.started_at.date()
+            day_start    = datetime(session_date.year, session_date.month, session_date.day, tzinfo=UTC)
+        else:
+            today     = datetime.now(UTC).date()
+            day_start = datetime(today.year, today.month, today.day, tzinfo=UTC)
+
+        # If the row for this start date is already finalised, nothing to do.
+        existing = await self._load_day_summary(day_start.date())
         if existing is not None and not existing.is_partial_data:
             return
 
-        live = await self.compute_live_summary(today)
+        if band_session is not None:
+            live = await self._compute_session_summary(
+                session_start   = band_session.started_at,
+                session_end     = datetime.now(UTC),
+                opening_balance = band_session.opening_balance,
+            )
+        else:
+            live = await self.compute_live_summary(day_start.date())
+
         if live is None:
             return  # no data yet
-
-        day_start = datetime(
-            today.year, today.month, today.day, tzinfo=UTC
-        )
 
         if existing is None:
             row = db.DailyStressSummary(
@@ -666,10 +918,6 @@ class TrackingService:
         row.is_partial_data           = True  # live rows are always partial
         row.waking_recovery_score     = live.waking_recovery_score
         row.net_balance               = live.net_balance
-        row.opening_balance           = live.opening_balance
-        row.opening_recovery          = live.opening_recovery
-        row.opening_stress            = live.opening_stress
-        row.closing_balance           = live.closing_balance
         row.ns_capacity_used          = live.ns_capacity_used
         row.stress_pct_raw            = live.stress_pct_raw
         row.recovery_pct_raw          = live.recovery_pct_raw
@@ -677,26 +925,7 @@ class TrackingService:
 
         await self._db.commit()
         logger.debug("Materialised daily score user=%s date=%s net=%.1f",
-                     self._uid, today, live.net_balance or 0.0)
-
-    async def get_today_morning_brief(self) -> "Optional[tuple[str, str]]":
-        """
-        Return (day_type, brief_message) for today's morning read, or None.
-        Called by the ingest router to populate IngestResponse for context="morning".
-        """
-        day_start = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
-        day_end   = day_start + timedelta(days=1)
-        result    = await self._db.execute(
-            select(db.MorningRead)
-            .where(db.MorningRead.user_id == self._uid)
-            .where(db.MorningRead.read_date >= day_start)
-            .where(db.MorningRead.read_date < day_end)
-            .limit(1)
-        )
-        row = result.scalar_one_or_none()
-        if row is None or row.day_type is None:
-            return None
-        return row.day_type, _morning_brief_text(row.day_type, row.vs_personal_avg_pct)
+                     self._uid, day_start.date(), live.net_balance or 0.0)
 
     # ── Recompute intraday ──────────────────────────────────────────────────────
 
@@ -711,9 +940,13 @@ class TrackingService:
         """
         personal = await _bootstrap_personal_model(self._db, self._uid)
 
-        morning_rmssd  = personal.rmssd_morning_avg
-        capacity_floor = personal.stress_capacity_floor_rmssd or personal.rmssd_floor
-        if capacity_floor is None or morning_rmssd is None:
+        # Use calibration midpoint as baseline reference when morning_avg is unavailable.
+        # (morning reads no longer exist; rmssd_morning_avg retained from prior calibration)
+        morning_rmssd = personal.rmssd_morning_avg or (
+            ((personal.rmssd_floor or 22.0) + (personal.rmssd_ceiling or 65.0)) / 2.0
+        )
+        capacity_floor = personal.rmssd_floor
+        if capacity_floor is None:
             return
 
         bg_windows = await _load_today_background(self._db, self._uid, day_start, day_end)
@@ -771,192 +1004,42 @@ class TrackingService:
         for rw in raw_recovery:
             self._db.add(_to_db_recovery(rw))
 
-    # ── Day close ──────────────────────────────────────────────────────────────
+    # ── Calibration + plan assessment (replaces close_day) ────────────────────
 
-    async def close_day(self, target_date: date) -> DailySummaryResult:
+    async def run_calibration_for_date(self, target_date: date) -> None:
         """
-        Finalize the DailyStressSummary for `target_date`. Called once per day
-        after the wake/sleep boundary is confirmed (or midnight fallback).
-
-        1. Detect wake/sleep boundary from today's BackgroundWindows.
-        2. Update PersonalModel.typical_wake/sleep timestamps.
-        3. Run full daily_summarizer.
-        4. Upsert DailyStressSummary row.
-        5. Return result to caller.
+        Run the calibration batch for target_date and apply the calibration lock
+        when the threshold is reached.  Called from the nightly rebuild job
+        instead of the old close_day().
         """
-        day_start = datetime(
-            target_date.year, target_date.month, target_date.day,
-            tzinfo=UTC
-        )
-        day_end = day_start + timedelta(days=1)
-
         personal = await _bootstrap_personal_model(self._db, self._uid)
-
-        morning_rmssd    = personal.rmssd_morning_avg
-        capacity_floor   = personal.stress_capacity_floor_rmssd or personal.rmssd_floor
-        capacity_ceiling = personal.rmssd_ceiling
-        capacity_version = personal.capacity_version or 0
-
-        bg_windows = await _load_today_background(self._db, self._uid, day_start, day_end)
-        if not bg_windows:
-            logger.warning("close_day: no background windows for %s user=%s", target_date, self._uid)
-
-        # Build context transitions from consecutive BackgroundWindow context changes.
-        # These feed detect_wake_sleep_boundary() priority-1 chain (sleep_transition method).
-        context_transitions: list[ContextTransition] = []
-        prev_ctx: Optional[str] = None
-        for w in bg_windows:
-            if prev_ctx is not None and w.context != prev_ctx:
-                context_transitions.append(ContextTransition(
-                    ts           = w.window_start,
-                    from_context = prev_ctx,
-                    to_context   = w.context,
-                ))
-            prev_ctx = w.context
-
-        # Fetch today's morning read timestamp (wake anchor — fallback priority 3).
-        mr_result = await self._db.execute(
-            select(db.MorningRead.captured_at)
-            .where(db.MorningRead.user_id == self._uid)
-            .where(db.MorningRead.read_date >= day_start)
-            .where(db.MorningRead.read_date < day_end)
-            .order_by(db.MorningRead.captured_at)
-            .limit(1)
-        )
-        morning_read_ts: Optional[datetime] = mr_result.scalar_one_or_none()
-
-        # Wake/sleep boundary — derive from context transitions, morning read, and PersonalModel typical times
-        last_bg_ts = bg_windows[-1].window_end if bg_windows else None
-        boundary = detect_wake_sleep_boundary(
-            day_date                  = day_start,
-            user_id                   = self._uid,
-            context_transitions       = context_transitions or None,
-            typical_wake_time         = personal.typical_wake_time,
-            typical_sleep_time        = personal.typical_sleep_time,
-            morning_read_ts           = morning_read_ts,
-            last_background_window_ts = last_bg_ts,
-        )
-
-        # Update PersonalModel typical times if boundary from sleep_transition
-        typical_wake  = personal.typical_wake_time
-        typical_sleep = personal.typical_sleep_time
-        if boundary.wake_detection_method == "sleep_transition" and boundary.wake_ts:
-            typical_wake = boundary.wake_ts.strftime("%H:%M")
-        if boundary.sleep_detection_method == "sleep_transition" and boundary.sleep_ts:
-            typical_sleep = boundary.sleep_ts.strftime("%H:%M")
-        if typical_wake != personal.typical_wake_time or typical_sleep != personal.typical_sleep_time:
-            personal.typical_wake_time  = typical_wake
-            personal.typical_sleep_time = typical_sleep
-            await self._db.flush()
-
-        # Reload stress/recovery windows (final pass)
-        stress_db  = await _load_existing_stress_windows(self._db, self._uid, day_start, day_end)
-        recovery_db = await _load_existing_recovery_windows(self._db, self._uid, day_start, day_end)
-
-        stress_results   = self._db_stress_to_results(stress_db)
-        recovery_results = self._db_recovery_to_results(recovery_db)
-
-        # Count calibration days
         calibration_days = await self._count_days_with_data()
 
-        # ── Calibration batch (Days 1–3): run before lock check so the batch
-        # can update personal_model before the lock timestamp is written.
         if personal.calibration_locked_at is None:
             await _run_calibration_batch(self._db, self._uid, calibration_days, personal)
-            # Reload model fields updated by the batch before passing to summarizer
             await self._db.refresh(personal)
 
-        # ── Phase 10: continuous balance thread ───────────────────────────────
-        # Fetch previous day's closing_balance for carry-forward.
-        prev_date    = target_date - timedelta(days=1)
-        prev_summary = await self._load_day_summary(prev_date)
-        opening_balance = float(prev_summary.closing_balance or 0.0) if prev_summary else 0.0
-
-        # Determine + persist calibration lock
         calibration_locked = calibration_days >= CONFIG.model.BASELINE_STABLE_DAYS
         if calibration_locked and personal.calibration_locked_at is None:
-            from datetime import timezone
-            personal.calibration_locked_at = datetime.now(timezone.utc)
+            personal.calibration_locked_at = datetime.now(UTC)
             await self._db.flush()
-            logger.info("Calibration locked for user %s after %d days", self._uid, calibration_days)
-        # ─────────────────────────────────────────────────────────────────────
-
-        result = compute_daily_summary(
-            user_id              = self._uid,
-            summary_date         = day_start,
-            background_windows   = bg_windows,
-            stress_windows       = stress_results,
-            recovery_windows     = recovery_results,
-            boundary             = boundary,
-            personal_morning_avg = morning_rmssd or 0.0,
-            personal_floor       = capacity_floor or 0.0,
-            personal_ceiling     = capacity_ceiling or (morning_rmssd or 0.0),
-            capacity_version     = capacity_version,
-            calibration_days     = calibration_days,
-            capacity_floor_used  = capacity_floor,
-            opening_balance      = opening_balance,
-            rmssd_sleep_avg      = personal.rmssd_sleep_avg,
-            sleep_ceiling        = personal.rmssd_sleep_ceiling,
-        )
-        existing_summary = await self._load_day_summary(target_date)
-        if existing_summary is None:
-            row = db.DailyStressSummary(
-                user_id      = self._uid,
-                summary_date = day_start,
+            logger.info(
+                "Calibration locked for user %s after %d days",
+                self._uid, calibration_days,
             )
-            self._db.add(row)
-        else:
-            row = existing_summary
-
-        # Top window FKs
-        top_stress_id   = None
-        if stress_db:
-            top = max(stress_db, key=lambda s: s.suppression_area or 0.0)
-            top_stress_id = top.id
-
-        top_recovery_id = None
-        if recovery_db:
-            top = max(recovery_db, key=lambda r: r.recovery_area or 0.0)
-            top_recovery_id = top.id
-
-        row.wake_ts                    = boundary.wake_ts
-        row.sleep_ts                   = boundary.sleep_ts
-        row.wake_detection_method      = boundary.wake_detection_method
-        row.sleep_detection_method     = boundary.sleep_detection_method
-        row.waking_minutes             = boundary.waking_minutes
-        row.stress_load_score          = result.stress_load_score
-        # recovery_score and readiness_score columns kept NULL (deprecated)
-        row.day_type                   = result.day_type
-        row.raw_suppression_area       = result.raw_suppression_area
-        row.raw_recovery_area_sleep    = result.raw_recovery_area_sleep
-        row.raw_recovery_area_zenflow  = result.raw_recovery_area_zenflow
-        row.raw_recovery_area_daytime  = result.raw_recovery_area_daytime
-        row.raw_recovery_area_waking   = result.raw_recovery_area_waking
-        row.max_possible_suppression   = result.max_possible_suppression
-        row.capacity_floor_used        = capacity_floor
-        row.capacity_version           = capacity_version
-        row.calibration_days           = calibration_days
-        row.is_estimated               = result.is_estimated
-        row.is_partial_data            = result.is_partial_data
-        row.top_stress_window_id       = top_stress_id
-        row.top_recovery_window_id     = top_recovery_id
-        row.waking_recovery_score      = result.waking_recovery_score
-        row.net_balance                = result.net_balance
-        # Phase 10: continuous balance + raw percentage fields
-        row.opening_balance            = opening_balance
-        row.opening_recovery           = result.opening_recovery
-        row.opening_stress             = result.opening_stress
-        row.closing_balance            = result.closing_balance
-        row.ns_capacity_used           = result.ns_capacity_used
-        row.stress_pct_raw             = result.stress_pct_raw
-        row.recovery_pct_raw           = result.recovery_pct_raw
-        row.ns_capacity_recovery       = result.ns_capacity_recovery_used
 
         await self._db.commit()
-        logger.info("Closed day %s for user %s: net_balance=%.1f day_type=%s",
-                    target_date, self._uid, result.net_balance or 0.0, result.day_type)
+        logger.debug(
+            "run_calibration_for_date user=%s date=%s days=%d locked=%s",
+            self._uid, target_date, calibration_days, calibration_locked,
+        )
 
-        # Wire evening assessor 
+    async def assess_plan_adherence(self, target_date: date) -> None:
+        """
+        Run the evening plan adherence assessment for target_date.
+        Writes per-item adherence_score to DailyPlan.items_json.
+        Called from the nightly rebuild job.
+        """
         try:
             from api.services.plan_service import PlanService
             from coach.assessor import assess_daily_adherence
@@ -969,9 +1052,7 @@ class TrackingService:
                 flag_modified(plan_row, "items_json")
                 await self._db.commit()
         except Exception as e:
-            logger.warning("Failed evening plan assessment: %s", e)
-
-        return result
+            logger.warning("Failed plan assessment user=%s date=%s: %s", self._uid, target_date, e)
 
     # ── Tag update ─────────────────────────────────────────────────────────────
 
@@ -1024,89 +1105,50 @@ class TrackingService:
         Compute the three scores on-the-fly from existing intraday windows
         WITHOUT writing anything to the database.
 
-        Day boundary is the MORNING READ, not calendar midnight.  When no
-        morning read has arrived for target_date yet (overnight / early
-        morning window), the query spans from yesterday's morning read
-        timestamp through now so that scores keep accumulating across
-        midnight with no visible reset.  opening_balance is only applied
-        once today's morning read has landed (matching close_day() logic).
+        When an open BandWearSession exists, the query window spans from
+        session.started_at to now — regardless of UTC day boundaries.  This
+        prevents the 5:30 AM IST reset caused by the UTC midnight flip.
 
-        Returns None if there are no background windows yet (band not worn).
+        When no open session exists (band not worn), falls back to the UTC
+        calendar day for target_date (historical/closed-day view).
+
         Always marks is_partial_data=True since the day is not finalized.
         """
-        now       = datetime.now(UTC)
+        now = datetime.now(UTC)
+
+        # Prefer band-session scope over UTC calendar day
+        band_session = await self._get_open_band_session()
+        if band_session is not None:
+            return await self._compute_session_summary(
+                session_start   = band_session.started_at,
+                session_end     = now,
+                opening_balance = band_session.opening_balance,
+            )
+
+        # Fallback: UTC calendar day (used for historical/closed-day queries)
         cal_start = datetime(target_date.year, target_date.month, target_date.day, tzinfo=UTC)
         cal_end   = cal_start + timedelta(days=1)
+        day_start = cal_start
+        day_end   = min(cal_end, now)
 
-        # ── Determine whether today's morning read has arrived ────────────────
-        mr_today_result = await self._db.execute(
-            select(db.MorningRead.captured_at)
-            .where(db.MorningRead.user_id == self._uid)
-            .where(db.MorningRead.read_date >= cal_start)
-            .where(db.MorningRead.read_date < cal_end)
-            .order_by(db.MorningRead.captured_at)
-            .limit(1)
-        )
-        today_morning_read_ts: Optional[datetime] = mr_today_result.scalar_one_or_none()
-
-        # Load personal model early — needed for Phase 0b synthetic wake check.
-        personal         = await _bootstrap_personal_model(self._db, self._uid)
-
-        if today_morning_read_ts:
-            # Normal day in progress: query calendar day as usual.
-            day_start      = cal_start
-            day_end        = cal_end
-            opening_balance_fn = True   # carry prev closing_balance → opening_balance
-        else:
-            # Overnight / pre-morning-read window: span from yesterday's morning
-            # read through now so scores don't reset at calendar midnight.
-            prev_date  = target_date - timedelta(days=1)
-            prev_start = datetime(prev_date.year, prev_date.month, prev_date.day, tzinfo=UTC)
-            prev_end   = prev_start + timedelta(days=1)
-            mr_prev_result = await self._db.execute(
-                select(db.MorningRead.captured_at)
-                .where(db.MorningRead.user_id == self._uid)
-                .where(db.MorningRead.read_date >= prev_start)
-                .where(db.MorningRead.read_date < prev_end)
-                .order_by(db.MorningRead.captured_at)
-                .limit(1)
-            )
-            prev_morning_read_ts: Optional[datetime] = mr_prev_result.scalar_one_or_none()
-
-            # Query from yesterday's morning read (or yesterday calendar start as
-            # fallback) through the current moment.
-            day_start      = prev_morning_read_ts if prev_morning_read_ts else prev_start
-            day_end        = now
-            # No opening_balance until morning read arrives — all windows are
-            # already included in the span so double-counting must be avoided.
-            opening_balance_fn = False
-
-            # Phase 0b: if band worn past typical wake + 2 h but no morning read,
-            # treat as a fresh day to prevent 25h+ score inflation.
-            if personal.typical_wake_time:
-                _h, _m = (int(x) for x in personal.typical_wake_time.split(":"))
-                _synthetic_wake = cal_start.replace(hour=_h, minute=_m, second=0, microsecond=0)
-                if now > _synthetic_wake + timedelta(hours=2):
-                    day_start          = cal_start
-                    day_end            = now
-                    opening_balance_fn = True
+        personal = await _bootstrap_personal_model(self._db, self._uid)
 
         bg_windows = await _load_today_background(self._db, self._uid, day_start, day_end)
         if not bg_windows:
             return None
 
-        morning_rmssd    = personal.rmssd_morning_avg
-        capacity_floor   = personal.stress_capacity_floor_rmssd or personal.rmssd_floor
+        morning_rmssd    = personal.rmssd_morning_avg or (
+            ((personal.rmssd_floor or 22.0) + (personal.rmssd_ceiling or 65.0)) / 2.0
+        )
+        capacity_floor   = personal.rmssd_floor
         capacity_ceiling = personal.rmssd_ceiling
         capacity_version = personal.capacity_version or 0
 
-        # Use already-detected intraday windows across the same span.
         stress_db        = await _load_existing_stress_windows(self._db, self._uid, day_start, day_end)
         recovery_db      = await _load_existing_recovery_windows(self._db, self._uid, day_start, day_end)
         stress_results   = self._db_stress_to_results(stress_db)
         recovery_results = self._db_recovery_to_results(recovery_db)
 
-        # Build context transitions (same as close_day()) for accurate boundary.
         context_transitions: list[ContextTransition] = []
         prev_ctx: Optional[str] = None
         for w in bg_windows:
@@ -1125,48 +1167,23 @@ class TrackingService:
             context_transitions       = context_transitions or None,
             typical_wake_time         = personal.typical_wake_time,
             typical_sleep_time        = personal.typical_sleep_time,
-            morning_read_ts           = today_morning_read_ts,
+            morning_read_ts           = None,
             last_background_window_ts = last_bg_ts,
         )
-
-        # Overnight branch: day_start is yesterday's morning read (~03:30 UTC).
-        # The wake_ts fallback (01:30 UTC today) is AFTER day_start, so the
-        # suppression/recovery area functions would skip all overnight windows.
-        # Override wake_ts to day_start so the entire span is counted.
-        if not opening_balance_fn:
-            boundary.wake_ts        = day_start
-            boundary.waking_minutes = (
-                ((boundary.sleep_ts or now) - day_start).total_seconds() / 60.0
+        if bg_windows:
+            band_on_ts = bg_windows[0].window_start
+            elapsed_from_band = (min(cal_end, now) - band_on_ts).total_seconds() / 60.0
+            boundary = WakeSleepBoundary(
+                user_id               = self._uid,
+                day_date              = cal_start,
+                wake_ts               = band_on_ts,
+                sleep_ts              = boundary.sleep_ts,
+                wake_detection_method = "band_on_anchor",
+                sleep_detection_method= boundary.sleep_detection_method,
+                waking_minutes        = elapsed_from_band,
             )
 
         calibration_days = await self._count_days_with_data()
-
-        # opening_balance rules:
-        #   Morning read arrived today  → apply yesterday's closing_balance (new day fully reset)
-        #   Overnight (no MR today yet) → apply yesterday's opening_balance to preserve the
-        #                                  continuous thread (live window already includes all
-        #                                  of yesterday's waking windows, so the carry-forward
-        #                                  INTO yesterday is the correct anchor)
-        prev_date    = target_date - timedelta(days=1)
-        prev_summary = await self._load_day_summary(prev_date)
-        if opening_balance_fn:
-            # Today's morning read has arrived — normal reset.
-            opening_balance = float(prev_summary.closing_balance or 0.0) if prev_summary else 0.0
-        else:
-            # Overnight: preserve continuity by using yesterday's opening_balance.
-            opening_balance = float(prev_summary.opening_balance or 0.0) if prev_summary else 0.0
-
-        # Fetch day_type from today's MorningRead (live display).
-        mr_daytype_result = await self._db.execute(
-            select(db.MorningRead.day_type)
-            .where(db.MorningRead.user_id == self._uid)
-            .where(db.MorningRead.read_date >= cal_start)
-            .where(db.MorningRead.read_date < cal_end)
-            .order_by(db.MorningRead.captured_at.desc())
-            .limit(1)
-        )
-        morning_day_type: Optional[str] = mr_daytype_result.scalar_one_or_none()
-
         calibration_locked = personal.calibration_locked_at is not None
 
         result = compute_daily_summary(
@@ -1182,9 +1199,9 @@ class TrackingService:
             capacity_version     = capacity_version,
             calibration_days     = calibration_days,
             calibration_locked   = calibration_locked,
-            day_type             = morning_day_type,
+            day_type             = None,
             capacity_floor_used  = capacity_floor,
-            opening_balance      = opening_balance,
+            opening_balance      = 0.0,   # historical/closed-day: no carry-forward
             rmssd_sleep_avg      = personal.rmssd_sleep_avg,
             sleep_ceiling        = personal.rmssd_sleep_ceiling,
         )

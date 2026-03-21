@@ -26,7 +26,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from api.config import get_settings
-from api.routers import stream, session, user, coach, outcomes, plan, tracking, tagging, psych, profile
+from api.routers import stream, session, user, coach, outcomes, plan, tracking, tagging, psych, profile, band_sessions
 from api.services.session_service import SessionService
 from api.services.coach_service import CoachService
 from api.services.conversation_service import ConversationService
@@ -111,7 +111,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             run_nightly_rebuild,
             CronTrigger(hour=18, minute=30, timezone="UTC"),  # 00:00 IST midnight fallback
             id="nightly_rebuild",
-            name="Nightly rebuild + close_day (18:30 UTC / 00:00 IST midnight)",
+            name="Nightly calibration + adherence (18:30 UTC / 00:00 IST midnight)",
             replace_existing=True,
         )
         scheduler.start()
@@ -164,6 +164,7 @@ def create_app() -> FastAPI:
     app.include_router(tagging.router)
     app.include_router(psych.router)
     app.include_router(profile.router)
+    app.include_router(band_sessions.router)
 
     # ── Health check ──────────────────────────────────────────────────────────
     @app.get("/health", tags=["meta"])
