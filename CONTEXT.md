@@ -1,8 +1,910 @@
 # ZenFlow Verity — Project Context
 
-**Last updated:** 19 March 2026 — Stuck morning context fix + DB cleanup + score re-materialisation
+**Last updated:** 22 March 2026 — BandWearSession history backend built (5 new columns + /metrics + /plan endpoints); NOT YET deployed to Railway or wired into frontend
 
 ---
+
+## Handoff Note — Session of 22 March 2026 — BandWearSession History Design + Backend Build
+
+---
+
+### BandWearSession History — Designed & Backend Built (NOT YET DEPLOYED)
+
+#### Design decisions (agreed)
+
+- **Zone system:** 5 universal zones — Excellent / Good / Normal / Low / Critical — used identically across every metric. Per-metric thresholds defined in design specification.
+- **All benchmarking is personal-relative** (vs `PersonalModel.rmssd_morning_avg`, `rmssd_floor`, `rmssd_ceiling`) — not population averages. Population data surfaced only as footnotes.
+- **SPO2 and sleep staging are placeholders** — no pipeline exists in the backend. Shown as greyed "Coming soon" tiles; never shown as `—`.
+- **Plan Adherence shows completed items only** (no deviation exists for slug). If zero: "No plan activities were completed." If no plan existed: "No plan was scheduled."
+- **All compute happens in the backend** — frontend is read-only. Metrics written at session close time into `band_wear_sessions` columns.
+- **No new table created** — 5 columns added to existing `band_wear_sessions` table.
+
+#### Screen 1 — Band Session History List
+- Grouped by calendar date (date of `started_at`)
+- Row: `START → END`, duration, Net Balance zone pill (coloured), sleep 🌙 flag, micro-stats (RMSSD · Stress · Recovery)
+- Calls existing `GET /band-sessions/history` (response model now also returns `avg_rmssd_ms`, `avg_hr_bpm`)
+
+#### Screen 2 — Band Session Detail (4 expandable sections)
+- **Overview (default expanded):** session timeline bar, Net Balance hero + zone chip, Stress%/Recovery% tiles, RMSSD/HR/SPO2(placeholder) mini-tiles, Session Intelligence coach text
+- **Key Events (collapsed):** compact event dot strip → expanded: stress + recovery event rows with tags
+- **Plan Adherence (collapsed):** adherence bar + % → expanded: completed plan items only with priority badge
+- **Sleep Analysis (collapsed):** RMSSD sparkline + avg + duration → expanded: Sleep RMSSD / Duration tiles + sleep stages placeholder + sleep insight text. Shows `0%` with wear tip when `has_sleep_data = false`.
+
+#### Backend changes built (NOT committed or deployed)
+
+| File | Change |
+|---|---|
+| `alembic/versions/j5k6l7m8n9o0_band_wear_sessions_metrics.py` | New migration: adds 5 columns to `band_wear_sessions` |
+| `api/db/schema.py` | 5 new nullable columns on `BandWearSession` ORM class: `avg_rmssd_ms`, `avg_hr_bpm`, `sleep_rmssd_avg_ms`, `sleep_started_at`, `sleep_ended_at` |
+| `api/services/tracking_service.py` | `_close_band_session`: computes and writes the 5 metrics at session close using full session window (sleep included) |
+| `api/routers/band_sessions.py` | Full rewrite: `BandSessionSummary` now includes `avg_rmssd_ms`/`avg_hr_bpm`; added `GET /{id}/metrics` (events, sparkline, personal baseline) and `GET /{id}/plan` (completed items, adherence) |
+
+**Migration ran locally** (`alembic upgrade head` confirmed: `i4j5k6l7m8n9 → j5k6l7m8n9o0`).  
+**Syntax verified** (`ast.parse` all 4 files → ✓).  
+**Route smoke-test passed** (5 routes registered: `/history`, `/current`, `/{id}/metrics`, `/{id}/plan`, `/{id}`).
+
+#### Next steps to go live
+
+1. **Deploy backend to Railway** — commit all modified files + new migration file, push to `main`, `railway up`, confirm migration log line `j5k6l7m8n9o0`.
+2. **Wire frontend screens** — the UI design exists as `/Users/pratikbarman/Downloads/zenflow_band_sessions_preview.jsx` (React/Tailwind preview). Needs to be translated to React Native using `ZenScreen`, `SectionCard`, `ZEN.colors` tokens and the same expandable-section pattern already used in `StressDetailScreen`.
+3. **Add frontend API calls** — `src/api/endpoints.ts` needs `getBandSessionHistory()`, `getBandSessionMetrics(id)`, `getBandSessionPlan(id)` typed functions.
+4. **Wire navigation** — `HistoryScreen.tsx` currently shows ZenFlow practice sessions (`/session/history`). A new tab or section needs to surface Band Sessions separately, or the screen needs a toggle.
+
+---
+
+### Status tracker (cumulative — as of 22 March 2026)
+
+| Issue | Status |
+|---|---|
+| #1 — UTC midnight score reset | ✅ Fixed + Deployed |
+| #2 — Screen sync (single shared context) | ✅ Fixed + Deployed |
+| #3 — Waveform sleep gap | ✅ Fixed + Deployed |
+| wake_locked_at overnight double-count | ✅ Fixed + Deployed |
+| HomeScreen UI optimisation | ✅ Done |
+| Load Monitor (StressDetailScreen) overhaul | ✅ Done |
+| Recovery screen parity | ✅ Done |
+| Sleep legend colour | ✅ Done |
+| Tagging end-to-end (3 failures) | ✅ Fixed + Deployed |
+| Nightly calibration job (AsyncSessionLocal ImportError) | ✅ Fixed + Deployed |
+| BandWearSession /metrics + /plan endpoints | ✅ Built locally — **NOT YET deployed** |
+| BandWearSession history frontend screens | ❌ Not yet built |
+
+---
+
+### Fix #G — Nightly calibration job `AsyncSessionLocal` ImportError ✅ FIXED & DEPLOYED
+
+**Problem:** The nightly rebuild job (`jobs/nightly_rebuild.py`) has run `from api.db.database import AsyncSessionLocal` every night. `AsyncSessionLocal` was never exported — the session factory was stored as the private `_AsyncSessionLocal` (underscore-prefixed). This caused an `ImportError` at the very start of every nightly run, before a single user was processed. APScheduler catches the exception silently — no alert, no log at the ERROR level via the Railway UI.
+
+**Impact:** The nightly calibration job has **never successfully run**. Personal model baselines (`rmssd_floor`, `rmssd_ceiling`, `rmssd_morning_avg`) have been frozen at manually-set values — the automatic nightly refinement has never executed. Plan/narrative rebuild, streak increment, and auto-tag pass were also all skipped every night.
+
+**Root cause chain:**
+1. `api/db/database.py` lazily initialises the session factory as `_AsyncSessionLocal` (private)
+2. `jobs/nightly_rebuild.py` imports it by the public name `AsyncSessionLocal` → `ImportError`
+3. APScheduler catches exception silently — no visible failure in Railway logs
+4. Each Railway redeploy (of which there were several today) also resets the scheduler, potentially skipping the 18:30 UTC slot entirely for that cycle
+
+**Fix:** Added a public `AsyncSessionLocal = _SessionLocalProxy()` to `api/db/database.py`. The `_SessionLocalProxy` class delegates to `_get_engine()` on call, preserving the existing lazy-init pattern. The job's `async with AsyncSessionLocal() as session:` usage works unchanged.
+
+```python
+class _SessionLocalProxy:
+    def __call__(self):
+        _, factory = _get_engine()
+        return factory()
+
+AsyncSessionLocal = _SessionLocalProxy()
+```
+
+**Verified locally:** `python3 -c "from api.db.database import AsyncSessionLocal; print('import OK:', AsyncSessionLocal)"` → `import OK: <_SessionLocalProxy object>`
+
+**Deployed to Railway** via `railway up`.
+
+**Expected:** Tonight's run at 18:30 UTC / 00:00 IST will be the first successful calibration job execution. `calibration_snapshots` should get a new row with `committed=True` if confidence ≥ 0.65.
+
+---
+
+ — `wake_locked_at` overnight double-count ✅ FIXED & DEPLOYED
+
+**Problem:** `_compute_session_summary` was scoring from `session.started_at` (band put on at 8 PM) all the way to now. Any stress windows from before-sleep were included in the daytime score — inflating stress and deflating recovery.
+
+**Fix:** Added `wake_locked_at` column to `BandWearSession`. Set at the `opening_balance_locked = True` moment (first sleep→background transition). `_compute_session_summary` now scores from `score_start = wake_locked_at if wake_locked_at is not None else session_start`. All window queries (`bg_windows`, `stress_db`, `recovery_db`) use `score_start`.
+
+**Migration:** `alembic/versions/i4j5k6l7m8n9_band_wear_sessions_wake_locked_at.py` — deployed, confirmed: `Running upgrade h3i4j5k6l7m8 -> i4j5k6l7m8n9`.
+
+**Files changed:**
+- `api/db/schema.py` — `wake_locked_at = Column(DateTime(timezone=True), nullable=True)` on `BandWearSession`
+- `api/services/tracking_service.py` — `_manage_band_session` writes `wake_locked_at`; `_compute_session_summary` uses `score_start`; all 3 callers pass `wake_locked_at=session.wake_locked_at`
+
+---
+
+### Fix #B — HomeScreen UI optimisation ✅ DONE
+
+- `BalanceDial`: removed "STRESS"/"RECOVERY" text labels, shrunk viewBox height 190→170, `cy=108`, added arc-end anchor dots (blue/green, opacity 0.7)
+- Polar sensor status dot: 12×12 animated dot in header top-right — green pulse when streaming, amber when connecting/scanning, red otherwise
+- Plan CTA block moved above `CoachSummary` (above the fold)
+- Spacing: `scroll.gap` 16→12, `headerRow.marginBottom` 8→4, `balanceCard` `paddingTop` 12, `balanceHero.paddingVertical` 0
+
+---
+
+### Fix #C — StressDetailScreen (Load Monitor) overhaul ✅ DONE
+
+- Removed `MoreHorizontal` 3-dot icon + `rightIcon` prop from `TopHeader`
+- **X-axis:** Replaced static `DAY_TICKS` (fixed noon/6pm etc.) with `buildXLabels(data, totalWidth)` — picks 5 evenly-spaced real data timestamps, formats as `"8am"` / `"2:30pm"`. `ch.xLabel` width 20→36, centering offset `−10→−18` to prevent clipping.
+- **Y-axis:** Formula was `(avg - rmssd) * 5 / ns_capacity * 100` — returned 0 when `ns_capacity` null. Fixed to `Math.max(0, avg - rmssd)` raw ms drop. Added `"ms"` unit label below y-axis.
+- **Tagging optimistic update:** `eventsOverride` state patched immediately after `tagWindow` resolves. `baseEvents` + `events = eventsOverride ?? baseEvents` pattern. `useFocusEffect` resets `eventsOverride(null)` on focus. `reload()` continues in background for eventual consistency.
+- **Tagged event label:** `StressEventRow` now shows `✓ TagName` in green (`ZEN.colors.recovery`) when tagged, instead of hardcoded "Stress Event". Styles `taggedRow` / `taggedCheck` added to `er` stylesheet.
+- **TagBottomSheet:** Added `customMode` / `customText` local state. "Custom…" option shows inline `TextInput` + Save. `handleClose` resets state. Added `customRow` / `customInput` styles to `tbs` stylesheet. `useState` and `TextInput` added to imports.
+- Fixed `eventLabel` to show `"Stress Event"` literal (not raw `tag_candidate` slug).
+
+---
+
+### Fix #D — RecoveryDetailScreen parity ✅ DONE
+
+All the same changes applied to the recovery screen:
+- Removed `MoreHorizontal` + `rightIcon`
+- `toChartPoints` Y-formula: `Math.max(0, rmssd - avg)` (was `(rmssd - avg) * 5 / ns_capacity * 100`)
+- `eventsOverride` optimistic state — same pattern as stress screen
+- `RecoveryChartCard`: uses `buildXLabels`, `ch2.xLabel` width 36, offset `−18`, `"ms"` unit label
+- `RecoveryEventRow`: tagged events show `✓ TagName` in green. Styles `taggedRow` / `taggedCheck` added to `re` stylesheet.
+- `useFocusEffect` resets `eventsOverride(null)` on focus
+
+---
+
+### Fix #E — Sleep legend colour ✅ DONE
+
+Sleep bars in both `StressChartCard` and `RecoveryChartCard` were `rgba(140,140,160,0.30)` — near-invisible grey on a dark background.
+
+Changed to `rgba(242,209,76,0.40)` — amber, matching `ZEN.colors.readiness` (#F2D14C) at 40% opacity. Applied to both bar `backgroundColor` and legend dot in both chart components.
+
+---
+
+### Fix #F — Tagging end-to-end (3 stacked silent failures) ✅ FIXED & DEPLOYED
+
+All three failures were absorbed by `catch {}` blocks, making them totally silent.
+
+**Failure 1 — Wrong URL** (`src/api/endpoints.ts`):
+- Frontend called `POST /tracking/tag-window` — this endpoint does not exist.
+- Fixed to `POST /tagging/tag`.
+
+**Failure 2 — Wrong field name** (`src/api/endpoints.ts`):
+- Frontend sent `{ tag: slug }` but backend `TagWindowRequest` schema requires `{ slug: str }`.
+- Fixed: `tag: args.tag` → `slug: args.tag`.
+
+**Failure 3 — Stub slug catalog** (`tagging/tagging_service.py`):
+- `validate_tag()` had a hardcoded 4-slug catalog: `running`, `yoga`, `work_sprint`, `walking`. Every real tag option from the UI (e.g. `"Walk / nature"`, `"Commute"`, `"Caffeine"`) returned `Unknown slug: …` → 400 error.
+- Fixed: removed catalog entirely. `validate_tag` now only checks `slug.strip()` is non-empty. Any user-provided string is valid.
+- **Deployed to Railway** via `railway up`.
+
+**Error visibility:** Added `console.error('[Stress] tagWindow failed:', e)` and `console.error('[Recovery] tagWindow failed:', e)` to `handleTag` catch blocks in both screens so future failures surface immediately in Expo console.
+
+---
+
+### Files changed — 21 March 2026 (Part 2)
+
+**Backend (deployed to Railway):**
+
+| File | Change |
+|---|---|
+| `api/db/database.py` | Added public `AsyncSessionLocal = _SessionLocalProxy()` so nightly job import works |
+| `api/db/schema.py` | `wake_locked_at` column on `BandWearSession` |
+| `alembic/versions/i4j5k6l7m8n9_…py` | Migration for `wake_locked_at`, deployed |
+| `api/services/tracking_service.py` | `wake_locked_at` write + `score_start` scoping in `_compute_session_summary` |
+| `tagging/tagging_service.py` | Removed hardcoded 4-slug catalog from `validate_tag()`; accepts any non-empty string |
+
+**Frontend (`Zenflow_front`):**
+
+| File | Change |
+|---|---|
+| `src/api/endpoints.ts` | `tagWindow`: URL `/tracking/tag-window` → `/tagging/tag`; field `tag:` → `slug:` |
+| `src/ui/zenflow-ui-kit.tsx` | `buildXLabels()` replaces `DAY_TICKS` in both chart cards; `xLabel` width 36, offset −18; `"ms"` y-unit label; sleep bars amber `rgba(242,209,76,0.40)`; `StressEventRow` tagged checkmark; `RecoveryEventRow` tagged checkmark; `TagBottomSheet` custom mode; `BalanceDial` no labels, cy=108, anchor dots; `taggedRow`/`taggedCheck` in `er` and `re`; `customRow`/`customInput` in `tbs`; `ch2.yUnit`; `ch2.xLabel` width 36 |
+| `src/screens/HomeScreen.tsx` | Polar dot animated, Plan CTA above fold, spacing tightened |
+| `src/screens/StressDetailScreen.tsx` | 3-dot removed; `toChartPoints` formula fix; `eventsOverride` optimistic pattern; `handleTag` error logging |
+| `src/screens/RecoveryDetailScreen.tsx` | Full parity with StressDetailScreen; `eventsOverride` optimistic pattern; `handleTag` error logging |
+
+---
+
+### Status tracker (cumulative — 21 March 2026)
+
+| Issue | Status |
+|---|---|
+| #1 — UTC midnight score reset | ✅ Fixed + Deployed |
+| #2 — Screen sync (single shared context) | ✅ Fixed + Deployed |
+| #3 — Waveform sleep gap | ✅ Fixed + Deployed |
+| #4 — History tab (Band Sessions) — backend | ✅ Endpoints built (`/band-sessions/history`, `/current`) |
+| #4 — History tab (Band Sessions) — frontend | ❌ Not yet started |
+| wake_locked_at overnight double-count | ✅ Fixed + Deployed |
+| HomeScreen UI optimisation | ✅ Done |
+| Load Monitor (StressDetailScreen) overhaul | ✅ Done |
+| Recovery screen parity | ✅ Done |
+| Sleep legend colour | ✅ Done |
+| Tagging end-to-end (3 failures) | ✅ Fixed + Deployed |
+| Nightly calibration job (`AsyncSessionLocal` ImportError) | ✅ Fixed + Deployed |
+
+---
+
+## Handoff Note — Session of 21 March 2026 (Part 1) — Band Wear Sessions + Screen Sync + Waveform Sleep Fix
+
+---
+
+
+### Issue #1 — UTC midnight score reset ✅ FIXED & DEPLOYED
+
+**Problem:** Scores reset to zero at ~5:30 AM IST (= UTC midnight day boundary). The root cause was threefold:
+
+1. `compute_live_summary()` queried windows using `datetime.now(UTC).date()` — at UTC midnight, this flipped to a new empty day bucket, so stress/recovery went to zero.
+2. `_materialise_daily_score()` wrote to the `DailyStressSummary` row keyed to UTC today — at midnight this created a new empty row and overwrote the overnight accumulation.
+3. `opening_balance` was hardcoded `0.0` for all code paths — no carry-forward from the pre-wake (sleep) period.
+
+**Design:** Two correct session-boundary triggers:
+- **Band off >90 min** → close session, NO carry-forward, fresh start at 0
+- **Sleep→background context transition (first wakeup)** → carry-forward closing `net_balance` as `opening_balance`, lock it (`opening_balance_locked = True`) so interrupted sleep doesn't trigger a second carry-forward
+
+**New table: `band_wear_sessions`**
+
+| Column | Purpose |
+|---|---|
+| `started_at` | When band was put on (session anchor) |
+| `ended_at` | When session closed (>90 min gap) |
+| `is_closed` | True once the session has ended |
+| `opening_balance` | Net balance carried forward from pre-wake sleep period |
+| `opening_balance_locked` | Prevents second carry-forward on interrupted sleep |
+| `stress_pct`, `recovery_pct`, `net_balance` | Final snapshot written on close |
+| `has_sleep_data` | Whether this session included a sleep window |
+
+**Migration:** `alembic/versions/h3i4j5k6l7m8_band_wear_sessions.py` — ran successfully on Railway production DB (`g2h3i4j5k6l7 → h3i4j5k6l7m8`).
+
+**Config:** `BAND_GAP_CLOSE_MINUTES = 90` in `config/tracking.py`.
+
+**Core logic — `api/services/tracking_service.py`:**
+
+- `ingest_background_window`: calls `_manage_band_session` before persisting each window; `_recompute_day_windows` now spans the full band session range instead of UTC today.
+- `_manage_band_session`: state machine — gap >90 min closes existing session, opens new one (opening_balance=0, locked=False); sleep→background transition (first time, not locked) calls `_compute_opening_balance` and locks; subsequent sleep→background transitions no-op.
+- `compute_live_summary`: checks for an open `BandWearSession` first; if found, delegates to `_compute_session_summary(session_start, now, opening_balance)` — scope anchored to band session start, not UTC today.
+- `_materialise_daily_score`: writes to the row for `band_session.started_at.date()` — no longer creates a stale midnight row.
+
+**New endpoints — `api/routers/band_sessions.py`:**
+- `GET /band-sessions/current` — open session or null
+- `GET /band-sessions/history?limit=20` — closed sessions, newest first
+- `GET /band-sessions/{id}` — detail placeholder
+
+**Deployment confirmed:** Railway logs show `BandWearSession opened user=8e8715c6… started_at=2026-03-21 03:58:43 (gap=0.0 min after close)` — new code live on ingest.
+
+---
+
+### Issue #2 — Screen sync: single shared data context ✅ FIXED
+
+**Problem:** Three independent polling timers (HomeScreen 60s, `useStressWindows` 5m, `useRecoveryWindows` 5m) each started their own clock on mount. After a few cycles they drifted up to 90s out of phase — Home updated first, stress/recovery detail screens updated later, so all four screens showed different numbers at the same time. No foreground detection — opening the app after 2 hours would not trigger an immediate refresh.
+
+Additionally, `HomeScreen` called `/tracking/daily-summary/{date}` (persisted/stale-first) while `getToday()` (live-first, no date param) already existed in `endpoints.ts` but was never used by Home.
+
+**Fix — new `src/contexts/DailyDataContext.tsx`:**
+
+- `DailyDataProvider` fetches `getToday()` (live), `getStressWindows(today)`, `getRecoveryWindows(today)`, `getWaveform(today)` together in one `Promise.allSettled`.
+- Single 60s `setInterval` — one clock, all data refreshed simultaneously.
+- `AppState.addEventListener('change', …)`: fires an immediate refresh when app returns to `active` state (foreground detection).
+- Exposes: `summary`, `stressWindows`, `recoveryWindows`, `waveform`, `loading`, `error`, `refresh`.
+
+**Changes to navigation and screens:**
+
+| File | Change |
+|---|---|
+| `src/navigation/AppNavigator.tsx` | `HomeStackNavigator` wrapped with `<DailyDataProvider>` |
+| `src/screens/HomeScreen.tsx` | Removed `useDailySummary` hook and local 60s `setInterval`; reads from `useDailyData()` context |
+| `src/screens/StressDetailScreen.tsx` | For today: reads `stressWindows`, `waveform`, `summary` from context. For historical dates: independent `Promise.all` fetch (unchanged). Tag action calls `ctx.refresh()` vs `loadHistorical()` accordingly. Removed `useStressWindows` hook. |
+| `src/screens/RecoveryDetailScreen.tsx` | Same dual-path pattern for recovery. Removed `useRecoveryWindows` hook. |
+
+**Historical date behaviour preserved:** Detail screens navigated to with a past date bypass the context entirely and perform their own one-shot fetch. No regression.
+
+---
+
+### Issue #3 — Waveform shows no sleep data ✅ FIXED
+
+**Problem:** Both `toChartPoints()` functions (Stress and Recovery detail screens) filtered with `.filter(p => p.is_valid !== false && p.context === 'background')`. Sleep-context waveform points (`context === 'sleep'`) were dropped entirely — producing a blank chart gap for the entire overnight period even though valid data existed.
+
+**Fix — both screens:**
+- Removed `&& p.context === 'background'` from the filter (kept `p.is_valid !== false`).
+- Each returned `ChartPoint` now includes `isSleep: p.context !== 'background'`.
+
+**Fix — `src/ui/zenflow-ui-kit.tsx`:**
+- `ChartPoint` interface: added `isSleep?: boolean`.
+- `StressChartCard` bar render: sleep bars rendered in `rgba(140,140,160,0.30)` (grey, dimmed) instead of the active blue. Legend updated to show "Sleep" swatch.
+- `RecoveryChartCard` bar render: same grey treatment for sleep bars. Legend updated.
+
+This makes the overnight sleep period visible as a distinct muted section of the waveform — present but clearly not an active stress/recovery window.
+
+---
+
+### Files changed — 21 March 2026
+
+**Backend (deployed to Railway):**
+
+| File | Change |
+|---|---|
+| `api/db/schema.py` | Added `BandWearSession` ORM class |
+| `alembic/versions/h3i4j5k6l7m8_band_wear_sessions.py` | New migration, ran in production |
+| `config/tracking.py` | Added `BAND_GAP_CLOSE_MINUTES = 90` |
+| `api/services/tracking_service.py` | `_manage_band_session`, `_compute_opening_balance`, `_close_band_session`, `_compute_session_summary`, `_get_open_band_session`, `_get_last_background_window_before`; rewrote `compute_live_summary` and `_materialise_daily_score` to use band session scope |
+| `api/routers/band_sessions.py` | New file: 3 endpoints |
+| `api/main.py` | Registered `band_sessions.router` |
+
+**Frontend (Zenflow_front — not yet published to a build):**
+
+| File | Change |
+|---|---|
+| `src/contexts/DailyDataContext.tsx` | New file: provider + hook |
+| `src/navigation/AppNavigator.tsx` | `HomeStackNavigator` wrapped with `<DailyDataProvider>` |
+| `src/screens/HomeScreen.tsx` | Context replaces `useDailySummary` + local interval; `refresh()` replaces `load()` |
+| `src/screens/StressDetailScreen.tsx` | Context for today; independent fetch for history; sleep filter removed; `isSleep` added to chart points |
+| `src/screens/RecoveryDetailScreen.tsx` | Same as above for recovery |
+| `src/ui/zenflow-ui-kit.tsx` | `ChartPoint.isSleep` field; sleep bar colour `rgba(140,140,160,0.30)`; Sleep legend swatch in both charts |
+
+---
+
+### Status tracker (cumulative — 21 March 2026)
+
+| Issue | Status |
+|---|---|
+| #1 — UTC midnight score reset | ✅ Fixed + Deployed |
+| #2 — Screen sync (single shared context) | ✅ Fixed (frontend, pending new app build) |
+| #3 — Waveform sleep gap | ✅ Fixed (frontend, pending new app build) |
+| #4 — History tab (Band Sessions) — backend | ✅ Endpoints built (`/band-sessions/history`, `/current`) |
+| #4 — History tab (Band Sessions) — frontend | ❌ Not yet started |
+
+---
+
+## Handoff Note — Session of 20 March 2026 (Part 6) — Symmetric Floor Scoring
+
+### What was done this session
+
+#### Fix — Removed `stress_capacity_floor_rmssd` offset; scoring now uses `rmssd_floor` directly ✅ DEPLOYED
+
+**Problem:** The stress denominator used `stress_capacity_floor_rmssd` (an offset value = `floor + 10% × range`) as the scoring boundary, while the recovery denominator used `rmssd_ceiling` raw. This asymmetry had no scientific basis — the 10% offset was a redundant safety margin on top of `is_valid` filtering.
+
+**Design change (symmetry with ceiling):**
+
+| | Before | After |
+|---|---|---|
+| Stress clamp | 26.3ms (`rmssd_floor + 10%`) | **22ms** (`rmssd_floor` raw) |
+| Stress denominator | `ln(38/26.3) × 960 = 353` | **`ln(38/22) × 960 = 525`** |
+| Recovery clamp | 65ms (`rmssd_ceiling` raw) | 65ms (unchanged) |
+| Recovery denominator | `ln(65/38) × 1440` (unchanged) | `ln(65/38) × 1440` (unchanged) |
+
+**Score impact at today's data (`raw_suppression=315`):**
+- Before: `315/353 = 89%`
+- After: `315/525 = 60%`
+
+**Industry reference:** Firstbeat (Garmin/Polar scientific foundation) uses raw personal floor as both clamp and denominator boundary with no secondary offset.
+
+**Code changes (`api/services/tracking_service.py`):**
+1. `_bootstrap_personal_model()`: Removed `seed_cap_floor` computation; `stress_capacity_floor_rmssd` no longer set on new user creation
+2. `_run_calibration_batch()`: Removed `cap_floor` computation; `stress_capacity_floor_rmssd` no longer written on calibration update
+3. Both intra-day scoring paths: `personal.stress_capacity_floor_rmssd or personal.rmssd_floor` → `personal.rmssd_floor`
+
+**DB patch (all 6 users):**
+```sql
+UPDATE personal_models SET stress_capacity_floor_rmssd = NULL;
+```
+Scoring falls back to `rmssd_floor` directly for all users.
+
+**Note:** The `stress_capacity_floor_rmssd` column is retained in DB schema for backward compat but is now always NULL and ignored by scoring code.
+
+---
+
+## Handoff Note — Session of 20 March 2026 (Part 5) — Stress Score Inflation Fix
+
+### What was done this session
+
+#### Fix — `stress_capacity_floor_rmssd` stale seed caused 3× stress inflation ✅ DEPLOYED
+
+**Bug:** The stress denominator (`ln(avg/floor) × 960`) incorrectly used a stale seed value of **32ms** for `stress_capacity_floor_rmssd` instead of the calibrated value derived from `rmssd_floor=22, ceiling=65`.
+
+**Root cause chain:**
+
+1. User was seeded with `_SEED_CAPACITY_FLOOR = 32.0` (hardcoded constant, not derived from floor/ceiling)
+2. The correct formula — `floor + 0.1 × (ceiling – floor)` — is applied in `_run_calibration_batch()` but **calibration has never run** for this user (0 rows in `calibration_snapshots`)
+3. `rmssd_floor=22, ceiling=65, morning_avg=38` were set directly in the DB (not via calibration), so the seed was never updated
+4. Live scoring uses `stress_capacity_floor_rmssd or rmssd_floor` — always picks the stale 32ms over the correct 22ms
+
+**Impact on scores:**
+
+| | Stale (floor=32ms) | Correct (floor=26.3ms) |
+|---|---|---|
+| Stress denominator | 164.98 | **354.6** |
+| `stress_pct_raw` | 98.09% | **45.6%** |
+| `net_balance` | –80.4 | **–27.9** |
+| BalanceDial needle | deep stress arc | mild stress arc |
+
+Stress was inflated **3×** and net balance was **6× more negative** than physiologically correct.
+
+**Fix (2 parts):**
+
+**Part 1 — Code** (`api/services/tracking_service.py`):
+- Removed `_SEED_CAPACITY_FLOOR = 32.0` (hardcoded constant)
+- Replaced with `seed_cap_floor = round(max(seed_floor + 0.1 * (seed_ceiling - seed_floor), 20.0), 1)` computed dynamically from the user's onboarding tier at bootstrap time
+- For the default moderate tier (floor=22, ceiling=65) this gives: `22 + 0.1 × 43 = 26.3ms` (was 32ms)
+- New users are now always seeded with the correct floor consistent with the calibration formula
+
+**Part 2 — DB patch** (all users, 6 rows):
+```sql
+UPDATE personal_models
+SET stress_capacity_floor_rmssd = round(CAST(rmssd_floor + 0.1 * (rmssd_ceiling - rmssd_floor) AS numeric), 1)
+WHERE rmssd_floor IS NOT NULL AND rmssd_ceiling IS NOT NULL;
+```
+All 6 users updated. Your user: `32ms → 26.3ms`.
+
+**Note:** The nightly calibration formula in `_run_calibration_batch()` was already correct (`cap_floor = max(rmssd_floor_clean + 0.1 * (rmssd_ceiling_clean - rmssd_floor_clean), 20.0)`). The bug was only in the seed path.
+
+**File:** `api/services/tracking_service.py` (seed bootstrap only — calibration formula was not changed)
+
+---
+
+
+
+## Handoff Note — Session of 20 March 2026 (Part 4) — Plan Screen Empty State Fix
+
+### What was done this session
+
+#### Fix 1 — `GET /plan/today` was returning wrong shape ✅ DEPLOYED
+
+**Bug:** The `/plan/today` endpoint was wired to `compute_daily_prescription()` + `prescribe_session()` — a different pipeline that returns `{ prescription: {...}, session: {...} }`. The frontend `PlanScreen` expects `{ id, plan_date, items: [...] }`. Because `items` was `undefined`, the screen always hit the empty state (`allItems.length === 0`).
+
+**The existing `PlanService.get_or_create_today_plan()` already did everything correctly** — reads from `daily_plans` table, generates if missing, returns the right shape — but was never wired to the route.
+
+**Fix:** Replaced the entire body of `GET /plan/today` and `POST /plan/trigger-today` with simple delegation to `PlanService`. Removed dead imports (`prescribe_session`, `PRF_UNKNOWN`, `PersonalModelRow`, `SessionRow`, `sqlfunc`, etc.).
+
+**Files:** `api/routers/plan.py`
+
+---
+
+#### Fix 2 — `plan_date` stored in UTC midnight, queried in UTC, but generated at IST midnight ✅ DEPLOYED
+
+**Bug:** The nightly job runs at 18:30 UTC = 00:00 IST. At that moment, `date.today()` on the Railway server (UTC) returns the *previous* UTC date (e.g. March 19). The plan is stored with `plan_date = 2026-03-19 00:00 UTC`. When the user opens the app at 08:00 IST the next morning (= 02:30 UTC March 20), `date.today()` now returns March 20, and the query `plan_date >= 2026-03-20 00:00 UTC` finds nothing → generates a fresh plan instead of the nightly one.
+
+**Fix:** Changed `today` calculation in `PlanService.get_or_create_today_plan()` to use IST timezone: `today = datetime.now(ZoneInfo("Asia/Kolkata")).date()`. This way both the nightly plan generation and the morning fetch agree on the IST calendar date, and `plan_date` is stored as UTC midnight of the correct IST day.
+
+**Fix also applied to `_increment_streak()`** in the nightly rebuild job — uses IST "yesterday" so the streak check finds the plan that was stored using IST date.
+
+**Files:** `api/services/plan_service.py`, `jobs/nightly_rebuild.py`
+
+---
+
+#### Fix 3 — `items_json` DB schema doesn't match frontend `PlanItem` type ✅ DEPLOYED
+
+**Bug:** Items stored in `daily_plans.items_json` use the prescriber's internal field names (`activity_slug`, `display`, `duration_min`, `reason_code`). The frontend TypeScript type `PlanItem` expects `activity_type_slug`, `title`, `duration_minutes`, `rationale`, `has_evidence`, `adherence_score`, `id`. Loading raw `items_json` into the frontend caused every item to render with blank/undefined fields.
+
+**Fix:** `_row_to_dict()` in `PlanService` now maps each raw item to the frontend shape:
+
+| DB field | Frontend field |
+|---|---|
+| `activity_slug` | `id` + `activity_type_slug` |
+| `display` | `title` |
+| `duration_min` | `duration_minutes` |
+| `reason_code` / `reason_note` | `rationale` |
+| _(missing)_ | `has_evidence: false` |
+| _(missing)_ | `adherence_score: null` |
+| _(missing)_ | `target_start_time: null` |
+
+Also renamed response key `plan_id` → `id` to match `DailyPlan` TypeScript interface.
+
+**Files:** `api/services/plan_service.py` (`_row_to_dict`)
+
+---
+
+
+
+## Handoff Note — Session of 20 March 2026 (Part 3) — Bug Fixes: Calibration + Sleep Gate + BalanceDial
+
+### What was done this session
+
+#### Fix 1 — Calibration nightly job `sanity_passed` NameError ✅ DEPLOYED
+
+**Bug:** `_run_calibration_batch()` in `api/services/tracking_service.py` ended with a `logger.info()` call referencing `sanity_passed` — a local variable that was deleted in a prior session when the sanity-check logic block was removed. The log line was not cleaned up.
+
+**Impact:** Every nightly run (18:30 UTC / 00:00 IST) hit `NameError: name 'sanity_passed' is not defined`, caught silently by the `try/except` in `_rebuild_one_user()`. Calibration (floor/ceiling/morning_avg updates) was **silently failing for all users every night**.
+
+**Fix (Option B):** Removed `sanity=%s` format spec and `sanity_passed` argument from the final `logger.info()` call. `snap.sanity_passed = True` is already stored on the snapshot row — no diagnostic info lost.
+
+**File:** `api/services/tracking_service.py` (final `logger.info` in `_run_calibration_batch()`)
+
+---
+
+#### Fix 2 — BalanceDial range expanded from ±20 to ±100 ✅ HOT-RELOAD
+
+**Bug:** `_valToAngle()` clamped input to `[-20, +20]`. The actual `net_balance` API scale is `[-100, +100]`. A value of `-46` was hard-clamped to `-20` → needle pinned to max-stress position even at moderate stress levels.
+
+**Fix:** Updated clamp and linear mapping:
+- Before: `clamp(v, -20, 20)` → `-120 + ((v+20)/40) * 240`
+- After: `clamp(v, -100, 100)` → `-120 + ((v+100)/200) * 240`
+
+`_balanceStatus()` thresholds scaled accordingly: ±8 → ±25.
+
+**Needle positions that matter:**
+
+| net_balance | Before | After |
+|---|---|---|
+| 0 (balanced) | 0° centre ✓ | 0° centre ✓ |
+| -46 (typical stress day) | -120° max stress ✗ | ≈-55° middle of stress arc ✓ |
+| -100 (worst case) | -120° ✓ | -120° ✓ |
+
+**File:** `Zenflow_front/src/ui/zenflow-ui-kit.tsx` (`_valToAngle`, `_balanceStatus`, comment on line above BalanceDial)
+
+---
+
+#### Fix 3 — Wake detector: `typical_sleep_time` removed as sleep gate ✅ DEPLOYED
+
+**Bug:** The sleep boundary detector had a 4-priority chain where Priority 2 was `typical_sleep_time` (stored as `"23:00"` for the test user). This fired **even when the band was actively streaming** — because `last_background_window_ts` (Priority 3) was only checked after the historical pattern already won. Result: stress accumulation was cut off at 11pm every night regardless of whether the user was actually asleep.
+
+**Root cause:** Historical sleep time should be **display/coach-framing only** — never a scoring gate. Only a confirmed band transition (`background→sleep`) should stop stress accumulation.
+
+**New two-tier design:**
+
+| | Tier 1 (band on) | Tier 2 (no band) |
+|---|---|---|
+| **Wake** | `sleep→background` context transition | historical wake time → morning read → 07:00 IST hardcoded |
+| **Sleep** | `background→sleep` context transition | `last_background_window_ts + 30min` → 22:00 IST hardcoded |
+
+`typical_sleep_time` is no longer consulted as a sleep gate. It remains stored in `personal_models` for future coach/display use.
+
+**File:** `tracking/wake_detector.py` — full rewrite of `detect_wake_sleep_boundary()` sleep section + module docstring updated
+
+---
+
+### Files changed this session
+
+| File | Change |
+|---|---|
+| `api/services/tracking_service.py` | Removed `sanity=%s` and `sanity_passed` from final logger call in `_run_calibration_batch()` |
+| `Zenflow_front/src/ui/zenflow-ui-kit.tsx` | `_valToAngle` range ±20→±100; `_balanceStatus` thresholds ±8→±25 |
+| `tracking/wake_detector.py` | Removed `typical_sleep_time` as sleep gate; two-tier detection; module docstring rewritten |
+
+### Status tracker (cumulative)
+
+| Item | Status |
+|---|---|
+| Calibration nightly job NameError | ✅ Fixed + Deployed |
+| Wake detector two-tier simplification | ✅ Fixed + Deployed |
+| BalanceDial range ±20→±100 | ✅ Fixed (hot-reload) |
+| Log-space scoring formula | ✅ Deployed (Part 2) |
+| BalanceDial needle glow removed | ✅ Done (Part 2) |
+| BalanceDial 240° arc dial | ✅ Done (Part 2) |
+| Density scaling removed | ✅ Deployed |
+| Live scores on device | ✅ Deployed |
+| Wake_ts timezone anchor fix | ✅ Deployed |
+| OutcomeService persist_session_outcome | ✅ Deployed |
+| Session start UI | ❌ Parked |
+| History tab populated | ❌ Blocked (no sessions in DB) |
+
+---
+
+
+
+### What was done this session
+
+#### Phase 1 — BalanceDial needle glow removed ✅
+
+The `FeDropShadow` filter on the needle line in `BalanceDial` produced a visible glow streak behind the needle. Removed the `<Filter id="dlNeedle">` definition from `<Defs>` and the `filter="url(#dlNeedle)"` prop from the `<Line>` element. Needle now renders as a clean `#7CFFAF` line.
+
+**File:** `Zenflow_front/src/ui/zenflow-ui-kit.tsx`
+
+---
+
+#### Phase 2 — Log-space scoring formula ✅ DEPLOYED
+
+**Root cause diagnosed:** The scoring formula had two compounding structural problems:
+
+1. **Wrong denominator:** `rmssd_range × 960` used `ceiling - floor` (43ms) as the capacity unit. Since `morning_avg = 38ms` is not at the midpoint of `[22, 65]` (midpoint = 43.5ms), the downward headroom is only 16ms and upward is 27ms. Using the full 43ms range as denominator created a hard structural cap: **stress could never exceed 37% and recovery could never exceed 63%** — regardless of how bad or good the day was.
+
+2. **Normality assumption:** Linear distance (`avg - rmssd`) assumes RMSSD is normally distributed. RMSSD is multiplicative (log-normal). The data confirmed this: `ln(38/22) = 0.547` vs `ln(65/38) = 0.537` — ratio 1.018, essentially perfect log-symmetry. Working in ms units makes a balanced physiological signal look asymmetric.
+
+**Fix — Log-space scoring (deployed):**
+
+$$\text{stress\_contrib}_w = \max\!\left(0,\ \ln\!\left(\frac{morning\_avg}{rmssd_w}\right)\right) \times \Delta t_w$$
+
+$$\text{cap\_stress} = \ln\!\left(\frac{morning\_avg}{floor}\right) \times 960$$
+
+$$\text{recov\_contrib}_w = \max\!\left(0,\ \ln\!\left(\frac{rmssd_w}{morning\_avg}\right)\right) \times \Delta t_w$$
+
+$$\text{cap\_recovery} = \ln\!\left(\frac{ceiling}{morning\_avg}\right) \times 1440$$
+
+**Properties:**
+- At `rmssd = floor` (worst stress), score reaches exactly 100% over a full 960-min day ✓
+- At `rmssd = ceiling` (peak recovery), score reaches exactly 100% over a full 1440-min day ✓
+- At `rmssd = morning_avg`, contribution = 0 ✓
+- At `rmssd < floor` (illness), score > 100% representing genuine debt ✓
+- No normality assumption. Symmetric in log-space by design.
+
+**Simulated impact (your calibration: floor=22, avg=38, ceiling=65):**
+
+| Method | Stress % at 125 min | Structural cap |
+|---|---|---|
+| Old (linear, ceiling-floor) | 2.4% | 37% max |
+| New (log-space, asymmetric) | 5.9% | 100% max |
+
+**Guard clause added:** When calibration is degenerate (`floor ≥ avg` or `avg ≥ ceiling`), ratio is clamped to min 1.0 before `log` → capacity = 0, no division-by-zero.
+
+**Note on SD-based alternative:** The user suggested expressing distance in SDs. Algebraic proof shows SD cancels when both numerator and denominator use the same SD → collapses to the asymmetric linear approach. Log-space is the correct form for log-normal data.
+
+**Note on SD2 formula evaluated:** `SS = 1000/SD2` where `SD2 = sqrt(2·SDNN² - SD1²)`. Discarded because: (a) SDNN is not stored in `background_windows`, (b) assuming `SDNN = k·RMSSD` collapses SD2 to `C/RMSSD` — structurally identical to current system. Would only add value if SDNN is computed from a different, longer time window than RMSSD.
+
+---
+
+### Files changed this session
+
+| File | Change |
+|---|---|
+| `Zenflow_front/src/ui/zenflow-ui-kit.tsx` | Removed `<Filter id="dlNeedle">` definition and `filter="url(#dlNeedle)"` from needle Line |
+| `tracking/daily_summarizer.py` | `import math` added; denominators changed to `ln(avg/floor)×960` and `ln(ceiling/avg)×1440`; `_compute_suppression_area()` uses `ln(avg/rmssd)`; `_compute_recovery_area_waking()` uses `ln(rmssd/avg)` |
+
+### Status tracker (cumulative)
+
+| Item | Status |
+|---|---|
+| Log-space scoring formula | ✅ Deployed |
+| BalanceDial needle glow removed | ✅ Done |
+| BalanceDial 240° arc dial | ✅ Done (hot-reload) |
+| Density scaling removed | ✅ Deployed (earlier today) |
+| Live scores on device (raw cumulative) | ✅ Deployed |
+| Wake_ts timezone anchor fix | ✅ Deployed |
+| OutcomeService persist_session_outcome | ✅ Deployed |
+| startSession() in endpoints.ts | ✅ Code done, no UI yet |
+| Session start UI | ❌ Parked |
+| History tab populated | ❌ Blocked (no sessions in DB) |
+| nightly close_day() UTC wake_ts bug | ❌ Known future issue |
+
+---
+
+**Last updated:** 20 March 2026 — Live score fix (wake_ts timezone bug) + session persistence + session/history RCA
+
+---
+
+## Handoff Note — Session of 20 March 2026 — Live Scores Fixed + Session RCA
+
+### What was done this session
+
+#### Phase 1 — Live scores fixed (wake_ts timezone bug) ✅
+
+**Root cause:** `typical_wake_time = "07:00"` stored in `PersonalModel` as an IST time string, but `_parse_time_on_date("07:00", utc_datetime)` applied it as UTC → `wake_ts = 07:00 UTC = 12:30 IST`. All real background data today was 09:08–11:51 IST — entirely before 12:30 IST. `_compute_suppression_area` gates on `window_start >= wake_ts`, so every window was skipped → suppression = 0 → stress_pct_raw = 0 → score = 0.
+
+**Fix — `api/services/tracking_service.py` → `compute_live_summary()`:**
+
+In the live-day path, always override the `WakeSleepBoundary` to use `bg_windows[0].window_start` as `wake_ts` (band-on anchor). The detected `sleep_ts` is kept unchanged.
+
+```python
+# ── Live-day anchor: always use first background window as wake_ts ─────
+if bg_windows:
+    band_on_ts = bg_windows[0].window_start
+    elapsed_from_band = (min(cal_end, now) - band_on_ts).total_seconds() / 60.0
+    boundary = WakeSleepBoundary(
+        user_id               = self._uid,
+        day_date              = cal_start,
+        wake_ts               = band_on_ts,
+        sleep_ts              = boundary.sleep_ts,
+        wake_detection_method = "band_on_anchor",
+        sleep_detection_method= boundary.sleep_detection_method,
+        waking_minutes        = elapsed_from_band,
+    )
+```
+
+**Wrong fix tried first (did not work):** `if boundary.wake_ts is None` — this condition never fires because `wake_ts` always gets the `07:00 UTC` fallback from `_parse_time_on_date`, it is never `None`.
+
+**Fix — `api/routers/tracking.py` → `get_today_summary()`:**
+
+Changed order from DB-row-first → live-first. Live `compute_live_summary()` is always preferred for today; stored row only used as fallback.
+
+**Result confirmed:** Scores 30 (stress) and 54 (recovery) appeared on device. Verified numerically:
+- cum_stress = 6.58%, cum_recovery = 10.72% at ~202 min elapsed (09:08–12:30 IST)
+- Density scale = 960 / 202 ≈ 4.75×
+- 6.58 × 4.75 ≈ **30** ✓, 10.72 × 4.75 ≈ **51** → **54** (additional data arrived) ✓
+
+---
+
+#### Phase 2 — Density scale explained
+
+The density formula: `displayed_score = raw_pct × (960 / elapsed_mins)`, floor at 120 min.
+
+- `elapsed_mins` = time from `bg_windows[0].window_start` (band-on) to `now` at API call time — **not** the last data point's timestamp
+- At 202 min elapsed: scale ≈ 4.75×. Scores drift toward raw values as day progresses. At elapsed = 960 min (full day worn), scale = 1× and displayed score equals raw %.
+- Rationale: early-day reading projected to full-day rate; gives actionable signal immediately after waking.
+
+---
+
+#### Phase 3 — OutcomeService rewrite ✅
+
+`api/services/outcome_service.py` was a 15-line stub with no `__init__` and no `persist_session_outcome()`. The router called it with `db=db, model_service=model_svc` — instant crash on any session end.
+
+**Fix:** Full rewrite (~80 lines). Added `__init__(self, db=None, model_service=None)` and `async persist_session_outcome(user_id, outcome: SessionOutcome) -> str` — writes to `sessions` table with `session_score × 100`, `coherence_avg`, `rmssd_pre/post`, zone columns = None for now. Deployed.
+
+---
+
+#### Phase 4 — `startSession()` added to endpoints.ts ✅
+
+`Zenflow_front/src/api/endpoints.ts` now has all 4 session functions:
+- `getCurrentSession()` — `GET /session/current`
+- `getSessionHistory(limit)` — `GET /session/history`
+- `endSession(sessionId)` — `POST /session/{id}/end`
+- `startSession(params?)` — `POST /session/start` ← NEW
+
+`StartSessionResponse` and `StartSessionParams` interfaces added.
+
+---
+
+### RCA: Session Summary Pop-up & History Tab (PARKED — no implementation yet)
+
+#### Issue 1: History Tab always empty
+
+**Root cause:** `sessions` table has 0 rows for test user (confirmed via DB). No "Start Session" button exists anywhere in the frontend. `startSession()` endpoint and function are fully implemented but never called. No session is started → no session is ended → nothing appears in history.
+
+#### Issue 2: Session summary pop-up never appears
+
+**Root cause:** `GET /session/current` returns `{ session: null }` — nothing in DB. Modal trigger `openSession !== null && is_open === true` is never satisfied.
+
+**Secondary issue:** `getCurrentSession()` is called only once on HomeScreen cold load, not on every screen focus (`useFocusEffect` not used) — so even if a session existed, re-entering HomeScreen from another tab wouldn't trigger the pop-up.
+
+#### Action plan (PARKED — awaiting approval)
+
+1. **Confirm intended session start UX** — manual button in app, or device-triggered?
+2. **Add "Start Session" entry point** to HomeScreen or a dedicated screen — calls `startSession()`, navigates to guided session flow
+3. **Add `useFocusEffect` to HomeScreen's `getCurrentSession` call** — check for open sessions on every Home focus, not just cold launch
+4. **Validate end-to-end:** start → DB row → end → row gains `ended_at` + score → History shows it → pop-up fires
+
+---
+
+### Files changed this session
+
+| File | Change |
+|---|---|
+| `api/services/tracking_service.py` | `compute_live_summary()`: unconditional wake_ts override using `bg_windows[0].window_start` |
+| `api/routers/tracking.py` | `get_today_summary()`: live-first order (was DB-row-first) |
+| `api/services/outcome_service.py` | Full rewrite: added `__init__`, `persist_session_outcome()` |
+| `Zenflow_front/src/api/endpoints.ts` | Added `startSession()`, `StartSessionResponse`, `StartSessionParams` |
+
+### Status tracker
+
+| Item | Status |
+|---|---|
+| Live scores on device (30 / 54) | ✅ Confirmed |
+| Wake_ts timezone anchor fix | ✅ Deployed |
+| Live-first order in tracking.py | ✅ Deployed |
+| Density rescaling (×960/elapsed) | ✅ Deployed (previous session) |
+| OutcomeService init + persist_session_outcome | ✅ Deployed |
+| startSession() in endpoints.ts | ✅ Code done, no UI yet |
+| endSession() in endpoints.ts | ✅ Done (previous session) |
+| Session modal in HomeScreen | ✅ Done (previous session) |
+| Plan button "View today's plan" | ✅ Done (previous session) |
+| Session start UI | ❌ Does not exist — action plan parked |
+| History tab populated | ❌ Blocked (no sessions in DB) |
+| Session pop-up | ❌ Blocked (no sessions in DB) |
+
+### Known issue: nightly `close_day()` will have same wake_ts bug for historical rows
+
+`compute_live_summary` fix applies only to live days. When `close_day()` runs at end of day it calls `detect_wake_sleep_boundary()` which uses the same `_parse_time_on_date` logic → finalized rows written to `daily_stress_summaries` may have the same 07:00 UTC anchor. `get_summary_by_date` returns stored rows for historical dates, so historical scores will be affected. Future fix needed.
+
+---
+
+**Last updated:** Calibration fix + adaptive central tendency — nightly job now commits reliably; morning_avg formula-owned
+
+---
+
+## Handoff Note — Calibration Fix ✅ COMPLETE
+
+### What was done
+
+Fixed three linked problems in the personal model calibration pipeline:
+
+| Problem | Root cause | Fix |
+|---------|-----------|-----|
+| Nightly job never committed | `len(clean) < 6` capped confidence at 0.5, below the 0.65 commit threshold — session-only users almost never accumulate 6 passive background windows | Lowered cap to `< 3` (matches the P10/P90 minimum requirement) |
+| `rmssd_morning_avg` = 20.6 bad value | Three separate code paths could overwrite the field with unreliable morning-hour or EWM-blended values | All three overwrite paths removed; field is now owned exclusively by the nightly calibration job |
+| morning_avg depended on morning-context windows | Session-based users don't wear the band passively all morning, so morning-context windows rarely exist | Replaced with formula: `floor + 0.37 × (ceiling − floor)` — matches moderate-tier seed ratio, always defined when floor+ceiling are known |
+
+### Architecture decisions
+
+- **morning_avg formula ratio:** `0.37` — derived from existing moderate-tier population seed (38 = 22 + 0.37 × 43). No new concept introduced.
+- **Clean window floor:** `3` — minimum needed for P10/P90 percentiles. Was 6, which permanently blocked session-only users.
+- **Central tendency helper added:** `robust_central_tendency(values)` in `model/calibration_filter.py`. Detects skewness (`|skew| > 0.5`) → median; near-symmetric → 10%-trimmed mean. Available for import by other modules.
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `model/calibration_filter.py` | Window cap: `< 6` → `< 3`; added `robust_central_tendency()` helper |
+| `api/services/tracking_service.py` | `_run_calibration_batch()`: removed morning-window extraction, sanity-check block, added formula derivation; morning_avg always written alongside floor+ceiling |
+| `model/fingerprint_updater.py` | Removed EWM morning_avg overwrite block |
+| `model/baseline_builder.py` | Removed morning-hour read overwrite block |
+| `jobs/nightly_rebuild.py` | Capacity growth: removed morning_avg DB query; formula replaces it; dead code removed |
+
+### DB hotfix applied
+
+```sql
+UPDATE personal_models
+SET rmssd_morning_avg = 38.0
+WHERE user_id = '8e8715c6-c6ab-45c1-a7da-f037207cf689';
+```
+
+Result: floor=22, ceiling=65, morning_avg=38 — stress threshold now `38 × 0.65 = 24.7ms` (was `20.6 × 0.65 = 13.4ms`, effectively dead).
+
+### Verification steps for next nightly run
+
+1. Re-query `calibration_snapshots` — should show `committed = true` row after 00:00 IST
+2. Re-query `personal_models` — floor/ceiling updated from real data, morning_avg = `floor + 0.37 × range`
+3. Run a session — stress windows should now appear when RMSSD drops below 24.7ms
+
+---
+
+## Handoff Note — Step 1: Session-Based Architecture ✅ COMPLETE
+
+### What was done
+
+Completed Step 1 of the 10-step plan: fully removed the morning-read / close_day / morning_pending scoring unit and replaced it with a continuous session-based architecture.
+
+### Backend changes
+
+| Phase | Files | Change |
+|-------|-------|--------|
+| B (orphan fix) | `api/services/tracking_service.py` | Deleted dangling old `close_day` body that was left as orphan code |
+| B | `jobs/nightly_rebuild.py` | Replaced `close_day(yesterday)` call with `run_calibration_for_date(yesterday)` + `assess_plan_adherence(yesterday)` |
+| B | `api/main.py` | Removed `plan_reset` import + `morning_plan_reset` cron job |
+| B | `jobs/plan_reset.py` | Replaced contents with deprecation notice (file no longer imported) |
+| C | `api/routers/coach.py` | Deleted `GET /coach/morning-brief` endpoint |
+| C | `api/services/coach_service.py` | Deleted `morning_brief()` method |
+| C | `coach/local_engine.py` | Deleted `_build_local_morning_brief` function + dispatch entry |
+| C | `coach/prompt_templates.py` | Deleted `_build_morning_brief` function + dispatch entry |
+| C | `coach/schema_validator.py` | Deleted `"morning_brief"` from `_REQUIRED_FIELDS` |
+| D | `api/routers/session.py` | Added `GET /session/current` and `GET /session/history` endpoints |
+| D | `api/routers/plan.py` | Added `POST /plan/trigger-today` endpoint |
+
+### New backend API surface
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /session/current` | Returns most recent session for user. `is_open=true` = still streaming. |
+| `GET /session/history?limit=20` | Returns last N completed sessions, newest first. |
+| `POST /plan/trigger-today` | Generates today's plan. Intended to be called once per day via "Plan My Day" button. |
+
+### TrackingService public methods (new, replace close_day)
+
+- `run_calibration_for_date(date)` — runs `_run_calibration_batch()` for a given date; updates PersonalModel calibration lock. Called by nightly_rebuild.
+- `assess_plan_adherence(date)` — evaluates daily plan completion, updates DailyPlan items_json. Called by nightly_rebuild.
+
+### Frontend changes
+
+| File | Change |
+|------|--------|
+| `PolarService.ts` | Removed `morning_pending` state entirely. `sleep` state now exits to `background` directly (new `else if (sleep)` branch using same `WAKE_HR_THRESHOLD/CV/CONFIRM_BEATS`). Removed `WAKE_HR_THRESHOLD`, `WAKE_CV_THRESHOLD`, `WAKE_CONFIRM_BEATS` constants (re-used in new sleep→background exit path). `flushContext` simplified to `sleep ? 'sleep' : 'background'`. |
+| `HomeScreen.tsx` | Replaced "See today's plan" → "Plan My Day" button. First tap calls `POST /plan/trigger-today`, stores IST date in AsyncStorage, grays out for rest of calendar day. |
+| `HistoryScreen.tsx` | Replaced TrendPolyChart + 4 metric tiles + hardcoded report card/archetype with `FlatList` of session rows calling `GET /session/history?limit=30`. Tap row → `SessionSummaryScreen`. Profile nav rows kept at bottom. |
+| `SessionSummaryScreen.tsx` | NEW FILE. Shows session time range, duration, score ring, coherence %, "still streaming" banner for open sessions. |
+| `AppNavigator.tsx` | Added `SessionSummary` route params to both `HomeStackParamList` and `HistoryStackParamList`. Registered `SessionSummaryScreen` in both stack navigators. |
+| `api/endpoints.ts` | Removed `getMorningBrief()`. Added `triggerTodayPlan()`, `getCurrentSession()`, `getSessionHistory()`, `SessionHistoryItem` interface. Removed `MorningBriefResponse` import. |
+
+### Architecture summary (post Step 1)
+
+The **scoring unit is now the session**, not the day:
+
+- **Background windows** flow in continuously via BLE (`context='background'` or `context='sleep'`).
+- **`compute_live_summary()`** uses calendar midnight as anchor with `opening_balance=0.0`. No MorningRead queries.
+- **Nightly job (18:30 UTC):** runs calibration + adherence assessment only. No more `close_day()`.
+- **Sessions** (`context='session'`) are the primary product unit. `GET /session/history` drives the HistoryScreen.
+- **`morning_pending` eliminated:** PolarService state machine is now: `background ↔ sleep` (bidirectional, with WAKE_CONFIRM_BEATS confirmation for both transitions).
+
+### What remains for Step 2+
+
+- Step 2: add `opening_balance` carry-forward between sessions (currently always 0.0 within a calendar day)
+- Step 3: hook assess_plan_adherence to post-session coach output
+- Steps 4–10: progressive coach loop tightening, plan lock mechanic, hardmode, etc.
+
+### Infrastructure state
+
+| Resource | Value |
+|----------|-------|
+| Backend API (Railway) | `https://api-production-8195d.up.railway.app` |
+| DB public URL | `postgresql://postgres:lStXwgKefGXXShUSTPXvxTmKluKPcLmE@switchyard.proxy.rlwy.net:35936/railway` |
+| Test user | `8e8715c6-c6ab-45c1-a7da-f037207cf689` |
+| Frontend dev server | Metro at `http://192.168.1.107:8081` (or `npx expo start --port 8081`) |
+| Latest Railway deploy | Triggered via `railway up --detach` — awaiting build completion |
+
+---
+
+
 
 ## Handoff Note — Session of 19 March 2026 (Part 2) — Stuck Morning Context Fix
 

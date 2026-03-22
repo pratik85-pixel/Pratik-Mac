@@ -1187,6 +1187,19 @@ class BandWearSession(Base):
     # Carry-forward state (live, updated each ingest while open)
     opening_balance        = Column(Float, nullable=False, default=0.0)
     opening_balance_locked = Column(Boolean, nullable=False, default=False)
+    # Timestamp of the first sleep→background transition within this session.
+    # When set, _compute_session_summary queries only windows AFTER this point,
+    # preventing the pre-wake period from being double-counted alongside opening_balance.
+    wake_locked_at         = Column(DateTime(timezone=True), nullable=True)
+
+    # Pre-computed metrics written at session close (NULL while open or no data).
+    # avg_rmssd_ms / avg_hr_bpm : mean over valid background-context windows.
+    # sleep_* columns            : derived from sleep-context windows in session range.
+    avg_rmssd_ms       = Column(Float, nullable=True)
+    avg_hr_bpm         = Column(Float, nullable=True)
+    sleep_rmssd_avg_ms = Column(Float, nullable=True)
+    sleep_started_at   = Column(DateTime(timezone=True), nullable=True)
+    sleep_ended_at     = Column(DateTime(timezone=True), nullable=True)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())

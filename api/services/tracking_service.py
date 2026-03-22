@@ -631,6 +631,7 @@ class TrackingService:
             )
             open_session.opening_balance        = opening_bal
             open_session.opening_balance_locked = True
+            open_session.wake_locked_at         = window_start
             logger.info(
                 "BandWearSession carry-forward locked user=%s opening_balance=%.2f wake_ts=%s",
                 self._uid, opening_bal, window_start,
@@ -721,15 +722,38 @@ class TrackingService:
         """
         # Compute live scores at the moment of close
         live = await self._compute_session_summary(
-            session_start = session.started_at,
-            session_end   = session.ended_at or datetime.now(UTC),
+            session_start   = session.started_at,
+            session_end     = session.ended_at or datetime.now(UTC),
             opening_balance = session.opening_balance,
+            wake_locked_at  = session.wake_locked_at,
         )
 
         if live is not None:
             session.stress_pct   = live.stress_pct_raw
             session.recovery_pct = live.recovery_pct_raw
             session.net_balance  = live.net_balance
+
+        # ── Pre-compute per-session metrics over the FULL session window ──────
+        # Use the full range (started_at → ended_at) regardless of wake_locked_at
+        # so that sleep-context windows are always included.
+        session_end_ts = session.ended_at or datetime.now(UTC)
+        all_windows = await _load_today_background(
+            self._db, self._uid, session.started_at, session_end_ts
+        )
+
+        bg_rmssd = [w.rmssd_ms for w in all_windows
+                    if w.context == "background" and w.is_valid and w.rmssd_ms is not None]
+        bg_hr    = [w.hr_bpm   for w in all_windows
+                    if w.context == "background" and w.is_valid and w.hr_bpm is not None]
+        sleep_ws = [w for w in all_windows if w.context == "sleep" and w.rmssd_ms is not None]
+
+        session.avg_rmssd_ms      = round(sum(bg_rmssd) / len(bg_rmssd), 1) if bg_rmssd else None
+        session.avg_hr_bpm        = round(sum(bg_hr)    / len(bg_hr),    1) if bg_hr    else None
+        if sleep_ws:
+            sleep_rmssd_vals          = [w.rmssd_ms for w in sleep_ws]
+            session.sleep_rmssd_avg_ms = round(sum(sleep_rmssd_vals) / len(sleep_rmssd_vals), 1)
+            session.sleep_started_at  = sleep_ws[0].window_start
+            session.sleep_ended_at    = sleep_ws[-1].window_end
 
         session.is_closed = True
         await self._db.flush()
@@ -750,11 +774,22 @@ class TrackingService:
         session_start: datetime,
         session_end: datetime,
         opening_balance: float,
+        wake_locked_at: Optional[datetime] = None,
     ) -> Optional[DailySummaryResult]:
-        """Compute a DailySummaryResult over a band session's full window range."""
+        """Compute a DailySummaryResult over a band session's full window range.
+
+        When wake_locked_at is set (i.e. the session spans overnight and a
+        sleep→background carry-forward already happened), only windows from
+        wake_locked_at onward are scored. This prevents the pre-wake period
+        from being counted twice — once in opening_balance and once here.
+        """
         personal = await _bootstrap_personal_model(self._db, self._uid)
 
-        bg_windows = await _load_today_background(self._db, self._uid, session_start, session_end)
+        # Use wake_locked_at as the effective start for scoring when present.
+        # This scopes stress/recovery to the post-wakeup waking period only.
+        score_start = wake_locked_at if wake_locked_at is not None else session_start
+
+        bg_windows = await _load_today_background(self._db, self._uid, score_start, session_end)
         if not bg_windows:
             return None
 
@@ -765,8 +800,8 @@ class TrackingService:
         capacity_ceiling = personal.rmssd_ceiling or 65.0
         capacity_version = personal.capacity_version or 0
 
-        stress_db   = await _load_existing_stress_windows(self._db, self._uid, session_start, session_end)
-        recovery_db = await _load_existing_recovery_windows(self._db, self._uid, session_start, session_end)
+        stress_db   = await _load_existing_stress_windows(self._db, self._uid, score_start, session_end)
+        recovery_db = await _load_existing_recovery_windows(self._db, self._uid, score_start, session_end)
         stress_results   = TrackingService._db_stress_to_results_static(stress_db)
         recovery_results = TrackingService._db_recovery_to_results_static(recovery_db)
 
@@ -781,7 +816,7 @@ class TrackingService:
             prev_ctx = w.context
 
         boundary = detect_wake_sleep_boundary(
-            day_date                  = session_start,
+            day_date                  = score_start,
             user_id                   = self._uid,
             context_transitions       = context_transitions or None,
             typical_wake_time         = personal.typical_wake_time,
@@ -789,10 +824,12 @@ class TrackingService:
             morning_read_ts           = None,
             last_background_window_ts = bg_windows[-1].window_end,
         )
-        # Always anchor wake to band-on time within the session
+        # Anchor wake_ts to the first post-wakeup background window.
+        # When wake_locked_at is set, bg_windows[0] is already at/after wakeup,
+        # so this is always correct regardless of the overnight-session case.
         boundary = WakeSleepBoundary(
             user_id               = self._uid,
-            day_date              = session_start,
+            day_date              = score_start,
             wake_ts               = bg_windows[0].window_start,
             sleep_ts              = boundary.sleep_ts,
             wake_detection_method = "band_on_anchor",
@@ -805,7 +842,7 @@ class TrackingService:
 
         return compute_daily_summary(
             user_id              = self._uid,
-            summary_date         = session_start,
+            summary_date         = score_start,
             background_windows   = bg_windows,
             stress_windows       = stress_results,
             recovery_windows     = recovery_results,
@@ -890,6 +927,7 @@ class TrackingService:
                 session_start   = band_session.started_at,
                 session_end     = datetime.now(UTC),
                 opening_balance = band_session.opening_balance,
+                wake_locked_at  = band_session.wake_locked_at,
             )
         else:
             live = await self.compute_live_summary(day_start.date())
@@ -1123,6 +1161,7 @@ class TrackingService:
                 session_start   = band_session.started_at,
                 session_end     = now,
                 opening_balance = band_session.opening_balance,
+                wake_locked_at  = band_session.wake_locked_at,
             )
 
         # Fallback: UTC calendar day (used for historical/closed-day queries)
