@@ -129,3 +129,21 @@ async def trigger_today_plan(
     plan_svc = PlanService(db=db, model_service=model_svc)
     result = await plan_svc.get_or_create_today_plan(user_id, force_regen=True)
     return {"user_id": user_id, "triggered": True, **result}
+
+
+@router.patch("/items/{slug}/complete")
+async def complete_plan_item(
+    slug:      str,
+    user_id:   str          = Depends(_user_id),
+    model_svc: ModelService = Depends(_model_svc),
+    db:        AsyncSession = Depends(get_db),
+) -> dict:
+    """
+    Mark a plan item as complete by its activity slug.
+    Sets has_evidence=True, recalculates adherence_pct, persists the change.
+    """
+    plan_svc = PlanService(db=db, model_service=model_svc)
+    updated = await plan_svc.complete_plan_item(user_id, slug)
+    if not updated:
+        raise HTTPException(status_code=404, detail=f"Plan item '{slug}' not found in today's plan")
+    return {"slug": slug, "completed": True}

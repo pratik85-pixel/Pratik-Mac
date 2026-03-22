@@ -361,3 +361,44 @@ class PlanService:
             return True
         return False
 
+    async def complete_plan_item(self, user_id: str, slug: str) -> bool:
+        """
+        Mark a plan item as complete by its activity slug.
+        Sets has_evidence=True on the matching item in items_json,
+        recalculates adherence_pct, and persists the change.
+        Returns True if a matching item was found and updated.
+        """
+        from datetime import date, datetime, UTC
+        from sqlalchemy.orm.attributes import flag_modified
+
+        uid = parse_uuid(user_id)
+        if not uid:
+            return False
+
+        today = date.today()
+        today_dt = datetime(today.year, today.month, today.day, tzinfo=UTC)
+        plan_row = await self._load_today_row(uid, today_dt)
+        if not plan_row or not plan_row.items_json:
+            return False
+
+        items = plan_row.items_json
+        matched = False
+        for item in items:
+            item_id = item.get("activity_type_slug") or item.get("activity_slug", "")
+            if item_id == slug:
+                item["has_evidence"] = True
+                matched = True
+                break
+
+        if not matched:
+            return False
+
+        completed = sum(1 for i in items if i.get("has_evidence", False))
+        total = len(items)
+        plan_row.adherence_pct = round(completed / total * 100) if total > 0 else 0
+
+        flag_modified(plan_row, "items_json")
+        await self._db.commit()
+        logger.info("complete_plan_item user=%s slug=%s adherence_pct=%s", user_id, slug, plan_row.adherence_pct)
+        return True
+

@@ -1,6 +1,6 @@
 # ZenFlow Verity — Project Context
 
-**Last updated:** 22 March 2026 — BandWearSession history backend built (5 new columns + /metrics + /plan endpoints); NOT YET deployed to Railway or wired into frontend
+**Last updated:** 22 March 2026 — Background foreground service fix implemented + deployed (Railway commit 9e49bb5, EAS build 1b1c7843)
 
 ---
 
@@ -66,8 +66,39 @@
 | Sleep legend colour | ✅ Done |
 | Tagging end-to-end (3 failures) | ✅ Fixed + Deployed |
 | Nightly calibration job (AsyncSessionLocal ImportError) | ✅ Fixed + Deployed |
-| BandWearSession /metrics + /plan endpoints | ✅ Built locally — **NOT YET deployed** |
-| BandWearSession history frontend screens | ❌ Not yet built |
+| BandWearSession /metrics + /plan endpoints | ✅ Built + Deployed (Railway commit 0e83782) |
+| BandWearSession history frontend screens | ✅ Built + EAS build dispatched (cb866315) |
+| Background foreground service freeze | ✅ Fixed + Deployed (commit 9e49bb5, EAS 1b1c7843) |
+
+---
+
+### Fix #H — Background Foreground Service Freeze ✅ FIXED & DEPLOYED
+
+**Problem:** When the app was minimised, heart rate scores froze. Beat data stopped flowing to the backend, and displayed scores stalled indefinitely.
+
+**Root cause — 3 layered failures:**
+
+1. **Primary:** `@supersami/rn-foreground-service` v2.2.5 requires `ServiceType` in the `start()` call (native Android module rejects without it). Our call omitted `ServiceType`, causing the native module to reject the call silently (try/catch swallowed the error). Result: no foreground notification → Android had no signal that BLE work was in progress → OS applied Doze mode / app standby.
+
+2. **Cascade:** Without a valid foreground service, Android's Doze mode and app standby buckets froze the React Native JS thread. The 60-second beat-flush `setInterval` stopped firing. Beat data was buffered but never POSTed to `/tracking/ingest`. Backend couldn't compute new scores.
+
+3. **Resume gap:** On returning to the foreground, `DailyDataContext` fired `fetchAll()` (display refresh) but never called `polarService.flushNow()` — beats buffered during background weren't posted immediately.
+
+**Fixes applied:**
+
+| File | Change |
+|---|---|
+| `src/services/PolarService.ts` | Added `ServiceType: 'connectedDevice'` to `VIForegroundService.start()` call — matches `foregroundServiceType` declared in AndroidManifest plugin |
+| `App.tsx` | Added `AppState.addEventListener` with `useRef` guard; calls `polarService.flushNow()` on every transition to `active` state |
+
+**Note:** `plugins/withForegroundService.js` and the AndroidManifest permissions were already correctly declared (`FOREGROUND_SERVICE`, `FOREGROUND_SERVICE_CONNECTED_DEVICE`, `WAKE_LOCK`, `foregroundServiceType="connectedDevice"`). Only the JS-side `start()` call and the resume flush were missing.
+
+**Deployment:**
+- Backend: Railway commit `9e49bb5` — `railway up` uploaded successfully
+- Frontend: EAS Android preview build `1b1c7843-722f-475f-8af8-9602907e607f`
+  - URL: `https://expo.dev/accounts/pratik85/projects/zenflow-verity/builds/1b1c7843-722f-475f-8af8-9602907e607f`
+
+**OEM caveat:** On Samsung One UI, MIUI, ColorOS — user must manually whitelist ZenFlow in battery settings to prevent the OS from killing the foreground service. This is the same requirement as WHOOP, Oura, Garmin, and every other wellness app on these OEMs.
 
 ---
 
