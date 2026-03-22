@@ -154,15 +154,15 @@ async def get_today_summary(
 
     personal = await svc.get_personal_model()
 
-    # 1. Persisted summary
-    row = await svc.get_daily_summary(today)
-    if row is not None:
-        return _build_summary_response(row, personal)
-
-    # 2. Live computation from background windows (spans midnight if needed)
+    # 1. Live computation (always preferred for today — avoids stale midnight rows)
     live = await svc.compute_live_summary(today)
     if live is not None:
         return _build_summary_response(live, personal)
+
+    # 2. Fallback: persisted summary (finalized row or manually written)
+    row = await svc.get_daily_summary(today)
+    if row is not None:
+        return _build_summary_response(row, personal)
 
     raise HTTPException(status_code=404, detail="No summary available yet.")
 
@@ -278,8 +278,6 @@ class IngestRequest(BaseModel):
 class IngestResponse(BaseModel):
     windows_processed:  int
     beats_received:     int
-    morning_day_type:   Optional[str] = None  # "green"|"yellow"|"red" — populated for context="morning"
-    morning_brief:      Optional[str] = None  # short coaching message for morning reads
 
 
 @router.post("/ingest", response_model=IngestResponse)
@@ -301,7 +299,7 @@ async def ingest_beats(
     if not body.beats:
         return IngestResponse(windows_processed=0, beats_received=0)
 
-    context = body.context if body.context in ("background", "sleep", "morning") else "background"
+    context = body.context if body.context in ("background", "sleep") else "background"
 
     # Sort by timestamp
     beats = sorted(body.beats, key=lambda b: b.ts)
@@ -348,108 +346,11 @@ async def ingest_beats(
         except Exception:
             logger.exception("ingest_background_window failed for window %s", win_start)
 
-    # ── Sleep-triggered day close ──────────────────────────────────────────────
-    # When the app transitions to context="sleep", the waking day is over.
-    # Close the day immediately using the actual sleep onset time rather than
-    # waiting for a fixed cron (which runs at a UTC time that may be morning IST).
-    if context == "sleep" and windows_processed > 0 and first_win_start is not None:
-        day_to_close = first_win_start.date()
-        try:
-            await svc.close_day(day_to_close)
-            logger.info(
-                "SLEEP-TRIGGERED close_day uid=%s date=%s sleep_onset=%s",
-                svc._uid, day_to_close, first_win_start.isoformat(),
-            )
-        except Exception:
-            logger.exception("sleep-triggered close_day failed uid=%s date=%s", svc._uid, day_to_close)
-
     logger.info("INGEST uid=%s context=%s windows_processed=%d beats=%d", svc._uid, context, windows_processed, len(beats))
-
-    # Gap 7 fix: return morning day_type + brief when a morning read was processed
-    morning_day_type: Optional[str] = None
-    morning_brief:    Optional[str] = None
-    if context == "morning" and windows_processed > 0:
-        try:
-            brief_result = await svc.get_today_morning_brief()
-            if brief_result:
-                morning_day_type, morning_brief = brief_result
-        except Exception:
-            logger.exception("morning brief generation failed uid=%s", svc._uid)
 
     return IngestResponse(
         windows_processed=windows_processed,
         beats_received=len(beats),
-        morning_day_type=morning_day_type,
-        morning_brief=morning_brief,
-    )
-
-
-@router.post("/tag-window", status_code=204, response_model=None)
-async def tag_window(
-    body: TagWindowRequest,
-    svc: TrackingService = Depends(_tracking_svc),
-) -> Response:
-    """
-    Apply a user-confirmed tag to a stress or recovery window.
-    The tag replaces any existing tag_candidate and sets tag_source = "user_confirmed".
-    """
-    try:
-        await svc.update_window_tag(
-            window_id   = body.window_id,
-            window_type = body.window_type,
-            tag         = body.tag,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc))
-    return Response(status_code=204)
-
-
-class CloseDayRequest(BaseModel):
-    date: Optional[str] = None  # YYYY-MM-DD; defaults to today
-
-
-class CloseDayResponse(BaseModel):
-    summary_date:          str
-    stress_load_score:     Optional[float]
-    recovery_score:        Optional[float]
-    readiness_score:       Optional[float]
-    waking_recovery_score: Optional[float] = None
-    net_balance:           Optional[float] = None
-    day_type:              Optional[str]
-    is_estimated:          bool
-
-
-@router.post("/close-day", response_model=CloseDayResponse)
-async def close_day(
-    body: CloseDayRequest = CloseDayRequest(),
-    svc:  TrackingService = Depends(_tracking_svc),
-) -> CloseDayResponse:
-    """
-    Finalise the DailyStressSummary for today (or a given date).
-
-    This writes the stress / recovery / readiness scores to the database
-    and makes them available from GET /tracking/daily-summary.
-
-    Triggered automatically by the 00:00 IST (18:30 UTC) nightly scheduler.
-    Can also be called manually (e.g. from the app when sleep boundary
-    is detected, or by a developer to force a day close).
-    """
-    target = _parse_date(body.date) if body.date else datetime.now(UTC).date()
-    try:
-        result = await svc.close_day(target)
-    except Exception as exc:
-        logger.exception("close_day failed for %s: %s", target, exc)
-        raise HTTPException(status_code=500, detail=f"close_day failed: {exc}") from exc
-
-    return CloseDayResponse(
-        summary_date          = target.isoformat(),
-        stress_load_score     = result.stress_load_score,
-        recovery_score        = None,  # deprecated — kept for API compat
-        readiness_score       = None,  # deprecated — kept for API compat
-        waking_recovery_score = result.waking_recovery_score,
-        net_balance           = result.net_balance,
-        day_type              = result.day_type,
-        is_estimated          = result.is_estimated,
     )
 
 

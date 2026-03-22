@@ -16,7 +16,7 @@ from typing import Annotated, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel
-from sqlalchemy import select, func as sqlfunc
+from sqlalchemy import select, func as sqlfunc, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sessions.session_prescriber import (
@@ -210,3 +210,102 @@ async def get_live_metrics(
     if metrics is None:
         raise HTTPException(status_code=404, detail="session not found or no data yet")
     return LiveMetricsResponse(**metrics.__dict__)
+
+
+# ── Session history / current ──────────────────────────────────────────────────
+
+class SessionHistoryItem(BaseModel):
+    session_id:       str
+    started_at:       str
+    ended_at:         Optional[str]
+    duration_minutes: Optional[float]
+    practice_type:    Optional[str]
+    session_score:    Optional[float]
+    coherence_avg:    Optional[float]
+    is_open:          bool
+
+
+@router.get("/current")
+async def get_current_session(
+    user_id: str            = Depends(_user_id),
+    db:      AsyncSession   = Depends(get_db),
+) -> dict:
+    """
+    Return the most recent ZenFlow session for this user.
+    is_open=true means ended_at is null (session still streaming).
+    is_open=false means it ended — UI can check gap and offer SessionSummaryScreen.
+    """
+    uid = parse_uuid(user_id)
+    if uid is None:
+        raise HTTPException(status_code=400, detail="invalid user id")
+
+    res = await db.execute(
+        select(SessionRow)
+        .where(SessionRow.user_id == uid, SessionRow.context == "session")
+        .order_by(desc(SessionRow.started_at))
+        .limit(1)
+    )
+    row: Optional[SessionRow] = res.scalar_one_or_none()
+    if row is None:
+        return {"session": None}
+
+    duration: Optional[float] = None
+    if row.ended_at and row.started_at:
+        duration = (row.ended_at - row.started_at).total_seconds() / 60.0
+
+    return {
+        "session": {
+            "session_id":       str(row.id),
+            "started_at":       row.started_at.isoformat(),
+            "ended_at":         row.ended_at.isoformat() if row.ended_at else None,
+            "duration_minutes": round(duration, 1) if duration is not None else None,
+            "practice_type":    row.practice_type,
+            "session_score":    round(row.session_score, 1) if row.session_score is not None else None,
+            "coherence_avg":    round(row.coherence_avg, 3) if row.coherence_avg is not None else None,
+            "is_open":          row.ended_at is None,
+        }
+    }
+
+
+@router.get("/history", response_model=list[SessionHistoryItem])
+async def get_session_history(
+    user_id: str          = Depends(_user_id),
+    db:      AsyncSession = Depends(get_db),
+    limit:   int          = 20,
+) -> list[SessionHistoryItem]:
+    """Return the N most recent completed ZenFlow sessions, newest first."""
+    if limit < 1 or limit > 200:
+        raise HTTPException(status_code=400, detail="limit must be 1–200")
+
+    uid = parse_uuid(user_id)
+    if uid is None:
+        raise HTTPException(status_code=400, detail="invalid user id")
+
+    res = await db.execute(
+        select(SessionRow)
+        .where(
+            SessionRow.user_id == uid,
+            SessionRow.context == "session",
+            SessionRow.ended_at.isnot(None),
+        )
+        .order_by(desc(SessionRow.started_at))
+        .limit(limit)
+    )
+    rows = res.scalars().all()
+
+    items: list[SessionHistoryItem] = []
+    for row in rows:
+        duration: Optional[float] = None
+        if row.ended_at and row.started_at:
+            duration = (row.ended_at - row.started_at).total_seconds() / 60.0
+        items.append(SessionHistoryItem(
+            session_id       = str(row.id),
+            started_at       = row.started_at.isoformat(),
+            ended_at         = row.ended_at.isoformat() if row.ended_at else None,
+            duration_minutes = round(duration, 1) if duration is not None else None,
+            practice_type    = row.practice_type,
+            session_score    = round(row.session_score, 1) if row.session_score is not None else None,
+            coherence_avg    = round(row.coherence_avg, 3) if row.coherence_avg is not None else None,
+            is_open          = False,
+        ))
+    return items

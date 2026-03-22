@@ -114,32 +114,6 @@ def generate_local_output(
 
 # ── Trigger-specific local builders ──────────────────────────────────────────
 
-def _build_local_morning_brief(
-    ctx: CoachContext,
-    rx: DailyPrescription,
-    tone: str,
-    opening: str,
-    closing: str,
-    reason: str,
-    focus: str,
-) -> dict:
-    session_str = f"{rx.session_duration}-minute {rx.session_type.replace('_', ' ')}"
-    return {
-        "summary": (
-            f"{opening} {reason} "
-            f"Today: {session_str} in the {rx.session_window} window."
-        ),
-        "observation": f"Load score today is {rx.load_score:.2f} — {rx.reason_tag.replace('_', ' ')}.",
-        "action": (
-            f"Do a {session_str} at {rx.session_intensity} intensity "
-            f"in the {rx.session_window} window."
-        ),
-        "window": f"Your window today: {rx.session_window}.",
-        "encouragement": "",
-        "follow_up_question": None,
-    }
-
-
 def _build_local_post_session(
     ctx: CoachContext,
     rx: DailyPrescription,
@@ -245,7 +219,6 @@ def _build_fallback_generic(
 
 
 _LOCAL_BUILDERS = {
-    "morning_brief":     _build_local_morning_brief,
     "post_session":      _build_local_post_session,
     "nudge":             _build_local_nudge,
     "weekly_review":     _build_local_weekly_review,

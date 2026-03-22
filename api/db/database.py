@@ -67,3 +67,17 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
             raise
         finally:
             await session.close()
+
+
+class _SessionLocalProxy:
+    """
+    Public proxy for the lazily-initialised session factory.
+    Supports `async with AsyncSessionLocal() as session:` — the same pattern
+    used throughout nightly_rebuild.py and any other non-FastAPI callers.
+    """
+    def __call__(self):
+        _, factory = _get_engine()
+        return factory()
+
+
+AsyncSessionLocal = _SessionLocalProxy()

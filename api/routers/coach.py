@@ -3,7 +3,6 @@ api/routers/coach.py
 
 Coaching message and conversation endpoints.
 
-GET  /coach/morning-brief           — today's synthesis + recommended action
 GET  /coach/post-session            — post-session message (requires session_id query param)
 GET  /coach/nudge                   — short mid-day motivational nudge
 POST /coach/conversation            — send a user message, receive coach reply
@@ -68,25 +67,6 @@ class CoachReply(BaseModel):
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
-
-@router.get("/morning-brief")
-async def morning_brief(
-    user_id:   str          = Depends(_user_id),
-    model_svc: ModelService = Depends(_model_svc),
-    coach_svc: CoachService = Depends(_coach_svc),
-) -> dict:
-    """Generate and return today's personalised morning brief."""
-    fp      = await model_svc.get_fingerprint(user_id) or _empty_fp()
-    profile = await model_svc.get_profile(user_id)
-    user    = await model_svc.get_user(user_id)
-
-    output = coach_svc.morning_brief(
-        fp, profile,
-        user_name=user.name if user else "there",
-    )
-
-    return {"trigger": "morning_brief", "user_id": user_id, **output}
-
 
 @router.get("/post-session")
 async def post_session_brief(

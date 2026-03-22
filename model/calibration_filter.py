@@ -126,8 +126,10 @@ def filter_calibration_windows(windows: list[Any]) -> FilterResult:
     if rejection_rate > _CONFIDENCE_PENALTY_ABOVE:
         penalty = _CONFIDENCE_PENALTY_PER_UNIT * (rejection_rate - _CONFIDENCE_PENALTY_ABOVE)
         confidence = max(0.0, 1.0 - penalty)
-    # Additional penalty if very few clean windows remain (< 6)
-    if len(clean) < 6:
+    # Additional penalty if very few clean windows remain (< 3)
+    # Note: P10/P90 percentile calculation already requires >= 3 windows;
+    # a cap below that permanently blocks session-only users.
+    if len(clean) < 3:
         confidence = min(confidence, 0.5)
 
     return FilterResult(
@@ -137,3 +139,27 @@ def filter_calibration_windows(windows: list[Any]) -> FilterResult:
         rejection_rate=round(rejection_rate, 4),
         confidence=round(confidence, 4),
     )
+
+
+def robust_central_tendency(values: list[float]) -> float:
+    """
+    Return the most appropriate central tendency estimate for a list of RMSSD values.
+
+    RMSSD distributions are typically right-skewed (a few high-value relaxation
+    peaks pull the tail up). Using the mean in that case overstates where the
+    user genuinely spends most of their time, raising the stress threshold and
+    suppressing detection.
+
+    Strategy:
+      - < 5 values  → median (not enough data to assess shape)
+      - |skewness| > 0.5 (noticeably skewed) → median
+      - Otherwise (near-symmetric) → 10 % trimmed mean
+    """
+    from scipy import stats as _stats
+
+    if len(values) < 5:
+        return float(np.median(values))
+    skewness = abs(float(_stats.skew(values)))
+    if skewness > 0.5:
+        return float(np.median(values))
+    return float(_stats.trim_mean(values, 0.10))

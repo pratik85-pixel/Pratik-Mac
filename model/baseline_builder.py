@@ -228,16 +228,8 @@ class BaselineBuilder:
         fp.rmssd_ceiling = round(float(np.percentile(all_rmssd, 95)), 1)
         fp.rmssd_range   = round(fp.rmssd_ceiling - fp.rmssd_floor, 1)
 
-        # Morning average
-        morning_readings = [
-            r for r in self.readings
-            if r.name == "rmssd"
-            and self._MORNING_HOUR_START <= r.ts.hour < self._MORNING_HOUR_END
-        ]
-        if morning_readings:
-            fp.rmssd_morning_avg = round(
-                float(np.mean([r.value for r in morning_readings])), 1
-            )
+        # morning_avg is owned exclusively by the nightly calibration job.
+        # Do not derive it from morning-hour readings here.
 
     def _build_rsa(self, fp: PersonalFingerprint) -> None:
         # Resting RSA: background context, not during sessions

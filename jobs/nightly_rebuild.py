@@ -83,9 +83,12 @@ async def _increment_streak(session, user_id) -> None:
     Updates UserPsychProfile.
     """
     from sqlalchemy import select, and_, func
+    from zoneinfo import ZoneInfo
     import api.db.schema as db
 
-    yesterday = (datetime.now(UTC) - timedelta(days=1)).date()
+    # Use IST date so "yesterday" matches the plan_date stored with IST calendar day
+    _IST = ZoneInfo("Asia/Kolkata")
+    yesterday = (datetime.now(_IST) - timedelta(days=1)).date()
     yesterday_start = datetime.combine(yesterday, datetime.min.time()).replace(tzinfo=UTC)
     yesterday_end   = datetime.combine(yesterday, datetime.max.time()).replace(tzinfo=UTC)
 
@@ -235,18 +238,6 @@ async def _check_capacity_growth(session, user_id) -> dict:
             )
             new_ceiling = new_peak_res.scalar_one_or_none() or yesterday_peak
 
-            # New morning_avg = mean of recent valid morning reads
-            morning_res = await session.execute(
-                select(func.avg(db.MorningRead.rmssd_ms)).where(
-                    and_(
-                        db.MorningRead.user_id   == user_id,
-                        db.MorningRead.read_date >= window_start,
-                        db.MorningRead.rmssd_ms.isnot(None),
-                    )
-                )
-            )
-            new_morning_avg = morning_res.scalar_one_or_none()
-
             # Snapshot state before mutation
             snapshot = db.ModelSnapshot(
                 user_id=user_id,
@@ -262,10 +253,12 @@ async def _check_capacity_growth(session, user_id) -> dict:
             )
             session.add(snapshot)
 
-            # Apply growth: update ceiling, morning avg, re-lock
+            # Apply growth: update ceiling, morning_avg, re-lock
             personal.rmssd_ceiling         = new_ceiling
-            if new_morning_avg is not None:
-                personal.rmssd_morning_avg = float(new_morning_avg)
+            # morning_avg grows proportionally with the new ceiling
+            personal.rmssd_morning_avg = round(
+                personal.rmssd_floor + 0.37 * (new_ceiling - personal.rmssd_floor), 1
+            )
             personal.calibration_locked_at  = datetime.now(UTC)
             personal.capacity_version       = (personal.capacity_version or 0) + 1
             personal.capacity_growth_streak = 0
@@ -290,6 +283,149 @@ async def _check_capacity_growth(session, user_id) -> dict:
 
     await session.flush()
     return result
+
+
+# ── Assessor helper ───────────────────────────────────────────────────────────
+
+async def _run_assessor(session, user_id) -> "Optional[Any]":
+    """
+    Fetch the minimal data needed by assessor.assess_user() and call it.
+
+    SessionRecord  — last 10 Sessions (context="session"); completed = ended_at IS NOT NULL.
+    ReadinessRecord — last 28 DailyStressSummary rows; readiness = waking_recovery_score.
+    DeviationRecord — last 30 days of PlanDeviation rows.
+    adherence_by_category — 7-day adherence per DailyPlan item category.
+
+    assess_user() is synchronous so we call it directly (no asyncio.to_thread
+    needed on CPython for pure-Python operations).
+    """
+    from sqlalchemy import select, and_
+    import api.db.schema as db
+    from coach.assessor import (
+        assess_user, SessionRecord, ReadinessRecord, DeviationRecord,
+        UserAssessment,
+    )
+    from datetime import date as date_type
+
+    cutoff_30d = datetime.now(UTC) - timedelta(days=30)
+    cutoff_28d = datetime.now(UTC) - timedelta(days=28)
+
+    # ── Sessions ──────────────────────────────────────────────────────────────
+    sess_res = await session.execute(
+        select(db.Session)
+        .where(
+            and_(
+                db.Session.user_id  == user_id,
+                db.Session.context  == "session",
+            )
+        )
+        .order_by(db.Session.started_at.desc())
+        .limit(10)
+    )
+    session_rows = sess_res.scalars().all()
+    session_records = [
+        SessionRecord(
+            session_id=str(row.id),
+            session_score=(row.session_score / 100.0) if row.session_score is not None else None,
+            was_prescribed=True,   # all ZenFlow sessions are prescribed
+            completed=row.ended_at is not None,
+        )
+        for row in reversed(session_rows)   # oldest first
+    ]
+
+    # ── Readiness (28-day DailyStressSummary) ────────────────────────────────
+    rdy_res = await session.execute(
+        select(db.DailyStressSummary)
+        .where(
+            and_(
+                db.DailyStressSummary.user_id       == user_id,
+                db.DailyStressSummary.summary_date  >= cutoff_28d,
+            )
+        )
+        .order_by(db.DailyStressSummary.summary_date.asc())
+    )
+    rdy_rows = rdy_res.scalars().all()
+    readiness_records = [
+        ReadinessRecord(
+            date_index=i,
+            readiness=float(row.waking_recovery_score or 0.0),
+        )
+        for i, row in enumerate(rdy_rows)
+    ]
+
+    # ── Deviations ────────────────────────────────────────────────────────────
+    dev_res = await session.execute(
+        select(db.PlanDeviation)
+        .where(
+            and_(
+                db.PlanDeviation.user_id == user_id,
+                db.PlanDeviation.ts      >= cutoff_30d,
+            )
+        )
+    )
+    dev_rows = dev_res.scalars().all()
+    deviation_records = [
+        DeviationRecord(
+            activity_slug=row.activity_slug,
+            priority=row.priority,
+            reason_category=row.reason_category,
+        )
+        for row in dev_rows
+    ]
+
+    # ── Adherence by category (last 7 days of DailyPlan items) ───────────────
+    cutoff_7d = datetime.now(UTC) - timedelta(days=7)
+    plan_res = await session.execute(
+        select(db.DailyPlan)
+        .where(
+            and_(
+                db.DailyPlan.user_id   == user_id,
+                db.DailyPlan.plan_date >= cutoff_7d,
+            )
+        )
+        .order_by(db.DailyPlan.plan_date.asc())
+    )
+    plan_rows = plan_res.scalars().all()
+
+    # Build category → (completed, total) tallies from items_json + adherence_pct
+    cat_totals: dict[str, list[float]] = {}   # category → list of item adherence values
+    for plan_row in plan_rows:
+        if not plan_row.items_json:
+            continue
+        adh = plan_row.adherence_pct or 0.0
+        for item in plan_row.items_json:
+            cat = item.get("category", "other")
+            cat_totals.setdefault(cat, []).append(adh)
+
+    adherence_by_category: dict[str, float] = {
+        cat: round(sum(vals) / len(vals), 3)
+        for cat, vals in cat_totals.items()
+    } if cat_totals else {}
+
+    # ── Tag model (sport stressors) ───────────────────────────────────────────
+    tag_res = await session.execute(
+        select(db.TagPatternModel).where(db.TagPatternModel.user_id == user_id)
+    )
+    tag_model = tag_res.scalar_one_or_none()
+    sport_stressors: list[str] = []
+    if tag_model and tag_model.sport_stressor_slugs:
+        sport_stressors = tag_model.sport_stressor_slugs
+
+    # ── Stage ─────────────────────────────────────────────────────────────────
+    user_res = await session.execute(
+        select(db.User).where(db.User.id == user_id)
+    )
+    user_row = user_res.scalar_one_or_none()
+    current_stage = int(user_row.training_level or 0) if user_row else 0
+
+    return assess_user(
+        current_stage=current_stage,
+        session_records=session_records,
+        readiness_records=readiness_records,
+        deviation_records=deviation_records,
+        adherence_by_category=adherence_by_category or None,
+        sport_stressors=sport_stressors or None,
+    )
 
 
 # ── Per-user rebuild ──────────────────────────────────────────────────────────
@@ -322,18 +458,18 @@ async def _rebuild_one_user(
     }
 
     try:
-        # ── Step 0: Close yesterday's day (write DailyStressSummary) ──────────────
+        # ── Step 0: Calibration + plan adherence for yesterday ───────────────────
         from api.services.tracking_service import TrackingService
         yesterday = (datetime.now(UTC) - timedelta(days=1)).date()
         try:
             tracking_svc = TrackingService(session, user_id)
-            await tracking_svc.close_day(yesterday)
+            await tracking_svc.run_calibration_for_date(yesterday)
+            await tracking_svc.assess_plan_adherence(yesterday)
             result["day_closed"] = True
-            log.debug("close_day OK user=%s date=%s", user_id, yesterday)
+            log.debug("calibration+adherence OK user=%s date=%s", user_id, yesterday)
         except Exception as exc:
-            log.warning("close_day failed user=%s date=%s: %s", user_id, yesterday, exc)
-            # Non-fatal — continue with profile rebuild using whatever
-            # DailyStressSummary data already exists
+            log.warning("calibration failed user=%s date=%s: %s", user_id, yesterday, exc)
+            # Non-fatal — continue with profile rebuild using whatever data exists
 
         # ── Step 1: Profile rebuild (narrative + plan) ───────────────────────
         # Get today's scores (from most recent DailyStressSummary)
@@ -348,6 +484,13 @@ async def _rebuild_one_user(
         stress      = int(summary.stress_load_score) if summary and summary.stress_load_score else None
         recovery    = int(summary.waking_recovery_score) if summary and summary.waking_recovery_score else None
 
+        # ── Step 1a: Assessor (behavioural gate + adherence) ──────────────────
+        assessment = None
+        try:
+            assessment = await _run_assessor(session, user_id)
+        except Exception as exc:
+            log.warning("assessor failed user=%s: %s", user_id, exc)
+
         # Full rebuild
         profile = await rebuild_unified_profile(
             session,
@@ -356,6 +499,7 @@ async def _rebuild_one_user(
             net_balance=net_balance,
             stress_score=stress,
             recovery_score=recovery,
+            assessment=assessment,
         )
         result["narrative_version"] = profile.narrative_version
         result["engagement_tier"]   = profile.engagement.engagement_tier

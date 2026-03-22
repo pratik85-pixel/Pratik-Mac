@@ -34,6 +34,28 @@
 			"type": "shell",
 			"command": "export PATH=\"$HOME/.npm-global/bin:$PATH\" EXPO_TOKEN=\"NkUqALgfgbtl9bqLG8UW8OlhSn7QSW2MLHs_6Tyn\" && cd /Users/pratikbarman/Desktop/Zenflow_front && eas build --platform android --profile preview --non-interactive",
 			"isBackground": false
+		},
+		{
+			"label": "Deploy: Alembic migrate head",
+			"type": "shell",
+			"command": "cd /Users/pratikbarman/Desktop/Zenflow_backend && railway run --service api alembic upgrade head",
+			"isBackground": false
+		},
+		{
+			"label": "Deploy: Alembic upgrade head (public URL)",
+			"type": "shell",
+			"command": "cd /Users/pratikbarman/Desktop/Zenflow_backend && DATABASE_URL='postgresql://postgres:lStXwgKefGXXShUSTPXvxTmKluKPcLmE@switchyard.proxy.rlwy.net:35936/railway' alembic upgrade head",
+			"isBackground": false
+		},
+		{
+			"label": "Migrate and Deploy",
+			"type": "shell",
+			"command": "cd /Users/pratikbarman/Desktop/Zenflow_backend && DATABASE_URL='postgresql://postgres:lStXwgKefGXXShUSTPXvxTmKluKPcLmE@switchyard.proxy.rlwy.net:35936/railway' alembic upgrade head && echo '=== MIGRATION DONE ===' && railway up --service api && echo '=== DEPLOY DONE ==='",
+			"isBackground": false,
+			"presentation": {
+				"panel": "new",
+				"reveal": "always"
+			}
 		}
 	]
 }

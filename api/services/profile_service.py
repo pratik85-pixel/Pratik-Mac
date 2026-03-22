@@ -161,6 +161,7 @@ async def rebuild_unified_profile(
     stress_score: Optional[int] = None,
     recovery_score: Optional[int] = None,
     available_slugs: Optional[list[str]] = None,
+    assessment: Optional[Any] = None,
 ) -> UnifiedProfile:
     """
     Full nightly rebuild pipeline:
@@ -218,6 +219,8 @@ async def rebuild_unified_profile(
         stress_score=stress_score,
         recovery_score=recovery_score,
         available_slugs=slugs,
+        adherence=assessment.adherence_7d if assessment is not None else None,
+        assessment_note=assessment.summary_note if assessment is not None else None,
     )
 
     # -- Layer 3: guardrails --

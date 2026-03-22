@@ -3,32 +3,27 @@ api/routers/plan.py
 
 Plan management and check-in endpoints.
 
-GET  /plan/today        — today's recommended session + timing
+GET  /plan/today        — today's plan items (via PlanService)
 GET  /plan/week         — full week plan (session targets + schedule)
 POST /plan/check-in     — submit 3-question subjective check-in
+POST /plan/trigger-today — force-regenerate today's plan
 """
 
 from __future__ import annotations
 
 import logging
-import uuid
-from datetime import datetime, UTC
-from typing import Annotated, Optional
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from sqlalchemy import select, func as sqlfunc
-
 from coach.plan_replanner import compute_daily_prescription
-from sessions.session_prescriber import (
-    PRF_FOUND, PRF_UNKNOWN, PRF_CONFIRMED, prescribe_session,
-)
 from api.db.database import get_db
-from api.db.schema import CheckIn, PersonalModel as PersonalModelRow, Session as SessionRow
+from api.db.schema import CheckIn
 from api.utils import parse_uuid
 from api.services.model_service import ModelService
+from api.services.plan_service import PlanService
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/plan", tags=["plan"])
@@ -62,67 +57,11 @@ async def today_plan(
     db:        AsyncSession = Depends(get_db),
 ) -> dict:
     """
-    Return today's prescribed session for the user.
-
-    Includes:
-    - `prescription`: load_score, session_type, reason_tag, timing window
-    - `session`: practice_type, pacer config, duration, tier
+    Return today's plan items for the user.
+    Loads from DB if already generated today (IST), otherwise generates and persists.
     """
-    fp      = await model_svc.get_fingerprint(user_id)
-    profile = await model_svc.get_profile(user_id)
-
-    if fp is None:
-        from model.baseline_builder import PersonalFingerprint
-        fp = PersonalFingerprint()
-
-    prescription = compute_daily_prescription(profile)
-
-    # Load PRF status + bpm from PersonalModel  ─────────────────────────────
-    uid = parse_uuid(user_id)
-    prf_status_val: str            = PRF_UNKNOWN
-    stored_prf_bpm: Optional[float] = None
-    total_sessions: int             = 0
-
-    if uid is not None:
-        pm_res = await db.execute(
-            select(PersonalModelRow).where(PersonalModelRow.user_id == uid)
-        )
-        pm_row = pm_res.scalar_one_or_none()
-        if pm_row is not None and pm_row.prf_status:
-            prf_status_val = pm_row.prf_status
-            stored_prf_bpm = pm_row.prf_bpm
-
-        count_res = await db.execute(
-            select(sqlfunc.count(SessionRow.id)).where(
-                SessionRow.user_id == uid,
-                SessionRow.context == "session",
-            )
-        )
-        total_sessions = count_res.scalar_one() or 0
-
-    practice = prescribe_session(
-        stage                    = profile.stage,
-        prf_status               = prf_status_val,
-        stored_prf_bpm           = stored_prf_bpm,
-        load_score               = prescription.load_score,
-        session_type             = prescription.session_type,
-        total_sessions_completed = total_sessions,
-    )
-
-    return {
-        "user_id": user_id,
-        "prescription": {
-            "load_score":     prescription.load_score,
-            "session_intensity": prescription.session_intensity,
-            "session_type":   prescription.session_type,
-            "reason_tag":     prescription.reason_tag,
-            "session_window": prescription.session_window,
-            "session_duration_minutes": prescription.session_duration,
-            "stage":          profile.stage,
-            "practice_type":  prescription.practice_type,
-        },
-        "session": practice.to_dict(),
-    }
+    plan_svc = PlanService(db=db, model_service=model_svc)
+    return await plan_svc.get_or_create_today_plan(user_id)
 
 
 @router.get("/week")
@@ -174,3 +113,19 @@ async def check_in(
             "We'll compare this to your HRV readings to sharpen your profile."
         ),
     }
+
+
+@router.post("/trigger-today")
+async def trigger_today_plan(
+    user_id:   str          = Depends(_user_id),
+    model_svc: ModelService = Depends(_model_svc),
+    db:        AsyncSession = Depends(get_db),
+) -> dict:
+    """
+    Force-regenerate today's plan for the user.
+    Called by the frontend's 'Plan My Day' button.
+    Returns the same payload as GET /plan/today.
+    """
+    plan_svc = PlanService(db=db, model_service=model_svc)
+    result = await plan_svc.get_or_create_today_plan(user_id, force_regen=True)
+    return {"user_id": user_id, "triggered": True, **result}

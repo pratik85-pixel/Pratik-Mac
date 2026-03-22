@@ -66,6 +66,13 @@ class BackgroundWindowResult:
             self.rmssd_ms is not None
             and self.confidence >= 0.5
             and self.n_beats >= CONFIG.tracking.BACKGROUND_MIN_BEATS
+            and (
+                self.context != "background"
+                or (
+                    self.rmssd_ms <= CONFIG.tracking.RMSSD_POPULATION_CEILING
+                    and self.rmssd_ms >= CONFIG.tracking.RMSSD_POPULATION_FLOOR
+                )
+            )
         )
 
 

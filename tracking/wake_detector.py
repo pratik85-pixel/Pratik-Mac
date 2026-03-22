@@ -6,20 +6,21 @@ Determines waking and sleep boundaries for a given calendar day.
 These boundaries define the stress accumulation window (wake → sleep) and
 the recovery window (yesterday's morning read → today's morning read).
 
-Priority chain for wake time:
-    1. "sleep_transition"     — bridge context changes sleep → background
-    2. "historical_pattern"   — PersonalModel.typical_wake_time (rolling 14-day median)
-    3. "morning_read_anchor"  — morning read timestamp (user picked up phone)
+Two-tier detection — band data takes absolute precedence:
 
-Priority chain for sleep time:
-    1. "sleep_transition"     — bridge context changes background → sleep
-    2. "historical_pattern"   — PersonalModel.typical_sleep_time
-    3. "last_background"      — last background window timestamp + buffer
+    Wake:
+        Tier 1 (band worn): sleep → background context transition
+        Tier 2 (no band):   historical typical_wake_time, then morning read,
+                            then 07:00 IST hardcoded
 
-Edge cases:
-    - No overnight wear → fall back to historical pattern or morning read
-    - Morning read taken, then user went back to bed (within 90 min) → extend sleep
-    - Multiple sleep transitions in one night → take the longest continuous sleep block
+    Sleep:
+        Tier 1 (band worn): background → sleep context transition
+        Tier 2 (no band):   last_background_window_ts + 30 min buffer,
+                            then 22:00 IST hardcoded
+
+IMPORTANT — typical_sleep_time is intentionally NOT used as a sleep gate.
+It must never cut off stress accumulation when the band is actively streaming.
+Historical sleep time is display/coach-framing only, not a scoring boundary.
 """
 
 from __future__ import annotations
@@ -99,7 +100,7 @@ def detect_wake_sleep_boundary(
 
     # ── Wake time detection ─────────────────────────────────────────────────
 
-    # Priority 1: sleep → background context transition
+    # Tier 1 (band worn): sleep → background context transition
     if context_transitions:
         for t in sorted(context_transitions, key=lambda x: x.ts):
             if t.from_context == "sleep" and t.to_context == "background":
@@ -108,30 +109,28 @@ def detect_wake_sleep_boundary(
                     wake_method = "sleep_transition"
                     break
 
-    # Priority 2: historical typical wake time
-    if wake_ts is None and typical_wake_time:
-        wake_ts = _parse_time_on_date(typical_wake_time, day_date)
-        wake_method = "historical_pattern"
-
-    # Priority 3: morning read timestamp
-    if wake_ts is None and morning_read_ts is not None:
-        wake_ts = morning_read_ts
-        wake_method = "morning_read_anchor"
-
-    # Absolute fallback: 7am
+    # Tier 2 (no band): historical pattern → morning read → hardcoded
     if wake_ts is None:
-        wake_ts = day_date.replace(hour=7, minute=0, second=0, microsecond=0)
-        wake_method = "morning_read_anchor"   # label as anchor even if imputed
+        if typical_wake_time:
+            wake_ts = _parse_time_on_date(typical_wake_time, day_date)
+            wake_method = "historical_pattern"
+        elif morning_read_ts is not None:
+            wake_ts = morning_read_ts
+            wake_method = "morning_read_anchor"
+        else:
+            # Absolute fallback: 07:00 IST = 01:30 UTC
+            wake_ts = day_date.replace(hour=1, minute=30, second=0, microsecond=0)
+            wake_method = "morning_read_anchor"
 
     # ── Sleep time detection ────────────────────────────────────────────────
+    # typical_sleep_time is intentionally NOT consulted here — it must never
+    # gate stress accumulation when live band data is present. Historical sleep
+    # time is display/coach-framing only, not a scoring boundary.
 
-    # Priority 1: background → sleep context transition
+    # Tier 1 (band worn): background → sleep context transition
     if context_transitions:
-        # Find transitions on this day or early next day (sleep after midnight is fine)
-        next_day = day_date + timedelta(days=1)
         for t in sorted(context_transitions, key=lambda x: x.ts):
             if t.from_context == "background" and t.to_context == "sleep":
-                # Must be after wake_ts and not more than 28h after wake
                 if t.ts > wake_ts:
                     max_awake = wake_ts + timedelta(hours=28)
                     if t.ts <= max_awake:
@@ -139,19 +138,17 @@ def detect_wake_sleep_boundary(
                         sleep_method = "sleep_transition"
                         break
 
-    # Priority 2: historical typical sleep time
-    if sleep_ts is None and typical_sleep_time:
-        candidate = _parse_time_on_date(typical_sleep_time, day_date)
-        # If typical sleep time is before wake (e.g. midnight crosses date), use next day
-        if candidate <= wake_ts:
-            candidate = _parse_time_on_date(typical_sleep_time, day_date + timedelta(days=1))
-        sleep_ts = candidate
-        sleep_method = "historical_pattern"
-
-    # Priority 3: last background window + buffer
-    if sleep_ts is None and last_background_window_ts is not None:
-        sleep_ts = last_background_window_ts + timedelta(minutes=30)
-        sleep_method = "last_background"
+    # Tier 2 (no band): last background window + buffer → hardcoded
+    if sleep_ts is None:
+        if last_background_window_ts is not None:
+            sleep_ts = last_background_window_ts + timedelta(minutes=30)
+            sleep_method = "last_background"
+        else:
+            # Absolute fallback: 22:00 IST = 16:30 UTC
+            sleep_ts = day_date.replace(hour=16, minute=30, second=0, microsecond=0)
+            if sleep_ts <= wake_ts:
+                sleep_ts = sleep_ts + timedelta(days=1)
+            sleep_method = "no_band_default"
 
     # Compute waking minutes
     waking_minutes: Optional[float] = None

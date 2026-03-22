@@ -97,90 +97,6 @@ def build_prompts(ctx: CoachContext) -> tuple[str, str]:
 
 # ── Per-trigger user prompt builders ─────────────────────────────────────────
 
-def _build_morning_brief(ctx: CoachContext, tone_desc: str) -> str:
-    milestone_block = ""
-    if ctx.milestone and ctx.milestone_evidence:
-        milestone_block = f"""
-MILESTONE EVENT:
-    label: {ctx.milestone}
-    evidence: {ctx.milestone_evidence}
-"""
-
-    habit_block = (
-        "\n".join(f"    - {e}" for e in ctx.recent_habit_events)
-        if ctx.recent_habit_events else "    none"
-    )
-
-    # Personality snapshot block (Layer 1 narrative)
-    personality_block = ""
-    if ctx.uup_narrative:
-        # Trim to first 1200 chars to keep prompt size manageable
-        narrative_excerpt = ctx.uup_narrative[:1200]
-        personality_block = f"""
-PERSONALITY SNAPSHOT (read before responding; do not narrate back to user):
-{narrative_excerpt}
-"""
-
-    # Conversation facts block
-    facts_block = ""
-    if ctx.user_facts:
-        facts_str = "\n".join(f"    - {f}" for f in ctx.user_facts[:8])
-        facts_block = f"""\nKNOWN FACTS ABOUT THIS USER:\n{facts_str}\n"""
-
-    # Engagement note
-    engagement_block = ""
-    if ctx.engagement_tier in ("at_risk", "churned"):
-        engagement_block = f"\nENGAGEMENT NOTE: User is '{ctx.engagement_tier}' — keep plan minimal and frictionless.\n"
-
-    return f"""\
-TRIGGER: morning_brief
-TONE: {ctx.tone}
-TONE INSTRUCTION: {tone_desc}
-{personality_block}{facts_block}{engagement_block}
-USER PROFILE:
-    Name: {ctx.user_name}
-    Pattern: {ctx.pattern_label} — {ctx.pattern_summary}
-    {ctx.stage_in_words} ({ctx.weeks_in_stage} weeks in stage)
-
-TODAY'S READING:
-    Morning RMSSD: {ctx.today_rmssd_vs_avg}
-    vs personal floor: {ctx.today_rmssd_vs_floor}
-    Read quality: {ctx.morning_read_quality}
-    Consecutive low days: {ctx.consecutive_low_days}
-
-7-DAY CONTEXT:
-    Trajectory: {ctx.trajectory}
-    Load trend: {ctx.load_trend}
-    Score delta 7d: {ctx.score_7d_delta if ctx.score_7d_delta is not None else 'unavailable'}
-    Recovery note: {ctx.recovery_pattern_note}
-    Sessions this week: {ctx.sessions_this_week}
-
-HABIT SIGNALS (last 72h):
-{habit_block}
-    Sleep: {ctx.sleep_note}
-    Schedule: {ctx.schedule_context}
-{milestone_block}
-TODAY'S PRESCRIPTION:
-    Session type: {ctx.prescription.session_type}
-    Duration: {ctx.prescription.session_duration} minutes
-    Intensity: {ctx.prescription.session_intensity}
-    Window: {ctx.prescription.session_window}
-    Physical load directive: {ctx.prescription.physical_load}
-    Load score: {ctx.prescription.load_score:.2f}
-    Reason: {ctx.prescription.reason_tag}
-
-Output this JSON (no markdown fences):
-{{
-  "summary": "<20–45 word opening — conditions today, in plain language>",
-  "observation": "<10–35 words — one specific thing the data shows>",
-  "action": "<10–28 words — exactly the prescribed session, nothing else>",
-  "window": "<1 sentence — confirm the timing window>",
-  "encouragement": "<optional — cite the milestone_evidence number if milestone present, else omit>",
-  "follow_up_question": "<short question to check in, or null>"
-}}
-"""
-
-
 def _build_post_session(ctx: CoachContext, tone_desc: str) -> str:
     session = ctx.session_data or {}
     coherence_peak  = session.get("coherence_peak",  "unavailable")
@@ -367,7 +283,6 @@ Output this JSON:
 # ── Dispatch table ────────────────────────────────────────────────────────────
 
 _TRIGGER_BUILDERS = {
-    "morning_brief":     _build_morning_brief,
     "post_session":      _build_post_session,
     "nudge":             _build_nudge,
     "weekly_review":     _build_weekly_review,

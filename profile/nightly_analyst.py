@@ -121,6 +121,8 @@ def run_layer2_plan(
     recovery_score: Optional[int] = None,
     available_slugs: Optional[list[str]] = None,
     today: Optional[date] = None,
+    adherence: Optional[dict] = None,
+    assessment_note: Optional[str] = None,
 ) -> UnifiedProfile:
     """
     Layer 2: Generate the suggested plan and attach to profile.
@@ -143,6 +145,8 @@ def run_layer2_plan(
         recovery_score=recovery_score,
         available_slugs=available_slugs or [],
         today=today,
+        adherence=adherence,
+        assessment_note=assessment_note,
     )
 
     plan_items: list[PlanItem] = []
@@ -334,16 +338,29 @@ def _build_layer2_user_prompt(
     recovery_score: Optional[int],
     available_slugs: list[str],
     today: date,
+    adherence: Optional[dict] = None,
+    assessment_note: Optional[str] = None,
 ) -> str:
     narrative = profile.coach_narrative or "(narrative unavailable)"
     slugs_str = ", ".join(available_slugs) if available_slugs else "walking, breathing, stretching, book_reading, nap"
 
     nb_str = f"{net_balance:+.1f}" if net_balance is not None else "Unknown"
+
+    adherence_section = ""
+    if adherence:
+        lines = "\n".join(
+            f"  {cat}: {round(pct * 100)}%"
+            for cat, pct in sorted(adherence.items())
+        )
+        adherence_section = f"\nADHERENCE LAST 7 DAYS (by category):\n{lines}"
+    if assessment_note:
+        adherence_section += f"\nCOACHING NOTE: {assessment_note}"
+
     return f"""
 TODAY: {today.isoformat()}
 NET BALANCE: {nb_str} (positive = surplus, negative = debt; drives day colour)
 STRESS SCORE: {stress_score if stress_score is not None else 'Unknown'}/100
-WAKING RECOVERY SCORE: {recovery_score if recovery_score is not None else 'Unknown'}/100
+WAKING RECOVERY SCORE: {recovery_score if recovery_score is not None else 'Unknown'}/100{adherence_section}
 
 USER PERSONALITY SNAPSHOT:
 {narrative}

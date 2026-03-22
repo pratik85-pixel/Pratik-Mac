@@ -105,24 +105,8 @@ def update_rmssd_stats(
             fp.rmssd_range = new_range
             changed.append("rmssd_range")
 
-    # ── Morning average: FROZEN after calibration
-    # EWM updates only happen during the initial calibration window (calibration_days < 3).
-    # After that, morning_avg is the frozen snapshot used as the scoring threshold.
-    if not calibration_locked:
-        morning_vals = [
-            r.value for r in rmssd
-            if r.context == "morning"
-        ]
-        if morning_vals and fp.rmssd_morning_avg is not None:
-            alpha = 0.2   # weight of new observation
-            new_morning = float(np.mean(morning_vals))
-            fp.rmssd_morning_avg = round(
-                alpha * new_morning + (1 - alpha) * fp.rmssd_morning_avg, 1
-            )
-            changed.append("rmssd_morning_avg")
-        elif morning_vals:
-            fp.rmssd_morning_avg = round(float(np.mean(morning_vals)), 1)
-            changed.append("rmssd_morning_avg")
+    # morning_avg is owned exclusively by the nightly calibration job (_run_calibration_batch).
+    # It is derived from floor+ceiling via formula and must not be overwritten here.
 
     return changed
 

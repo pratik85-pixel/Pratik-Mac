@@ -25,6 +25,9 @@ import logging
 import uuid
 from datetime import date, datetime, UTC
 from typing import Optional
+from zoneinfo import ZoneInfo
+
+_IST = ZoneInfo("Asia/Kolkata")
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -41,8 +44,10 @@ from coach.prescriber import (
     DailyPlan,
     PrescriberInputs,
     build_daily_plan,
+    build_daily_plan_from_uup,
     plan_to_items_json,
 )
+from api.services.profile_service import load_unified_profile
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +76,7 @@ class PlanService:
         and persisted (replacing any existing row for today).
         """
         uid = parse_uuid(user_id)
-        today = date.today()
+        today = datetime.now(_IST).date()   # IST calendar date to match user's day
         today_dt = datetime(today.year, today.month, today.day, tzinfo=UTC)
 
         if uid is not None and not force_regen:
@@ -81,6 +86,22 @@ class PlanService:
 
         # Build inputs from profile + habits
         inputs = await self._build_inputs(user_id, today)
+
+        # Try LLM plan first — nightly Layer 2 output from unified profile
+        if uid is not None:
+            uup = await load_unified_profile(self._db, uid)
+            if uup is not None:
+                uup_plan = build_daily_plan_from_uup(
+                    uup,
+                    readiness_score=inputs.readiness_score,
+                    stage=inputs.stage,
+                )
+                if uup_plan is not None:
+                    await self._persist_plan(uid, uup_plan, today_dt)
+                    logger.info("plan_source=uup user=%s", user_id)
+                    return uup_plan.model_dump()
+
+        # Fallback: rule-based prescriber
         plan: DailyPlan = build_daily_plan(inputs)
 
         if uid is not None:
@@ -286,13 +307,30 @@ class PlanService:
 
     @staticmethod
     def _row_to_dict(row: DailyPlanRow) -> dict:
+        raw_items = row.items_json or []
+        items = [
+            {
+                "id":                item.get("activity_type_slug") or item.get("activity_slug", ""),
+                "category":          item.get("category", ""),
+                "activity_type_slug": item.get("activity_type_slug") or item.get("activity_slug", ""),
+                "title":             item.get("title") or item.get("display", ""),
+                "target_start_time": item.get("target_start_time", None),
+                "target_end_time":   item.get("target_end_time", None),
+                "duration_minutes":  item.get("duration_minutes") or item.get("duration_min") or 0,
+                "priority":          item.get("priority", "optional"),
+                "rationale":         item.get("rationale") or item.get("reason_note") or item.get("reason_code", ""),
+                "has_evidence":      bool(item.get("has_evidence", False)),
+                "adherence_score":   item.get("adherence_score", None),
+            }
+            for item in raw_items
+        ]
         return {
-            "plan_id":          str(row.id),
+            "id":               str(row.id),
             "plan_date":        row.plan_date.date().isoformat() if row.plan_date else None,
             "day_type":         row.day_type,
             "readiness_score":  row.readiness_score,
             "stage":            row.stage,
-            "items":            row.items_json or [],
+            "items":            items,
             "prescriber_notes": row.prescriber_notes or [],
             "adherence_pct":    row.adherence_pct,
         }
