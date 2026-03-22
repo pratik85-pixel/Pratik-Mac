@@ -1,10 +1,131 @@
 # ZenFlow Verity — Project Context
 
-**Last updated:** 22 March 2026 — Background foreground service fix implemented + deployed (Railway commit 9e49bb5, EAS build 1b1c7843)
+**Last updated:** 22 March 2026 — Six fixes bundled and deployed (backend Railway commit `7d95121`, EAS build `ad2f230b-022b-41ef-8491-18ea5ac1d5f4`)
 
 ---
 
-## Handoff Note — Session of 22 March 2026 — BandWearSession History Design + Backend Build
+## Session — 22 March 2026 (Part 2) — 6-Fix Bundle
+
+### Changes deployed
+
+#### Fix 1 — Option B: Foreground service crash on BLE reconnect ✅ IMPLEMENTED
+
+**Root cause:** `_startForegroundService()` was called every time the Polar sensor reconnected (inside `_startPpiStream()`). On Android 12+, calling `startForegroundService()` while the app is in the background throws `IllegalStateException`. The native library caught this and emitted `onServiceError` to JS. With `alert: true` in App.tsx, this showed a dialog before killing the process.
+
+**Fix (Option B — no restart on reconnect):**
+- Added `private _serviceRunning = false` flag to `PolarService`
+- `_startForegroundService()` returns immediately if `_serviceRunning` is true → service never re-started on reconnect
+- `_serviceRunning = true` set after first successful start
+- `_serviceRunning = false` cleared in `_stopForegroundService()`
+- **Removed** `this._stopForegroundService()` from the `onDeviceDisconnected` callback — service stays alive through the entire BLE reconnect cycle, only stops on user-initiated `stop()`
+- `alert: true` → `alert: false` in `App.tsx` `VIForegroundService.register()` — suppresses the crash dialog even if the error event fires
+
+**Files changed:**
+| File | Change |
+|---|---|
+| `src/services/PolarService.ts` | `_serviceRunning` flag; guarded `_startForegroundService()`; removed stop from disconnect handler |
+| `App.tsx` | `alert: true` → `alert: false` |
+
+---
+
+#### Fix 2 — Tagging persistence across navigation ✅ IMPLEMENTED
+
+**Root cause:** Tags applied by the user were only stored in a local `eventsOverride` React state. When the user navigated away and returned to the screen, `eventsOverride` reset to `null` and the component fell back to `ctx.stressWindows`, which may not have been refreshed with the tagged data yet (race condition with async `ctx.refresh()` + `fetchInFlight` guard).
+
+**Fix:** Removed the `eventsOverride`/`setEventsOverride` local state pattern. Instead:
+- Added `patchStressWindow(id: string, patch: Partial<StressWindow>): void` to `DailyDataContext`
+- After `tagWindow()` succeeds, calls `ctx.patchStressWindow(id, { tag, tag_source })` for today's screen
+- For history screen, patches `localWindows` directly
+- `ctx.stressWindows` now holds the authoritative tagged state — survives navigation, 60s refresh cycle, and app foreground transitions
+- Removed `useEffect(() => setEventsOverride(null), [baseEvents])` — no longer needed
+
+**Files changed:**
+| File | Change |
+|---|---|
+| `src/contexts/DailyDataContext.tsx` | Added `patchStressWindow` to interface + `useCallback` implementation |
+| `src/screens/StressDetailScreen.tsx` | Removed `eventsOverride` state; `handleTag` calls `ctx.patchStressWindow` |
+
+---
+
+#### Fix 3 — Mark plan item complete (missing backend route) ✅ IMPLEMENTED
+
+**Root cause:** Frontend called `PATCH /plan/items/${itemId}/complete` — this route did not exist. Every tap of the checkmark hit a 404, the catch block silently reverted the optimistic update, and the checkmark disappeared.
+
+**Fix:** Added the missing route and service method.
+- New `complete_plan_item(user_id, slug)` method in `PlanService`:
+  - Loads today's plan row
+  - Finds item where `activity_type_slug == slug` (item IDs are slugs, not UUIDs)
+  - Sets `has_evidence = True` on the matching item
+  - Recomputes `plan_row.adherence_pct = completed / total * 100`
+  - `flag_modified(plan_row, "items_json")` + commit
+- New `PATCH /plan/items/{slug}/complete` route in `plan.py` — returns 404 if slug not found
+
+**Files changed:**
+| File | Change |
+|---|---|
+| `api/services/plan_service.py` | Added `complete_plan_item(user_id, slug)` |
+| `api/routers/plan.py` | Added `PATCH /plan/items/{slug}/complete` |
+
+---
+
+#### Fix 4 — Plan live-update (has_evidence persistence) ✅ IMPLEMENTED
+
+**Mechanism:** The `complete_plan_item` service method (Fix 3) mutates `items_json` in the DB row and commits. Subsequent `GET /plan/today` calls return the row from DB via `_row_to_dict`, which reads `item.get("has_evidence", False)` — so the live state is driven by the DB. No additional changes required.
+
+---
+
+#### Fix 5 — Adherence score UI ✅ IMPLEMENTED
+
+**Root cause:**
+- Backend `_row_to_dict()` already returned `adherence_pct: row.adherence_pct` — data was being sent
+- TypeScript `DailyPlan` interface was missing `adherence_pct`
+- PlanScreen only showed `{completed}/{total}` count badge, no visual bar
+
+**Fix:**
+- Added `adherence_pct?: number | null` to `DailyPlan` in `src/types/index.ts`
+- Added thin horizontal progress bar below the count badge in PlanScreen
+  - Width = `plan.adherence_pct` if available, else `completed / total * 100` (local fallback)
+  - Green fill (`ZEN.colors.recovery`), muted percentage label right-aligned
+
+**Files changed:**
+| File | Change |
+|---|---|
+| `src/types/index.ts` | `DailyPlan.adherence_pct?: number | null` added |
+| `src/screens/PlanScreen.tsx` | Adherence bar + styles (`adherenceWrap`, `adherenceTrack`, `adherenceFill`, `adherencePct`) |
+
+---
+
+### Deployment — 22 March 2026 (Part 2)
+
+| Target | Commit / Build | Status |
+|---|---|---|
+| Railway (backend) | `7d95121` | ✅ `railway up --detach` confirmed |
+| EAS Android | `ad2f230b-022b-41ef-8491-18ea5ac1d5f4` | ⏳ Queued — install via `adb install -r` once ready |
+
+**Download APK:**
+```javascript
+// node /tmp/dl_bundle5.js
+const https = require('https');
+const fs = require('fs');
+// Get build URL from: https://expo.dev/accounts/pratik85/projects/zenflow-verity/builds/ad2f230b-022b-41ef-8491-18ea5ac1d5f4
+```
+
+---
+
+### Status tracker (cumulative — 22 March 2026 Part 2)
+
+| Issue | Status |
+|---|---|
+| Background scores freeze | ✅ Fixed + Deployed |
+| Crash on BLE reconnect (Option B guard) | ✅ Fixed + EAS build `ad2f230b` |
+| alert:false (crash dialog suppressed) | ✅ Fixed + EAS build `ad2f230b` |
+| Tagging disappears on navigation | ✅ Fixed + EAS build `ad2f230b` |
+| Mark-complete does nothing | ✅ Fixed + Railway `7d95121` + EAS `ad2f230b` |
+| Plan adherence_pct score UI | ✅ Fixed + EAS build `ad2f230b` |
+
+---
+
+
 
 ---
 
