@@ -1,10 +1,16 @@
 # ZenFlow Verity — Project Context
 
-**Last updated:** 23 March 2026 — Graph freeze + pull-to-refresh fix (frontend-only, OTA-eligible) — graphs now refresh immediately on foreground; pull-to-refresh added to Home, Stress, and Recovery screens ✅
+**Last updated:** 23 March 2026 — v29 deployed: graph freeze fix, pull-to-refresh on Home/Stress/Recovery, 7-day Strain & Recovery chart moved to History tab ✅
 
 ---
 
-## Session — 23 March 2026 — Graph Freeze + Pull-to-Refresh Fix (frontend-only, OTA)
+## Session — 23 March 2026 — 7-Day Chart moved to History (v29)
+
+The `CombinedBalanceChart` (7-Day Strain & Recovery) was moved from `ReadinessOverlayScreen` (Net Balance detail) to `HistoryScreen` (History tab), where it now appears above the sessions list. This was a pure lift-and-shift — no component changes, just new data fetch in `HistoryScreen.load()` and removal of the chart + its state/imports from `ReadinessOverlayScreen`.
+
+---
+
+## Session — 23 March 2026 — Graph Freeze + Pull-to-Refresh Fix (v29, same build)
 
 ### Problems
 1. **Graph freeze on resume**: Stress, Recovery, and Balance graphs showed stale data from the time the app was minimized. Specifically, `StressDetailScreen` and `RecoveryDetailScreen` never called `ctx.refresh()` for today's view in their `useFocusEffect` — only historical dates triggered a reload. The shared context AppState handler had a 2-second `setTimeout` delay that also contributed to a brief stale window.
@@ -48,8 +54,11 @@
 - Historical date views unaffected — `onRefresh` branches on `isToday`
 - `fetchInFlight` guard in context prevents concurrent fetches even with the immediate foreground refresh
 
-### Deployment note
-JS-only change — OTA-eligible via Expo OTA. No EAS build required unless approved.
+### Deployment
+- Frontend commit: `f2694910` — "v29: fix graph freeze, pull-to-refresh (Home/Stress/Recovery), move 7-day chart to History"
+- EAS build: `9ba065d5-3d30-459a-9351-124b80ab1b77`, versionCode 29, profile `preview`
+- APK installed via `adb -s JJCE6H4XJNXS6L8D install -r /tmp/zenflow_v29.apk` ✅
+- Backend commit: `5f07dcb` — docs only (CONTEXT.md), deployed via `railway up --detach`
 
 ---
 
