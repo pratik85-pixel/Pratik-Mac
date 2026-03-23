@@ -1,6 +1,40 @@
 # ZenFlow Verity — Project Context
 
-**Last updated:** 22 March 2026 — BLE background blackout root-cause fixed (EAS build `86b7420c-a085-4ee4-ae58-9838e7c8b0a3`, versionCode 27)
+**Last updated:** 23 March 2026 — JS timer freeze root cause discovered and fixed (EAS build `bfd4e689-c5a4-460d-abfc-9f3f655f6cf6`, versionCode 28) — background_windows confirmed populating during background ✅
+
+---
+
+## Session — 23 March 2026 — JS Timer Freeze Root Cause + Fix (v28) ✅ CONFIRMED WORKING
+
+### Problem (post-v27)
+After v27 was installed, the DB `background_windows` table still showed no new rows during background. Device logcat confirmed BLE callbacks were firing every 5s (`[Polar] callback fired`) — so `autoConnect:true` was working and the GATT connection was alive. But no flush/ingest logs appeared anywhere in the session. A 3.5-minute gap appeared in JS logs (10:20:38 → 10:24:08), then 302 packets were processed all at once when the JS thread woke up.
+
+### True root cause — JS Thread Freeze
+Android's Doze mode puts the JS thread to sleep between BLE notification wakeups. Both `setInterval` and `@supersami/rn-foreground-service`'s `add_task` are JS-layer timers — `add_task` internally uses `setInterval(500ms)` to poll registered tasks. Both freeze when the JS thread sleeps. Beats accumulated in `this.beats[]` but the 60s flush timer never fired because it was frozen. This explained why v27's BLE fix was correct but incomplete.
+
+### Root Cause C Fix — Callback-Driven Flush
+The BLE GATT notification callback (`_parsePpiPacket`) is invoked directly from the native layer and is NOT affected by JS timer freeze — it always runs when the JS thread is woken by a BLE notification. Fix: at the end of `_parsePpiPacket`, after the PPI frame loop, check `Date.now() - this._lastCallbackFlushAt >= FLUSH_INTERVAL_MS` and fire `_flushBeats()` async if true. This guarantees data is sent on the first BLE wakeup after 60s, instead of waiting for a frozen timer.
+
+### New fields / code changes (frontend — `PolarService.ts`)
+- Added `private _lastCallbackFlushAt: number = 0;` — ms timestamp, separate from `_lastFlushAt` (which tracks successful API POST)
+- Added flush trigger block at end of `_parsePpiPacket`, before the outer catch, throttled to `FLUSH_INTERVAL_MS`
+- `_flushBeats()` is concurrent-safe: second call exits via `if (this.beats.length === 0) return`
+
+### Build details
+- Frontend commit: `b77492d5` — "v28: fix background flush — trigger from BLE callback, not frozen JS timer"
+- EAS build: `bfd4e689-c5a4-460d-abfc-9f3f655f6cf6`, versionCode 28, profile `preview`
+- APK installed via `adb -s JJCE6H4XJNXS6L8D install -r /tmp/zenflow_v28.apk`
+
+### Verification — CONFIRMED ✅
+User confirmed: `background_windows` DB table populated with new rows while app was minimized. Background data collection fully operational.
+
+### Status tracker (cumulative — 23 March 2026)
+
+| Issue | versionCode | Status |
+|---|---|---|
+| BLE drops on backgrounding (autoConnect missing) | 27 | ✅ Fixed |
+| Battery whitelist not requested (PowerManager layer) | 27 | ✅ Fixed |
+| JS timer freeze (setInterval + add_task both frozen by Doze) | 28 | ✅ Fixed — callback-driven flush |
 
 ---
 
