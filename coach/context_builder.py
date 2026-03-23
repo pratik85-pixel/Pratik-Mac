@@ -140,6 +140,7 @@ class CoachContext:
     net_balance:     Optional[float] = field(default=None)  # unbounded ±; drives day colour
     stress_score:    Optional[int]   = field(default=None)  # 0–100
     recovery_score:  Optional[int]   = field(default=None)  # 0–100 (waking recovery)
+    readiness_score: Optional[int]   = field(default=None)  # 0–100 (deprecated input; kept for prompt compat)
 
     # ── Psychological profile insight ─────────────────────────────────────────
     psych_insight:   Optional[str] = field(default=None)   # pre-built 1-sentence insight
