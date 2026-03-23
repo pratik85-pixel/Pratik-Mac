@@ -1,6 +1,55 @@
 # ZenFlow Verity — Project Context
 
-**Last updated:** 23 March 2026 — Calibration lock bug fixed (backend commit `7e82948`) — `DailyStressSummary` finalization added to nightly job; tonights run (18:30 UTC / 00:00 IST) will trigger lock for users with 3+ days of data ✅
+**Last updated:** 23 March 2026 — Graph freeze + pull-to-refresh fix (frontend-only, OTA-eligible) — graphs now refresh immediately on foreground; pull-to-refresh added to Home, Stress, and Recovery screens ✅
+
+---
+
+## Session — 23 March 2026 — Graph Freeze + Pull-to-Refresh Fix (frontend-only, OTA)
+
+### Problems
+1. **Graph freeze on resume**: Stress, Recovery, and Balance graphs showed stale data from the time the app was minimized. Specifically, `StressDetailScreen` and `RecoveryDetailScreen` never called `ctx.refresh()` for today's view in their `useFocusEffect` — only historical dates triggered a reload. The shared context AppState handler had a 2-second `setTimeout` delay that also contributed to a brief stale window.
+
+2. **Non-functional pull-to-refresh on HomeScreen**: `HomeScreen` had a `<RefreshControl>` rendered as a zero-size floating sibling inside `<ZenScreen>` (`position: absolute, width: 0, height: 0`). It was never wired to the underlying `ScrollView` because `ZenScreen` didn't accept a `refreshControl` prop.
+
+3. **No pull-to-refresh on Stress/Recovery screens**: `StressDetailScreen` and `RecoveryDetailScreen` had no pull-to-refresh at all.
+
+### Root Causes
+- **`ZenScreenProps`** had no `refreshControl` prop — the underlying `ScrollView` couldn't receive it.
+- **`useFocusEffect` in Stress/Recovery screens** only called `loadHistorical()` when `!isToday` — today's view got no refresh on new focus.
+- **AppState handler in `DailyDataContext`** used `setTimeout(fetchAll, 2000)` — 2-second delay meant graphs showed stale data for 2 seconds even after the JS thread woke.
+
+### Fixes — All frontend, OTA-eligible (no EAS build required)
+
+#### `src/ui/zenflow-ui-kit.tsx`
+- Added `refreshControl?: React.ReactElement` to `ZenScreenProps`
+- Passed `refreshControl` prop through to the internal `ScrollView`
+
+#### `src/contexts/DailyDataContext.tsx`
+- Removed `setTimeout(() => fetchAll(), 2000)` — now calls `fetchAll()` immediately on AppState `'active'`
+- `subscribeFlush` listener continues to fire `fetchAll()` after the beat flush POST completes (second, authoritative refresh)
+
+#### `src/screens/HomeScreen.tsx`
+- Removed the broken zero-size floating `<RefreshControl>`
+- Added `refreshControl={<RefreshControl ...>}` as a prop to `<ZenScreen>` (tinted with `ZEN.colors.readiness`)
+
+#### `src/screens/StressDetailScreen.tsx`
+- Added `RefreshControl` import
+- Added `refreshing` state + `onRefresh` callback (calls `ctx.refresh()` for today, `loadHistorical()` for history)
+- Fixed `useFocusEffect`: now calls `ctx.refresh()` for today's view (previously only history triggered a reload)
+- Added `refreshControl` prop to `<ZenScreen>` (tinted with `ZEN.colors.stress`)
+
+#### `src/screens/RecoveryDetailScreen.tsx`
+- Same changes as `StressDetailScreen` (tinted with `ZEN.colors.recovery`)
+
+### Regression assessment
+- Zero new TypeScript errors introduced (pre-existing errors in `App.tsx`, `HistoryScreen.tsx`, `SessionSummaryScreen.tsx` unchanged)
+- No backend changes, no schema changes, no navigation changes
+- `patchStressWindow`, `eventsOverride`, and tag flow completely untouched
+- Historical date views unaffected — `onRefresh` branches on `isToday`
+- `fetchInFlight` guard in context prevents concurrent fetches even with the immediate foreground refresh
+
+### Deployment note
+JS-only change — OTA-eligible via Expo OTA. No EAS build required unless approved.
 
 ---
 
