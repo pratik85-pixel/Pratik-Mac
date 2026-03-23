@@ -1051,6 +1051,31 @@ class TrackingService:
         instead of the old close_day().
         """
         personal = await _bootstrap_personal_model(self._db, self._uid)
+
+        # ── Finalize past DailyStressSummary rows ─────────────────────────────
+        # Live rows are always written with is_partial_data=True during the day.
+        # The nightly job is the correct close point — flip every row up to and
+        # including target_date so that _count_days_with_data() returns the real
+        # count instead of 0 (the root cause of calibration lock never firing).
+        day_cutoff = datetime(
+            target_date.year, target_date.month, target_date.day, tzinfo=UTC
+        ) + timedelta(days=1)
+        stale_res = await self._db.execute(
+            select(db.DailyStressSummary)
+            .where(db.DailyStressSummary.user_id == self._uid)
+            .where(db.DailyStressSummary.summary_date < day_cutoff)
+            .where(db.DailyStressSummary.is_partial_data == True)  # noqa: E712
+        )
+        stale_rows = stale_res.scalars().all()
+        for row in stale_rows:
+            row.is_partial_data = False
+        if stale_rows:
+            await self._db.flush()
+            logger.info(
+                "Finalized %d DailyStressSummary rows user=%s up_to=%s",
+                len(stale_rows), self._uid, target_date,
+            )
+
         calibration_days = await self._count_days_with_data()
 
         if personal.calibration_locked_at is None:
