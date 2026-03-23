@@ -1,6 +1,42 @@
 # ZenFlow Verity — Project Context
 
-**Last updated:** 23 March 2026 — JS timer freeze root cause discovered and fixed (EAS build `bfd4e689-c5a4-460d-abfc-9f3f655f6cf6`, versionCode 28) — background_windows confirmed populating during background ✅
+**Last updated:** 23 March 2026 — Calibration lock bug fixed (backend commit `7e82948`) — `DailyStressSummary` finalization added to nightly job; tonights run (18:30 UTC / 00:00 IST) will trigger lock for users with 3+ days of data ✅
+
+---
+
+## Session — 23 March 2026 — Calibration Lock Bug Fix (backend-only)
+
+### Problem
+Calibration lock never triggered despite users wearing the band for 3+ days. The lock counter `_count_days_with_data()` queries `DailyStressSummary` rows where `is_partial_data = False`, but no code path ever set that flag to `False`. Every row was created by `_materialise_daily_score()` (called on every 5-min ingest) which hardcodes `is_partial_data = True`. The nightly job called `run_calibration_for_date()` which ran the calibration batch fine (confidence = 1.00 for the test user) but the counter always returned 0, so the lock threshold of 3 days was never reached.
+
+### Root Cause
+The old `close_day()` refactor removed the finalization step without porting it into the new `run_calibration_for_date()`. Dead counter — all 6 production users affected.
+
+### Fix — `api/services/tracking_service.py`
+Added a finalization step at the **start** of `run_calibration_for_date()`, before `_count_days_with_data()` is evaluated:
+- Queries all `DailyStressSummary` rows for the user with `summary_date < target_date + 1 day` AND `is_partial_data = True`
+- Flips each row to `is_partial_data = False` (day is now closed)
+- Flushes, logs count
+- Then calls `_count_days_with_data()` — now returns the correct non-zero count
+- This also acts as a retroactive backfill for all prior accumulated partial rows
+
+### Expected outcome tonight
+On the 18:30 UTC (00:00 IST) nightly run:
+1. All existing partial rows for the user get finalized (days 20, 21, 22, 23 March)
+2. `_count_days_with_data()` returns 4 (≥ 3 threshold)
+3. `calibration_locked_at` is written to `PersonalModel`
+4. `_check_capacity_growth()` begins running for all locked users from tonight onwards
+
+### Regression assessment
+- Backend-only change (1 file, ~25 lines added)
+- No schema changes, no migrations
+- No API contract changes, no frontend impact
+- `_materialise_daily_score()` guard (`if not existing.is_partial_data: return`) remains safe — finalized rows are not overwritten by live ingests
+- `_check_capacity_growth()` will start running post-lock as designed (uses `is_valid=True` BackgroundWindow data, streaks over multiple days — no single-night risk)
+
+### Deployment
+- Backend commit: `7e82948` — "fix: finalize DailyStressSummary rows in nightly job so calibration lock can fire"
+- Deployed: `railway up --detach`, build started ~05:28 UTC, API restarted with scheduler confirmed in logs
 
 ---
 
