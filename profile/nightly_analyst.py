@@ -76,7 +76,7 @@ OUTPUT RULES
 - Maximum 2 must_do items otherwise.
 - If engagement_tier is "at_risk" or "churned", add a short, low-friction item to \
   re-engage the user. Do NOT add hard items that will increase drop-off risk.
-- If readiness_score < 40 ("red day"), only restorative items — no performance items.
+- If net_balance < -20 ("red day"), only restorative items — no performance items.
 - If mood_baseline is "low" for 5+ days, add a mood-positive item and set tone to gentle.
 - Do NOT prescribe social_time if user is introvert AND stress_score > 70.
 - The reason field MUST reference a specific score, trait, or fact from the snapshot.

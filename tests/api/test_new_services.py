@@ -359,12 +359,12 @@ class TestCoachServiceAssessmentWiring:
 
     def test_build_assessment_returns_user_assessment(self):
         from api.services.coach_service import CoachService
-        from coach.assessor import SessionRecord, ReadinessRecord
+        from coach.assessor import SessionRecord, RecoveryRecord
         records = [
             SessionRecord(session_id="s1", session_score=0.75, was_prescribed=True, completed=True),
             SessionRecord(session_id="s2", session_score=0.80, was_prescribed=True, completed=True),
         ]
-        readiness = [ReadinessRecord(date_index=0, readiness=60.0)]
+        readiness = [RecoveryRecord(date_index=0, recovery=60.0)]
         assessment = CoachService.build_assessment(
             current_stage=1,
             session_records=records,
@@ -377,7 +377,7 @@ class TestCoachServiceAssessmentWiring:
 
     def test_morning_brief_with_assessment_includes_summary(self):
         from api.services.coach_service import CoachService
-        from coach.assessor import SessionRecord, ReadinessRecord
+        from coach.assessor import SessionRecord, RecoveryRecord
         fp, profile = self._make_profile_fp()
         records = [
             SessionRecord(session_id="s1", session_score=0.70, was_prescribed=True, completed=True),
@@ -411,7 +411,7 @@ class TestCoachServiceAssessmentWiring:
 
     def test_weekly_review_with_assessment_includes_learning_state(self):
         from api.services.coach_service import CoachService
-        from coach.assessor import SessionRecord, ReadinessRecord
+        from coach.assessor import SessionRecord, RecoveryRecord
         fp, profile = self._make_profile_fp()
         records = [
             SessionRecord(session_id=f"s{i}", session_score=0.72, was_prescribed=True, completed=True)
@@ -420,7 +420,7 @@ class TestCoachServiceAssessmentWiring:
         assessment = CoachService.build_assessment(
             current_stage=1,
             session_records=records,
-            readiness_records=[ReadinessRecord(date_index=i, readiness=62.0) for i in range(7)],
+            readiness_records=[RecoveryRecord(date_index=i, recovery=62.0) for i in range(7)],
         )
         svc = CoachService(llm_client=None)
         result = svc.weekly_review(fp, profile, assessment=assessment)

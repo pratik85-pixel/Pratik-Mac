@@ -14,7 +14,7 @@ from coach.assessor import (
     SESSION_QUALITY_THRESHOLD,
     ConversationSignal,
     DeviationRecord,
-    ReadinessRecord,
+    RecoveryRecord,
     SessionRecord,
     UserAssessment,
     assess_user,
@@ -43,8 +43,8 @@ def _sessions(prescribed: int, completed: int, score: float = 0.5) -> list[Sessi
     return sessions
 
 
-def _readiness(values: list[float]) -> list[ReadinessRecord]:
-    return [ReadinessRecord(date_index=i, readiness=v) for i, v in enumerate(values)]
+def _readiness(values: list[float]) -> list[RecoveryRecord]:
+    return [RecoveryRecord(date_index=i, recovery=v) for i, v in enumerate(values)]
 
 
 # ── Gate 1 — Adherence ────────────────────────────────────────────────────────

@@ -68,10 +68,10 @@ class SessionRecord:
 
 
 @dataclass
-class ReadinessRecord:
-    """Daily readiness score record."""
+class RecoveryRecord:
+    """Daily waking recovery score record."""
     date_index: int    # 0 = oldest, ascending order
-    readiness:  float  # 0–100
+    recovery:   float  # 0–100 (maps to waking_recovery_score)
 
 
 @dataclass
@@ -161,7 +161,7 @@ class UserAssessment:
 def assess_user(
     current_stage: int,
     session_records: list[SessionRecord],
-    readiness_records: list[ReadinessRecord],
+    readiness_records: list[RecoveryRecord],
     deviation_records: Optional[list[DeviationRecord]] = None,
     conversation_signals: Optional[list[ConversationSignal]] = None,
     adherence_by_category: Optional[dict[str, float]] = None,
@@ -177,8 +177,8 @@ def assess_user(
     session_records : list[SessionRecord]
         All qualifying sessions in chronological order (oldest first).
         Should include at least the last 10 prescribed sessions.
-    readiness_records : list[ReadinessRecord]
-        Daily readiness scores in chronological order (oldest first).
+    readiness_records : list[RecoveryRecord]
+        Daily recovery scores in chronological order (oldest first).
         Should span at least 28 days for Gate 2 evaluation.
     deviation_records : list[DeviationRecord] | None
         Recent plan deviations (last 30 days).
@@ -230,7 +230,7 @@ def assess_user(
 def evaluate_level_gate(
     current_stage: int,
     session_records: list[SessionRecord],
-    readiness_records: list[ReadinessRecord],
+    readiness_records: list[RecoveryRecord],
     conversation_signals: Optional[list[ConversationSignal]] = None,
 ) -> LevelGateResult:
     """Standalone level gate evaluation without full user assessment."""
@@ -247,7 +247,7 @@ def evaluate_level_gate(
 def _evaluate_level_gate(
     current_stage: int,
     session_records: list[SessionRecord],
-    readiness_records: list[ReadinessRecord],
+    readiness_records: list[RecoveryRecord],
     conversation_signals: list[ConversationSignal],
 ) -> LevelGateResult:
     if current_stage >= 5:
@@ -354,7 +354,7 @@ def _gate_1_adherence(session_records: list[SessionRecord]) -> GateStatus:
     )
 
 
-def _gate_2_readiness(readiness_records: list[ReadinessRecord]) -> GateStatus:
+def _gate_2_readiness(readiness_records: list[RecoveryRecord]) -> GateStatus:
     """
     Gate 2: 14-day rolling avg readiness ≥ prior 14-day avg + 5 pts.
     Requires at least 28 readiness records.
@@ -374,8 +374,8 @@ def _gate_2_readiness(readiness_records: list[ReadinessRecord]) -> GateStatus:
     recent = readiness_records[-READINESS_WINDOW_DAYS:]
     prior  = readiness_records[-READINESS_WINDOW_DAYS * 2:-READINESS_WINDOW_DAYS]
 
-    recent_avg = sum(r.readiness for r in recent) / len(recent)
-    prior_avg  = sum(r.readiness for r in prior) / len(prior)
+    recent_avg = sum(r.recovery for r in recent) / len(recent)
+    prior_avg  = sum(r.recovery for r in prior) / len(prior)
     delta      = recent_avg - prior_avg
 
     passed = delta >= READINESS_IMPROVEMENT_PTS
@@ -451,7 +451,7 @@ def _check_suppression(signals: list[ConversationSignal]) -> list[str]:
 
 # ── Learning state ────────────────────────────────────────────────────────────
 
-def _classify_learning_state(readiness_records: list[ReadinessRecord]) -> str:
+def _classify_learning_state(readiness_records: list[RecoveryRecord]) -> str:
     """
     Classify the user's learning trajectory from recent readiness trends.
 
@@ -463,8 +463,8 @@ def _classify_learning_state(readiness_records: list[ReadinessRecord]) -> str:
     recent_7  = readiness_records[-7:]
     prior_7   = readiness_records[-14:-7] if len(readiness_records) >= 14 else readiness_records[:7]
 
-    recent_avg = sum(r.readiness for r in recent_7) / len(recent_7)
-    prior_avg  = sum(r.readiness for r in prior_7) / len(prior_7)
+    recent_avg = sum(r.recovery for r in recent_7) / len(recent_7)
+    prior_avg  = sum(r.recovery for r in prior_7) / len(prior_7)
     delta      = recent_avg - prior_avg
 
     if delta >= IMPROVING_DELTA:
@@ -475,7 +475,7 @@ def _classify_learning_state(readiness_records: list[ReadinessRecord]) -> str:
     # Check for plateau: no significant change over PLATEAU_DAYS
     if len(readiness_records) >= PLATEAU_DAYS:
         all_recent = readiness_records[-PLATEAU_DAYS:]
-        values = [r.readiness for r in all_recent]
+        values = [r.recovery for r in all_recent]
         spread = max(values) - min(values)
         if spread < 10.0:   # less than 10 point range = plateau
             return "plateaued"

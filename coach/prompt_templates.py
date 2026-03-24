@@ -225,8 +225,6 @@ def _build_conversation_turn(ctx: CoachContext, tone_desc: str) -> str:
 
     score_line = ""
     parts = []
-    if ctx.readiness_score is not None:
-        parts.append(f"readiness {ctx.readiness_score}/100")
     if ctx.stress_score is not None:
         parts.append(f"stress {ctx.stress_score}/100")
     if ctx.recovery_score is not None:

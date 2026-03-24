@@ -292,7 +292,7 @@ async def _run_assessor(session, user_id) -> "Optional[Any]":
     Fetch the minimal data needed by assessor.assess_user() and call it.
 
     SessionRecord  — last 10 Sessions (context="session"); completed = ended_at IS NOT NULL.
-    ReadinessRecord — last 28 DailyStressSummary rows; readiness = waking_recovery_score.
+    RecoveryRecord — last 28 DailyStressSummary rows; recovery = waking_recovery_score.
     DeviationRecord — last 30 days of PlanDeviation rows.
     adherence_by_category — 7-day adherence per DailyPlan item category.
 
@@ -302,7 +302,7 @@ async def _run_assessor(session, user_id) -> "Optional[Any]":
     from sqlalchemy import select, and_
     import api.db.schema as db
     from coach.assessor import (
-        assess_user, SessionRecord, ReadinessRecord, DeviationRecord,
+        assess_user, SessionRecord, RecoveryRecord, DeviationRecord,
         UserAssessment,
     )
     from datetime import date as date_type
@@ -346,9 +346,9 @@ async def _run_assessor(session, user_id) -> "Optional[Any]":
     )
     rdy_rows = rdy_res.scalars().all()
     readiness_records = [
-        ReadinessRecord(
+        RecoveryRecord(
             date_index=i,
-            readiness=float(row.waking_recovery_score or 0.0),
+            recovery=float(row.waking_recovery_score or 0.0),
         )
         for i, row in enumerate(rdy_rows)
     ]

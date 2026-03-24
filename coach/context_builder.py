@@ -140,7 +140,6 @@ class CoachContext:
     net_balance:     Optional[float] = field(default=None)  # unbounded ±; drives day colour
     stress_score:    Optional[int]   = field(default=None)  # 0–100
     recovery_score:  Optional[int]   = field(default=None)  # 0–100 (waking recovery)
-    readiness_score: Optional[int]   = field(default=None)  # 0–100 (deprecated input; kept for prompt compat)
 
     # ── Psychological profile insight ─────────────────────────────────────────
     psych_insight:   Optional[str] = field(default=None)   # pre-built 1-sentence insight
@@ -181,7 +180,6 @@ def build_coach_context(
     extracted_signals: Optional[list[str]] = None,
     session_data: Optional[dict] = None,
     schedule_note: str = "",
-    readiness_score: Optional[int] = None,   # DEPRECATED — kept for call-site compat; ignored
     net_balance:     Optional[float] = None,
     stress_score:    Optional[int] = None,
     recovery_score:  Optional[int] = None,
@@ -237,8 +235,6 @@ def build_coach_context(
         0–100 Stress Load score — cited by coach in responses.
     recovery_score : int | None
         0–100 Waking Recovery score — cited by coach in responses.
-    readiness_score : int | None
-        DEPRECATED. Kept for call-site compat only — ignored by CoachContext.
     psych_insight : str | None
         Pre-built 1-sentence insight from PsychProfile.coach_insight.
 

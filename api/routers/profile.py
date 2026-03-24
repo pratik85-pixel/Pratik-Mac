@@ -46,7 +46,6 @@ _VALID_CATEGORIES = {"person", "preference", "schedule", "event", "goal", "belie
 # ── Request / Response models ─────────────────────────────────────────────────
 
 class RebuildRequest(BaseModel):
-    readiness_score: Optional[int] = Field(None, ge=0, le=100)
     stress_score:    Optional[int] = Field(None, ge=0, le=100)
     recovery_score:  Optional[int] = Field(None, ge=0, le=100)
 
@@ -128,7 +127,6 @@ async def trigger_rebuild(
         db,
         user_id,
         llm_client=llm_client,
-        readiness_score=body.readiness_score,
         stress_score=body.stress_score,
         recovery_score=body.recovery_score,
     )
