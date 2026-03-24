@@ -491,14 +491,12 @@ async def _rebuild_one_user(
         except Exception as exc:
             log.warning("assessor failed user=%s: %s", user_id, exc)
 
-        # Full rebuild
-        profile = await rebuild_unified_profile(
+        # Full rebuild — DataAssembler-powered path (physio injected into Layer 1)
+        from profile.profile_updater import run_profile_update
+        profile = await run_profile_update(
             session,
             user_id,
             llm_client=llm_client,
-            net_balance=net_balance,
-            stress_score=stress,
-            recovery_score=recovery,
             assessment=assessment,
         )
         result["narrative_version"] = profile.narrative_version
