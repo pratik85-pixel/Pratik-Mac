@@ -28,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from archetypes.scorer import NSHealthProfile
 from coach.context_builder import build_coach_context, CoachContext
 from coach.conversation import ConversationManager, TurnResult
+from coach.data_assembler import assemble_for_user, AssembledContext
 from coach.memory_store import MemoryStore
 from coach.plan_replanner import DailyPrescription, HabitSignal, compute_daily_prescription
 from coach.tone_selector import select_tone
@@ -194,6 +195,39 @@ class ConversationService:
         profile = await model_service.get_profile(user_id)
         self._scratch_profile = profile
 
+        # ── Phase 4: assemble live physio data before building ctx ─────────────
+        uid = parse_uuid(user_id)
+        assembled: Optional[AssembledContext] = None
+        avoid_items_raw: list[dict] = []
+        if db is not None and uid is not None:
+            try:
+                assembled = await assemble_for_user(db, uid)
+                uup = await _profile_svc.load_unified_profile(db, uid)
+                if uup is not None and uup.avoid_items:
+                    avoid_items_raw = [
+                        {"slug_or_label": a.slug_or_label, "reason": a.reason}
+                        for a in uup.avoid_items
+                    ]
+            except Exception:
+                logger.warning(
+                    "DataAssembler failed for user=%s — proceeding without physio", user_id
+                )
+                assembled = None
+                avoid_items_raw = []
+
+        # Extract today scores from assembled trajectory (most recent day)
+        _net_bal: Optional[float] = None
+        _stress_sc: Optional[int] = None
+        _recovery_sc: Optional[int] = None
+        if assembled is not None and assembled.daily_trajectory:
+            _latest = assembled.daily_trajectory[-1]
+            _net_bal = _latest.get("net_balance")
+            raw_sl   = _latest.get("stress_load")
+            raw_wr   = _latest.get("waking_recovery")
+            _stress_sc   = int(round(raw_sl))   if raw_sl   is not None else None
+            _recovery_sc = int(round(raw_wr))   if raw_wr   is not None else None
+        # ── end Phase 4 assembly ───────────────────────────────────────────────
+
         def _build_ctx(
             last_user_said:       Optional[str],
             conversation_summary: Optional[str],
@@ -210,13 +244,17 @@ class ConversationService:
                 last_user_said=last_user_said,
                 conversation_summary=conversation_summary,
                 extracted_signals=extracted_signals,
+                net_balance=_net_bal,
+                stress_score=_stress_sc,
+                recovery_score=_recovery_sc,
+                avoid_items=avoid_items_raw,
             )
 
         result = self._manager.process_turn(conversation_id, user_message, _build_ctx)
 
         # Persist to DB
         if db is not None:
-            uid = parse_uuid(user_id)
+            # uid was already computed above during assembly; reuse it
             if uid is not None:
                 user_event = ConversationEvent(
                     user_id=uid, role="user", content=user_message,

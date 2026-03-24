@@ -212,6 +212,44 @@ Output this JSON:
 """
 
 
+def _build_physio_section(ctx: CoachContext) -> str:
+    """
+    Build the TODAY'S PHYSIO block for conversation turns.
+
+    Injected only when DataAssembler data is available (scores non-None).
+    Returns an empty string when no data is present — prompt is unchanged.
+    Capped at ~300 tokens; shows scores, 7-day direction, and avoid items.
+    """
+    score_parts = []
+    if ctx.stress_score is not None:
+        score_parts.append(f"stress load: {ctx.stress_score}/100")
+    if ctx.recovery_score is not None:
+        score_parts.append(f"recovery: {ctx.recovery_score}/100")
+    if ctx.net_balance is not None:
+        sign = "+" if ctx.net_balance >= 0 else ""
+        score_parts.append(f"balance: {sign}{ctx.net_balance:.1f}")
+
+    if not score_parts:
+        return ""  # no data — omit block entirely
+
+    lines = ["TODAY'S PHYSIO:"]
+    lines.append("    " + " | ".join(score_parts))
+
+    if ctx.trajectory and ctx.trajectory not in ("", "unknown"):
+        lines.append(f"    7-day direction: {ctx.trajectory}")
+
+    if ctx.avoid_items:
+        avoid_strs = [
+            a.get("reason") or a.get("slug_or_label", "")
+            for a in ctx.avoid_items[:2]
+        ]
+        avoid_strs = [s for s in avoid_strs if s]
+        if avoid_strs:
+            lines.append("    Avoid today: " + "; ".join(avoid_strs))
+
+    return "\n".join(lines) + "\n"
+
+
 def _build_conversation_turn(ctx: CoachContext, tone_desc: str) -> str:
     conv_block = ""
     if ctx.conversation_summary:
@@ -223,14 +261,8 @@ def _build_conversation_turn(ctx: CoachContext, tone_desc: str) -> str:
             f"    - {s}" for s in ctx.extracted_signals
         ) + "\n"
 
-    score_line = ""
-    parts = []
-    if ctx.stress_score is not None:
-        parts.append(f"stress {ctx.stress_score}/100")
-    if ctx.recovery_score is not None:
-        parts.append(f"recovery {ctx.recovery_score}/100")
-    if parts:
-        score_line = "CURRENT SCORES: " + ", ".join(parts) + "\n"
+    # TODAY'S PHYSIO — populated by DataAssembler; empty string when no data
+    physio_block = _build_physio_section(ctx)
 
     psych_line = f"PSYCH INSIGHT: {ctx.psych_insight}\n" if ctx.psych_insight else ""
 
@@ -257,7 +289,7 @@ def _build_conversation_turn(ctx: CoachContext, tone_desc: str) -> str:
 TRIGGER: conversation_turn
 TONE: {ctx.tone}
 TONE INSTRUCTION: {tone_desc}
-{personality_block}{facts_block}{engagement_block}{conv_block}{signals_block}{score_line}{psych_line}
+{personality_block}{facts_block}{engagement_block}{conv_block}{signals_block}{physio_block}{psych_line}
 USER JUST SAID:
     "{last_said}"
 

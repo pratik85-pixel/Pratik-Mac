@@ -157,6 +157,10 @@ class CoachContext:
     # Engagement tier from UUP — used by coach to calibrate push vs gentle.
     engagement_tier:  Optional[str] = field(default=None)  # "high"|"medium"|"low"|"at_risk"|"churned"
 
+    # Avoid items from Layer 2 plan guardrails (Phase 3). Each dict has
+    # "slug_or_label" and "reason" keys. Injected into TODAY'S PHYSIO block.
+    avoid_items: list[dict] = field(default_factory=list)
+
 
 # ── Public API ─────────────────────────────────────────────────────────────────
 
@@ -187,6 +191,7 @@ def build_coach_context(
     uup_narrative:   Optional[str] = None,
     user_facts:      Optional[list[str]] = None,
     engagement_tier: Optional[str] = None,
+    avoid_items:     Optional[list[dict]] = None,
 ) -> CoachContext:
     """
     Assemble a complete CoachContext for the given trigger.
@@ -316,6 +321,7 @@ def build_coach_context(
         uup_narrative          = uup_narrative,
         user_facts             = user_facts or [],
         engagement_tier        = engagement_tier,
+        avoid_items            = avoid_items or [],
     )
 
 
