@@ -24,6 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.db.database import get_db, AsyncSessionLocal
 from api.services.tracking_service import TrackingService
+from api.rate_limiter import ingest_limiter
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/tracking", tags=["tracking"])
@@ -289,8 +290,9 @@ class IngestResponse(BaseModel):
 
 @router.post("/ingest", response_model=IngestResponse)
 async def ingest_beats(
-    body: IngestRequest,
-    svc:  TrackingService = Depends(_tracking_svc),
+    body:    IngestRequest,
+    user_id: str           = Depends(_user_id),
+    svc:     TrackingService = Depends(_tracking_svc),
 ) -> IngestResponse:
     """
     Accept a batch of raw PPI beats from the mobile app's BLE bridge.
@@ -303,6 +305,7 @@ async def ingest_beats(
     No PersonalModel is required — windows are always stored.  Stress / recovery
     detection is a no-op (returns early) until the personal baseline is built.
     """
+    ingest_limiter.check(user_id)
     if not body.beats:
         return IngestResponse(windows_processed=0, beats_received=0)
 

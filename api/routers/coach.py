@@ -18,7 +18,7 @@ from datetime import datetime
 from typing import Annotated, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import select, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -29,6 +29,7 @@ from api.services.model_service import ModelService
 from api.services.coach_service import CoachService
 from api.services.conversation_service import ConversationService
 from api.utils import parse_uuid
+from api.rate_limiter import conversation_limiter
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/coach", tags=["coach"])
@@ -53,7 +54,7 @@ def _conv_svc(request: Request) -> ConversationService:
 # ── Request / response models ──────────────────────────────────────────────────
 
 class ConversationTurnRequest(BaseModel):
-    message:         str
+    message:         str = Field(..., max_length=2_000)
     conversation_id: Optional[str] = None  # None → opens a new conversation
 
 
@@ -154,6 +155,7 @@ async def conversation_turn(
     Send a user message and receive the coach's reply.
     Opens a new conversation if no conversation_id is provided.
     """
+    conversation_limiter.check(user_id)
     conversation_id = body.conversation_id
     if conversation_id is None:
         conversation_id = await conv_svc.open(user_id, trigger_context="user_initiated")
