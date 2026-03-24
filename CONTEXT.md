@@ -3069,12 +3069,17 @@ CAPACITY_GROWTH_CONFIRM_DAYS  = 7      # must hold for 7 consecutive days (strea
           fix: do not discard PMD packets when skin contact bit is high (v22)
 ```
 
-### Zenflow_backend (backend) — as of 14 March 2026
+### Zenflow_backend (backend) — as of 24 March 2026
 ```
-(latest)  feat: DailySummaryResponse — add rmssd_morning_avg, rmssd_ceiling, ns_capacity_used
-          feat: tighten stress/recovery thresholds (STRESS_THRESHOLD_PCT=0.75 etc.)
-          start.sh: migrations + uvicorn, fix Dockerfile CMD
-          Remove Procfile startCommand override, simplify railway.toml
+(latest)  Phase 7: security hardening — message cap, outcomes auth, rate limiting [fec2dfd]
+          Phase 6: remove dead assessment wiring from CoachService [bdc4a3a]
+          Phase 5: nudge-check, evening-checkin, night-closure trigger endpoints [06b7a1b]
+          Phase 4: wire DataAssembler into live conversation turns [0f5858e]
+          docs: CONTEXT.md interim update [9bac2bb]
+          Phase 3: morning brief, avoid items, coach watch notes, wake hook [269b289]
+          Phase 2: ProfileUpdater physio injection into Layer 1 nightly prompt [5bb72c2]
+          Phase 1: DataAssembler — single source of truth for LLM data [944cd62]
+          Phase 0: dead code removal, readiness_score cleanup, ReadinessRecord rename [231cebd]
 ```
 
 ---
@@ -3270,55 +3275,69 @@ Note: `railway up` CLI reported "Deploy failed" due to its 2-min health-check re
 | Phase 1 | DataAssembler — single source of truth for LLM data | ✅ Done — commit `944cd62` |
 | Phase 2 | ProfileUpdater — physio injection into Layer 1 nightly prompt | ✅ Done — commit `5bb72c2` |
 | Phase 3 | Morning brief, avoid items, coach watch notes, wake hook | ✅ Done — commit `269b289` |
-| **Phase 4** | **Wire Conversation — DataAssembler into live coach chat** | **⬅ NEXT** |
-| Phase 5 | Trigger endpoints — nudge_check, evening_checkin, night_closure | ⏳ Pending |
-| Phase 6 | Dead code removal — plan_replanner.py, assessor.py, prescriber.py | ⏳ Pending |
-| Phase 7 | Security hardening — rate limits, token cap audit, PII scrub | ⏳ Pending |
+| Phase 4 | Wire Conversation — DataAssembler into live coach chat | ✅ Done — commit `0f5858e` |
+| Phase 5 | Trigger endpoints — nudge_check, evening_checkin, night_closure | ✅ Done — commit `06b7a1b` |
+| Phase 6 | Dead code removal — coach_service.py assessment wiring | ✅ Done — commit `bdc4a3a` |
+| Phase 7 | Security hardening — rate limits, message cap, outcomes auth | ✅ Done — commit `fec2dfd` |
+| **Phase 8** | **JWT/token authentication — replace X-User-Id trust model** | **⬅ NEXT** |
 
-### Phase 4 — Wire Conversation (PENDING APPROVAL)
+### Phase 7 — Security Hardening (DONE — commit `fec2dfd`, deployed 24 Mar 2026)
 
-**Goal:** The LLM coach chat currently has no live physio data. A user asking "how am I doing today?" receives an answer built from static rule-based context, not from their actual scores. Phase 4 connects `DataAssembler` (built in Phase 1) into every conversation turn.
+**What was done:**
 
-**Scope:**
+#### 7A — Message length cap
+- `ConversationTurnRequest.message: str = Field(..., max_length=2_000)` in `api/routers/coach.py`
+- Prevents oversized LLM calls (prompt injection via huge messages, runaway OpenAI cost)
+- Caps per-turn input at ~500 tokens, consistent with DataAssembler 4k context budget
 
-#### 4A — `api/services/conversation_service.py`
-- `process_turn()` calls `assemble_for_user(session, user_id)` before `_build_ctx()`
-- Result passed into `_build_ctx()` as an optional `assembled: AssembledContext | None` arg
-- `build_coach_context()` receives today scores: `net_balance`, `stress_load_score`, `waking_recovery_score`, `avoid_items`
+#### 7B — Outcomes router auth fix
+- Both `GET /api/v1/outcomes/weekly` and `GET /api/v1/outcomes/longitudinal`
+- Changed `Header(default="test")` → `Header(...)` — missing header now returns 422
+- Consistent with every other router in the API
 
-#### 4B — `coach/prompt_templates.py`
-- `_build_conversation_turn()` system prompt gains a new `TODAY'S PHYSIO` section (injected only when `assembled` is not None):
-  - Today's scores in plain English ("stress load today: moderate-high | recovery: strong | balance: +4.2")
-  - 7-day direction ("net balance positive for 4 consecutive days — building momentum")
-  - Avoid items ("Avoid: high-intensity sessions today — residual fatigue signal from last 48h")
-- Section capped at ~300 tokens; overall prompt stays under 6k hard cap
-- Old `ctx.trajectory` (rule-based string) replaced with DataAssembler-driven equivalent
+#### 7C — In-process per-user rate limiter
+- New `api/rate_limiter.py` — `RollingRateLimiter` (stdlib `collections.deque`, no Redis dependency)
+- `conversation_limiter`: 10 turns / 60 s per user → wired to `POST /coach/conversation`
+- `ingest_limiter`: 20 batches / 60 s per user → wired to `POST /tracking/ingest`
+- Resets on process restart (acceptable for a single-instance Railway deployment)
 
-#### 4C — Graceful degradation
-- If `assemble_for_user()` raises (DB timeout, no data), conversation continues without physio section
-- `AssembledContext.estimated_tokens == 0` treated as "no data" — section omitted
-- No hard failure path — LLM call always proceeds
+**Tests added:** 11 new tests across 3 classes:
+- `TestMessageLengthCap` — oversized message → 422, 2000-char boundary, empty message
+- `TestOutcomesHeaderRequired` — missing/present header, both endpoints
+- `TestRollingRateLimiter` — under cap, at cap (429), key isolation, window expiry
 
-**What does NOT change in Phase 4:**
-- `context_builder.py` rule-based path remains (trimmed in Phase 6)
-- `conversation_service.py` existing turn logic unchanged except the assembly call
-- No new DB schema, no migrations
-- No API contract changes — frontend receives the same response shape
+**Baseline after Phase 7:** 47 failures (pre-existing), 1074 passing.
 
-**Files to change:** `api/services/conversation_service.py`, `coach/prompt_templates.py`
-**New tests:** `tests/api/test_conversation_service.py` (assembly wiring), `tests/coach/test_prompt_templates.py` (today's physio section injection/omission)
+**Deferred (Phase 8 scope):**
+- UUID validation on user headers (skipped — existing tests use `"test-user-001"` non-UUID strings; requires full JWT auth to address properly)
+- Redis-backed rate limiting (single-instance now, not needed)
+
+---
+
+### Phase 8 — JWT Authentication (PENDING APPROVAL)
+
+**Goal:** Replace the `X-User-Id: <uuid>` trust model with a proper JWT bearer token, so any client claiming to be a user actually has to prove it. Currently the API accepts any string as a user identity.
+
+**Why now:** Phase 7 closed all low-hanging security issues. JWT authentication is the remaining systemic gap before the app goes to a wider audience.
+
+**High-level scope:**
+- Add `python-jose` + `passlib` (or `PyJWT`) to requirements
+- New `api/auth.py` — `create_access_token`, `verify_token`, `get_current_user` dependency
+- Migration: `User.password_hash` column (new Alembic migration)
+- New `POST /auth/register` + `POST /auth/login` endpoints
+- All routers: replace `Depends(_user_id)` with `Depends(get_current_user)`
+- Frontend: store JWT in SecureStore, send as `Authorization: Bearer <token>` header
+
+**Does not change:** DB schema for any domain tables, all coaching logic, nightly rebuild, scoring pipeline.
+
+---
 
 ### Parked bugs — carry forward from 16 March 2026
 
 | # | Bug | Location | Notes |
 |---|---|---|---|
-| P2 | `morning_brief` endpoint passes no scores to coach | `api/routers/coach.py` | Superseded by Phase 4 — live scores will flow through conversation, not just brief endpoint |
-| P5 | Coach push on capacity growth | `jobs/nightly_rebuild.py` | `_check_capacity_growth()` logs INFO on trigger but no coach nudge/push to user yet — defer to Phase 5 |
-
-### Ongoing rules
-- **No code changes without explicit user approval** (standing instruction)
-- JS/TS changes only → dev server hot reload (no EAS)
-- EAS build only for: native module changes, `app.json`, gradle/manifest changes
+| P2 | `morning_brief` endpoint passes no scores to coach | `api/routers/coach.py` | Superseded by Phase 4 — live scores flow through conversation |
+| P5 | Coach push on capacity growth | `jobs/nightly_rebuild.py` | `_check_capacity_growth()` logs INFO on trigger but no push to user yet |
 
 ---
 
