@@ -79,6 +79,23 @@ class MorningBriefResponse(BaseModel):
     avoid_items:    list[dict]      # avoid items from UUP
 
 
+class NudgeCheckResponse(BaseModel):
+    should_nudge: bool
+    message:      Optional[str]     # populated only when should_nudge=True
+    reason:       str               # "ok"|"outside_window"|"cap_reached"|"no_data"
+
+
+class EveningCheckinResponse(BaseModel):
+    day_summary:      str
+    tonight_priority: str
+    trend_note:       str
+
+
+class NightClosureResponse(BaseModel):
+    updated_narrative: str
+    tomorrow_seed:     str
+
+
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 
 @router.get("/post-session")
@@ -260,6 +277,151 @@ async def get_morning_brief(
         is_stale       = is_stale,
         plan           = plan,
         avoid_items    = avoid,
+    )
+
+
+# ── Phase 5 endpoints ────────────────────────────────────────────────────────
+
+@router.get("/nudge-check", response_model=NudgeCheckResponse)
+async def nudge_check(
+    user_id:   str          = Depends(_user_id),
+    model_svc: ModelService = Depends(_model_svc),
+    coach_svc: CoachService = Depends(_coach_svc),
+    db:        AsyncSession = Depends(get_db),
+) -> NudgeCheckResponse:
+    """
+    Decision gate — should the app push a nudge notification right now?
+
+    Guardrails evaluated in order:
+      1. IST time window (10:00 – 20:00)
+      2. Rolling 4-hour nudge cap (NUDGE_CAP_PER_4H messages max)
+      3. Data availability (trajectory must be non-empty)
+
+    Returns should_nudge=True + generated message only when all gates pass.
+    """
+    from zoneinfo import ZoneInfo
+    from datetime import timedelta
+    from sqlalchemy import func
+    import api.db.schema as _db
+    from coach.data_assembler import assemble_for_user
+    from config import CONFIG
+
+    uid = parse_uuid(user_id)
+    if uid is None:
+        raise HTTPException(status_code=401, detail="Invalid X-User-Id")
+
+    IST = ZoneInfo("Asia/Kolkata")
+    cfg = CONFIG.coach
+    now_ist = datetime.now(IST)
+
+    # Gate 1 — time window
+    if not (cfg.NUDGE_WINDOW_START_HOUR_IST <= now_ist.hour < cfg.NUDGE_WINDOW_END_HOUR_IST):
+        return NudgeCheckResponse(should_nudge=False, message=None, reason="outside_window")
+
+    # Gate 2 — cap check
+    window_start = datetime.now(IST).astimezone().__class__.now() - timedelta(hours=4)
+    # Use UTC-aware cutoff for DB comparison
+    from datetime import timezone as _tz
+    cutoff_utc = datetime.now(_tz.utc) - timedelta(hours=4)
+    cap_result = await db.execute(
+        select(func.count(_db.CoachMessage.id)).where(
+            _db.CoachMessage.user_id    == uid,
+            _db.CoachMessage.message_type == "nudge",
+            _db.CoachMessage.created_at >= cutoff_utc,
+        )
+    )
+    nudges_in_window = cap_result.scalar() or 0
+    if nudges_in_window >= cfg.NUDGE_CAP_PER_4H:
+        return NudgeCheckResponse(should_nudge=False, message=None, reason="cap_reached")
+
+    # Gate 3 — data availability
+    assembled = await assemble_for_user(db, uid)
+    if not assembled.daily_trajectory:
+        return NudgeCheckResponse(should_nudge=False, message=None, reason="no_data")
+
+    # All gates passed — generate a nudge
+    fp      = await model_svc.get_fingerprint(user_id) or _empty_fp()
+    profile = await model_svc.get_profile(user_id)
+    latest  = assembled.daily_trajectory[-1]
+    output  = coach_svc.nudge(
+        fp, profile,
+        stress_score   = latest.get("stress_load"),
+        recovery_score = latest.get("waking_recovery"),
+    )
+    message = output.get("summary") or output.get("action")
+    return NudgeCheckResponse(should_nudge=True, message=message, reason="ok")
+
+
+@router.get("/evening-checkin", response_model=EveningCheckinResponse)
+async def evening_checkin(
+    user_id:   str          = Depends(_user_id),
+    coach_svc: CoachService = Depends(_coach_svc),
+    db:        AsyncSession = Depends(get_db),
+) -> EveningCheckinResponse:
+    """
+    Synthesise today's physio data into a brief evening check-in.
+    Called at ~18:30 IST or on user demand.
+    """
+    from coach.data_assembler import assemble_for_user
+
+    uid = parse_uuid(user_id)
+    if uid is None:
+        raise HTTPException(status_code=401, detail="Invalid X-User-Id")
+
+    assembled = await assemble_for_user(db, uid)
+    output    = coach_svc.evening_checkin(assembled)
+    return EveningCheckinResponse(
+        day_summary      = output.get("day_summary",      ""),
+        tonight_priority = output.get("tonight_priority", ""),
+        trend_note       = output.get("trend_note",       ""),
+    )
+
+
+@router.get("/night-closure", response_model=NightClosureResponse)
+async def night_closure(
+    user_id:   str          = Depends(_user_id),
+    coach_svc: CoachService = Depends(_coach_svc),
+    db:        AsyncSession = Depends(get_db),
+) -> NightClosureResponse:
+    """
+    Generate tomorrow-seed and updated narrative.
+    Gate: must be called at or after 21:30 IST — returns 409 if too early.
+    Persists tomorrow_seed into UserUnifiedProfile.coach_narrative.
+    """
+    from zoneinfo import ZoneInfo
+    from sqlalchemy import select as _select
+    import api.db.schema as _db
+    from coach.data_assembler import assemble_for_user
+    from config import CONFIG
+
+    uid = parse_uuid(user_id)
+    if uid is None:
+        raise HTTPException(status_code=401, detail="Invalid X-User-Id")
+
+    IST = ZoneInfo("Asia/Kolkata")
+    cfg = CONFIG.coach
+    now_ist = datetime.now(IST)
+    if (now_ist.hour, now_ist.minute) < (cfg.NIGHT_CLOSURE_HOUR_IST, cfg.NIGHT_CLOSURE_MINUTE_IST):
+        raise HTTPException(status_code=409, detail="too_early")
+
+    assembled = await assemble_for_user(db, uid)
+    output    = coach_svc.night_closure(assembled)
+
+    tomorrow_seed     = output.get("tomorrow_seed", "")
+    updated_narrative = output.get("updated_narrative", "")
+
+    # Persist tomorrow_seed into coach_narrative on UserUnifiedProfile
+    uup_result = await db.execute(
+        _select(_db.UserUnifiedProfile).where(_db.UserUnifiedProfile.user_id == uid)
+    )
+    uup = uup_result.scalar_one_or_none()
+    if uup is not None:
+        uup.coach_narrative = tomorrow_seed
+        await db.commit()
+
+    return NightClosureResponse(
+        updated_narrative = updated_narrative,
+        tomorrow_seed     = tomorrow_seed,
     )
 
 

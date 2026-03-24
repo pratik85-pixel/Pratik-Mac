@@ -51,4 +51,20 @@ class CoachConfig(BaseSettings):
     # Model used for safety classification — cheaper/faster than main coach model
     SAFETY_MODEL: str = "gpt-4o-mini"
 
+    # ── Nudge Cap ─────────────────────────────────────────────────────────────
+    # downstream: api/routers/coach (nudge-check endpoint)
+    # Max coach nudge messages allowed within a rolling 4-hour window.
+    # Prevents repeated nudge spam if the app polls frequently.
+    NUDGE_CAP_PER_4H: int = 2
+
+    # Earliest IST hour at which nudge-check may return should_nudge=True (10:00)
+    NUDGE_WINDOW_START_HOUR_IST: int = 10
+
+    # Latest IST hour at which nudge-check may return should_nudge=True (20:00)
+    NUDGE_WINDOW_END_HOUR_IST: int = 20
+
+    # Earliest IST hour for night-closure (21:30 → stored as 21, checked with minute)
+    NIGHT_CLOSURE_HOUR_IST: int = 21
+    NIGHT_CLOSURE_MINUTE_IST: int = 30
+
     model_config = {"env_prefix": "ZENFLOW_COACH_", "extra": "ignore"}

@@ -8,6 +8,8 @@ Trigger types handled
     "post_session"     — immediately after a session ends
     "nudge"            — mid-day motivational / reminder
     "weekly_review"    — end-of-week synthesis
+    "evening_checkin"  — end-of-day physio synthesis (Phase 5)
+    "night_closure"    — tomorrow morning-brief seed (Phase 5)
 
 All calls are synchronous wrappers around the coach layer.
 The LLM client is injected so the service can run in offline mode during tests.
@@ -15,9 +17,11 @@ The LLM client is injected so the service can run in offline mode during tests.
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 from datetime import date
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from archetypes.scorer import NSHealthProfile
 from coach.context_builder import build_coach_context
@@ -41,7 +45,169 @@ from coach.prescriber import DailyPlan, plan_to_items_json, build_daily_plan_fro
 from model.baseline_builder import PersonalFingerprint
 from outcomes.session_outcomes import SessionOutcome
 
+if TYPE_CHECKING:
+    from coach.data_assembler import AssembledContext
+
 logger = logging.getLogger(__name__)
+
+# ── Phase 5 inline LLM prompts ───────────────────────────────────────────────
+# These are minimal system prompts for assembled-context triggers.
+# They reuse the same output-format rules as the main coach system prompt.
+
+_EVENING_CHECKIN_SYSTEM = """\
+You are the ZenFlow Verity coach. The user's day is wrapping up.
+Write a brief, grounded evening check-in from the data provided.
+
+Rules
+-----
+- Plain language only. No clinical terms (HRV, RMSSD, cortisol, autonomic, etc.)
+- No medical advice. No disclaimers.
+- day_summary: 1-2 sentences. What the body showed today. Cite one number if available.
+- tonight_priority: 1 short sentence. Single clearest action for tonight.
+- trend_note: 1 sentence. Whether today fits or breaks the recent pattern.
+
+Output ONLY valid JSON — no markdown fences, no commentary:
+{
+  "day_summary":       "...",
+  "tonight_priority":  "...",
+  "trend_note":        "..."
+}
+"""
+
+_NIGHT_CLOSURE_SYSTEM = """\
+You are the ZenFlow Verity coach. The user's day is complete.
+Generate a tomorrow-seed sentence that will prime the morning brief,
+and a brief updated narrative for the user's profile.
+
+Rules
+-----
+- Plain language only. No clinical terms (HRV, RMSSD, cortisol, autonomic, etc.)
+- No medical advice. No disclaimers.
+- updated_narrative: 2-3 sentences. How today changes the understanding of this user.
+- tomorrow_seed: 1 sentence (≤20 words). What the morning brief should lead with tomorrow.
+
+Output ONLY valid JSON — no markdown fences, no commentary:
+{
+  "updated_narrative": "...",
+  "tomorrow_seed":     "..."
+}
+"""
+
+
+# ── Assembled-trigger helper ──────────────────────────────────────────────────
+
+def _build_assembled_user_prompt(assembled: "AssembledContext", trigger_type: str) -> str:
+    """Build a minimal user prompt from AssembledContext for Phase 5 triggers."""
+    traj = assembled.daily_trajectory
+    latest = traj[-1] if traj else {}
+    stress  = latest.get("stress_load",     "unavailable")
+    recov   = latest.get("waking_recovery", "unavailable")
+    balance = latest.get("net_balance",     "unavailable")
+    day_type = latest.get("day_type",       "unavailable")
+
+    traj_summary = (
+        ", ".join(
+            f"{e.get('date','?')} s={e.get('stress_load','?')} r={e.get('waking_recovery','?')}"
+            for e in traj[-7:]
+        )
+        if traj else "no data"
+    )
+
+    stress_label   = assembled.population_stress_label
+    recovery_label = assembled.population_recovery_label
+    narrative      = assembled.coach_narrative or "none"
+    facts          = "\n".join(f"- {f}" for f in assembled.user_facts[:5]) or "none"
+
+    return f"""\
+TRIGGER: {trigger_type}
+
+TODAY
+    Stress load: {stress} (population: {stress_label})
+    Waking recovery: {recov} (population: {recovery_label})
+    Net balance: {balance}
+    Day type: {day_type}
+
+7-DAY TRAJECTORY (oldest→newest):
+    {traj_summary}
+
+PROFILE NARRATIVE:
+{narrative}
+
+USER FACTS:
+{facts}
+"""
+
+
+def _run_assembled_trigger(
+    assembled: "AssembledContext",
+    *,
+    trigger_type: str,
+    llm_client: Optional[Any],
+    system_prompt: str,
+    user_name: str = "there",
+) -> dict:
+    """
+    Run an assembled-context trigger through the LLM (or deterministic fallback).
+
+    Returns a dict matching the output schema for trigger_type.
+    """
+    user_prompt = _build_assembled_user_prompt(assembled, trigger_type)
+
+    if llm_client is None:
+        return _assembled_fallback(assembled, trigger_type)
+
+    try:
+        response = llm_client.chat.completions.create(
+            model="gpt-4o",
+            temperature=0.6,
+            max_tokens=300,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user",   "content": user_prompt},
+            ],
+        )
+        raw_text = response.choices[0].message.content or ""
+        # Strip markdown fences if present
+        raw_text = re.sub(r"^```[a-z]*\n?", "", raw_text.strip())
+        raw_text = re.sub(r"\n?```$", "", raw_text.strip())
+        parsed = json.loads(raw_text)
+        return parsed
+    except Exception as exc:
+        logger.warning("assembled_trigger LLM failed trigger=%s: %s", trigger_type, exc)
+        return _assembled_fallback(assembled, trigger_type)
+
+
+def _assembled_fallback(assembled: "AssembledContext", trigger_type: str) -> dict:
+    """Deterministic fallback when LLM is unavailable."""
+    traj = assembled.daily_trajectory
+    latest = traj[-1] if traj else {}
+    stress  = latest.get("stress_load",     None)
+    recov   = latest.get("waking_recovery", None)
+    balance = latest.get("net_balance",     None)
+
+    if trigger_type == "evening_checkin":
+        if stress is not None and recov is not None:
+            s_str = f"Stress load reached {stress}, recovery at {recov}."
+        else:
+            s_str = "Physio data is still being collected."
+        return {
+            "day_summary":      s_str,
+            "tonight_priority": "A short wind-down routine will help the system reset overnight.",
+            "trend_note":       "Today's data will inform tomorrow's morning brief.",
+        }
+    if trigger_type == "night_closure":
+        if balance is not None:
+            b_str = f"Today's net balance was {balance:+.0f}." if isinstance(balance, (int, float)) else f"Today's net balance: {balance}."
+        else:
+            b_str = "Today's data is being tallied."
+        return {
+            "updated_narrative": f"{b_str} The pattern from today will be reflected in tomorrow's plan.",
+            "tomorrow_seed":     "Start tomorrow with a baseline check before committing to intensity.",
+        }
+    # Generic
+    return {"summary": "Check-in noted.", "action": "Resume your plan tomorrow."}
+
+
 
 
 class CoachService:
@@ -216,3 +382,46 @@ class CoachService:
         signals:  list[HabitSignal],
     ) -> DailyPrescription:
         return compute_daily_prescription(profile, habit_signals=signals)
+
+    # ── Phase 5 assembled-context triggers ───────────────────────────────────
+    # These bypasses CoachContext / prompt_templates and build minimal inline
+    # prompts from AssembledContext — appropriate for data synthesis triggers
+    # that do not require a prescription or fingerprint.
+
+    def evening_checkin(
+        self,
+        assembled: "AssembledContext",
+        *,
+        user_name: str = "there",
+    ) -> dict:
+        """
+        Synthesise today's physio trajectory into a brief evening check-in.
+
+        Returns dict with keys: day_summary, tonight_priority, trend_note.
+        """
+        return _run_assembled_trigger(
+            assembled,
+            trigger_type="evening_checkin",
+            llm_client=self._llm,
+            system_prompt=_EVENING_CHECKIN_SYSTEM,
+            user_name=user_name,
+        )
+
+    def night_closure(
+        self,
+        assembled: "AssembledContext",
+        *,
+        user_name: str = "there",
+    ) -> dict:
+        """
+        Generate a tomorrow seed and updated narrative for the morning brief.
+
+        Returns dict with keys: updated_narrative, tomorrow_seed.
+        """
+        return _run_assembled_trigger(
+            assembled,
+            trigger_type="night_closure",
+            llm_client=self._llm,
+            system_prompt=_NIGHT_CLOSURE_SYSTEM,
+            user_name=user_name,
+        )

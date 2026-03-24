@@ -35,6 +35,10 @@ _REQUIRED_FIELDS: dict[str, set[str]] = {
     "nudge":         {"summary", "action", "follow_up_question"},
     "weekly_review": {"summary", "week_narrative", "dimension_spotlight", "action", "follow_up_question"},
     "conversation_turn": {"reply", "follow_up_question"},
+    # Phase 5 triggers
+    "nudge_check":       {"should_nudge", "reason"},
+    "evening_checkin":   {"day_summary", "tonight_priority", "trend_note"},
+    "night_closure":     {"updated_narrative", "tomorrow_seed"},
 }
 
 # ── Word length constraints ────────────────────────────────────────────────────
