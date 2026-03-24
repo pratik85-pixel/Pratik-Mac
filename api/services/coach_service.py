@@ -33,14 +33,6 @@ from coach.plan_replanner import (
     DailyPrescription,
     HabitSignal,
 )
-from coach.assessor import (
-    UserAssessment,
-    SessionRecord,
-    RecoveryRecord,
-    DeviationRecord,
-    ConversationSignal,
-    assess_user,
-)
 from coach.prescriber import DailyPlan, plan_to_items_json, build_daily_plan_from_uup
 from model.baseline_builder import PersonalFingerprint
 from outcomes.session_outcomes import SessionOutcome
@@ -230,7 +222,6 @@ class CoachService:
         user_name:          str = "there",
         habit_signals:      Optional[list[HabitSignal]] = None,
         sessions_this_week: int = 0,
-        assessment:         Optional[UserAssessment] = None,
         stress_score:       Optional[int] = None,
         recovery_score:     Optional[int] = None,
         psych_insight:      Optional[str] = None,
@@ -240,8 +231,6 @@ class CoachService:
         tone         = select_tone(profile, milestone_detected=milestone is not None)
 
         extra_signals: list[str] = []
-        if assessment is not None:
-            extra_signals.append(f"assessment: {assessment.summary_note}")
 
         session_data = {
             "score":         outcome.session_score,
@@ -285,7 +274,6 @@ class CoachService:
         *,
         user_name:     str = "there",
         habit_signals: Optional[list[HabitSignal]] = None,
-        assessment:    Optional[UserAssessment] = None,
         stress_score:    Optional[int] = None,
         recovery_score:  Optional[int] = None,
         psych_insight:   Optional[str] = None,
@@ -294,8 +282,6 @@ class CoachService:
         tone         = select_tone(profile)
 
         extra_signals: list[str] = []
-        if assessment is not None:
-            extra_signals.append(f"assessment: {assessment.summary_note}")
 
         ctx = build_coach_context(
             profile,
@@ -319,20 +305,12 @@ class CoachService:
         *,
         user_name:          str = "there",
         sessions_this_week: int = 0,
-        assessment:         Optional[UserAssessment] = None,
     ) -> dict:
         prescription = self._prescription(profile, [])
         milestone    = detect_milestone(profile, fingerprint)
         tone         = select_tone(profile, milestone_detected=milestone is not None)
 
         extra_signals: list[str] = []
-        if assessment is not None:
-            extra_signals.append(f"assessment: {assessment.summary_note}")
-            extra_signals.append(f"learning_state: {assessment.learning_state}")
-            if assessment.level_gate.ready:
-                extra_signals.append(
-                    f"level_gate: ready to advance to stage {assessment.level_gate.next_stage}"
-                )
 
         ctx = build_coach_context(
             profile,
@@ -347,32 +325,6 @@ class CoachService:
             extracted_signals=extra_signals if extra_signals else None,
         )
         return generate_response(ctx, profile, llm_client=self._llm)
-
-    # ── Assessment helper ──────────────────────────────────────────────────────
-
-    @staticmethod
-    def build_assessment(
-        current_stage: int,
-        session_records: list[SessionRecord],
-        readiness_records: list[RecoveryRecord],
-        deviation_records: Optional[list[DeviationRecord]] = None,
-        conversation_signals: Optional[list[ConversationSignal]] = None,
-        sport_stressor_slugs: Optional[list[str]] = None,
-    ) -> UserAssessment:
-        """
-        Run the 3-gate assessor and return a full UserAssessment.
-
-        All inputs are plain dataclass types — no DB handles needed.
-        Callers (routers/background tasks) are responsible for loading data.
-        """
-        return assess_user(
-            current_stage=current_stage,
-            session_records=session_records,
-            readiness_records=readiness_records,
-            deviation_records=deviation_records,
-            conversation_signals=conversation_signals,
-            sport_stressors=sport_stressor_slugs,
-        )
 
     # ── Internal helpers ─────────────────────────────────────────────────────
 
