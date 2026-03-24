@@ -1,6 +1,151 @@
 # ZenFlow Verity — Project Context
 
-**Last updated:** 23 March 2026 — v29 deployed: graph freeze fix, pull-to-refresh on Home/Stress/Recovery, 7-day Strain & Recovery chart moved to History tab ✅
+**Last updated:** 24 March 2026 — Score Architecture Overhaul Phases 0–3 complete: DataAssembler, ProfileUpdater with physio injection, morning brief infrastructure, wake hook ✅  
+*(Interim update — final update on CONTEXT.md after all phases complete)*
+
+---
+
+## Session — 24 March 2026 — Score Architecture Overhaul: Phase 3 — Morning Brief, Avoid Items, Coach Watch Notes, Wake Hook
+
+**Commit:** `269b289` — "Phase 3: Morning brief, avoid items, coach watch notes, wake hook" (14 files, +765/−48)
+
+### What was built
+
+#### 1. DB Migration — `k6l7m8n9o0p1`
+New columns on `UserUnifiedProfile`:
+- `morning_brief_text`, `morning_brief_evidence`, `morning_brief_one_action`, `morning_brief_day_state`, `morning_brief_day_confidence`, `morning_brief_generated_at` — store the last generated morning brief (idempotent, re-run safe)
+- `coach_watch_notes` — Layer 1 narrative addition (LLM-generated flags the coach should track during conversations)
+- `avoid_items_json` — JSONB list of `AvoidItem` objects from the Layer 2 plan guardrails
+- `morning_brief_opening_balance_used` — the opening balance at generation time (for cache invalidation)
+
+#### 2. Layer 1 — COACH WATCH NOTES (`profile/nightly_analyst.py`)
+- `nightly_analyst.py` system prompt extended: LLM now produces a `"coach_watch_notes"` key in JSON output alongside `"narrative"`
+- Output template updated; structured as a flat list of watch items (≤4 bullets, each ≤20 words)
+- Deterministic fallback returns empty list if LLM output missing or malformed
+- 9 existing nightly analyst tests updated, 2 new tests added
+
+#### 3. Layer 2 — Avoid Items (`profile/profile_schema.py`, `profile/plan_guardrails.py`, `profile/nightly_analyst.py`)
+- New `AvoidItem` dataclass: `reason` (str), `duration_days` (int)
+- `ValidatedPlan.avoid_items` field added
+- `nightly_analyst.py` `_parse_plan_json()` now returns `(plan_json, coach_watch_notes, avoid_items)` tuple instead of plain plan JSON
+- `api/services/profile_service.py` persists `avoid_items_json` + `coach_watch_notes` after nightly run
+
+#### 4. Morning Brief Generator (`coach/morning_brief.py`)
+New file: `generate_morning_brief(session_factory, user_id, opening_balance, llm_client)`.
+- Idempotent: skips generation if today's brief at this opening_balance already exists in `UserUnifiedProfile`
+- Pulls 7-day trajectory from `DailyStressSummary` (gap-annotated: fills missing days as `-/-`)
+- Calls GPT-4o with structured JSON schema: `{day_state, day_confidence, brief_text, evidence, one_action}`
+- Deterministic fallback on LLM failure — uses trajectory to pick adaptive/hold/recovery state
+- Persists result to `UserUnifiedProfile` cols, returns dict
+
+#### 5. Wake Hook (`api/services/tracking_service.py`, `api/routers/tracking.py`)
+`POST /tracking/morning-read` now calls `generate_morning_brief()` after a successful morning read is persisted. The opening balance from that morning read is passed into the generator (cache key). A failed brief generation never raises — logged as WARNING only.
+
+`api/main.py` — `AsyncSessionLocal` session factory exported and passed into wake hook.
+
+#### 6. Morning Brief Endpoint (`api/routers/coach.py`)
+`GET /coach/morning-brief` — returns current `UserUnifiedProfile` fields:
+- `brief_text`, `evidence`, `one_action` (from morning brief generator)
+- `avoid_items` (from Layer 2 plan guardrails, JSONB)
+- `generated_at` (ISO timestamp)
+
+#### Schema note
+Morning brief response uses `{brief_text, evidence, one_action}` — **not** the `{dos, donts, watch_for}` schema sketched in the original 7-phase plan. This is intentional for Phase 3: `dos/donts/watch_for` alignment is deferred to Phase 4 trigger-endpoint cleanup.
+
+### Test baseline
+- 988 tests passing, 49 pre-existing failures (unchanged)
+
+### Deployment
+- Committed to `main`, awaiting next Railway deploy cycle
+
+---
+
+## Session — 24 March 2026 — Score Architecture Overhaul: Phase 2 — DataAssembler Physio Injection into Layer 1 Prompt
+
+**Commit:** `5bb72c2` — "Phase 2: DataAssembler physio injection into Layer 1 prompt" (3 files, +522/−5)
+
+### What was built
+
+#### `profile/profile_updater.py` (new file, 240 lines)
+`ProfileUpdater` class — called from `nightly_rebuild.py` as a pre-pass before `nightly_analyst.py`.
+
+**Responsibilities:**
+- Calls `assemble_for_user()` to get a fresh `AssembledContext` for the user
+- Injects physio data derived from `AssembledContext` into the Layer 1 system prompt for `NightlyAnalyst`:
+  - 7-day trajectory (daily `stress_load`, `waking_recovery`, `net_balance`, `day_type`)
+  - 24h stress/recovery window counts and dominant tags
+  - Background RMSSD bins (4h buckets as % of ceiling)
+  - Population-relative labels (`stress_label`, `recovery_label`)
+  - Personal model calibration status
+- Builds prompt section strings with token-awareness (honours the 4k cap already enforced by `DataAssembler`)
+- Produces a `ProfilePhysioPayload` dataclass that `NightlyAnalyst` can merge into its context
+
+#### `jobs/nightly_rebuild.py` (updated)
+- Instantiates `ProfileUpdater` and calls `updater.build_physio_payload(user_id, db)` per user before `analyst.run()`
+- Passes `physio_payload` into `analyst.run()` as a new optional kwarg
+- Wrapped in try/except — no user is skipped if PhysioUpdater fails for them
+
+#### Tests — `tests/profile/test_profile_updater.py` (new file, 279 lines)
+24 unit tests: physio section formatting, token budget enforcement, graceful degradation on missing data.
+
+### Test baseline
+- 988 passing, 49 pre-existing failures (unchanged)
+
+---
+
+## Session — 24 March 2026 — Score Architecture Overhaul: Phase 1 — DataAssembler (Single Source of Truth)
+
+**Commit:** `944cd62` — "phase1: add DataAssembler - single source of truth for LLM data assembly" (2 files, +761)
+
+### What was built
+
+#### `coach/data_assembler.py` (489 lines)
+`AssembledContext` dataclass + `assemble_for_user(session, user_id)` async function.
+
+**Data sources queried (8 tables):**
+| Field | Source table | Notes |
+|---|---|---|
+| `personal_model` | `PersonalModel` | floor_ms, ceiling_ms, morning_avg_ms, is_calibrated |
+| `daily_trajectory` | `DailyStressSummary` | last 7 days, oldest→newest |
+| `stress_windows_24h` | `StressWindow` | count, avg_suppression_pct, top_tag |
+| `recovery_windows_24h` | `RecoveryWindow` | count, sources {tag: count} |
+| `background_bins` | `BackgroundWindow` | 4-hour buckets, rmssd_pct_ceiling |
+| `habit_events` | `HabitEvent` | plain-English, last 72h |
+| `user_facts` | `UserFact` | confidence ≥ 0.7 |
+| `coach_narrative` | `UserUnifiedProfile` | ≤ 800 chars |
+
+**Key design rules:**
+- RMSSD values normalized to `pct_ceiling` — never raw ms in LLM prompts
+- Token cap enforced at 4k chars total: sections pruned in order (bins → trajectory → events → facts) until under cap
+- Graceful degradation: every section defaults to empty if no DB rows
+- Population labels derived from most recent trajectory row
+
+#### Tests — `tests/coach/test_data_assembler.py` (272 lines)
+45 unit tests: all 8 source fetchers, token cap enforcement, population label logic, edge cases (no data, partial data).
+
+---
+
+## Session — 24 March 2026 — Score Architecture Overhaul: Phase 0 — Dead Code Removal, ReadinessRecord → RecoveryRecord
+
+**Commit:** `231cebd` — "phase0: remove readiness_score dead code, rename ReadinessRecord to RecoveryRecord" (9 files, +30/−42)
+
+### What was removed
+- `readiness_score` field removed from `CoachContext` (coach/assessor.py)
+- `readiness_score` removed from `build_coach_context()` (coach/context_builder.py) — was passed as `None` always
+- `readiness_score` removed from `nudge()` and `post_session()` call sites (api/services/coach_service.py)
+- `readiness_score` removed from `PrescriberInputs` (api/routers/profile.py)
+- `readiness_score` stray field removed from `prompt_templates.py`
+
+### What was renamed
+- `ReadinessRecord` → `RecoveryRecord` in `jobs/nightly_rebuild.py` and `profile/nightly_analyst.py`
+  - Reason: "readiness" implied a score that doesn't exist; the record represents recovery/physiological state from the nightly analyst pass
+
+### Test updates
+- `tests/api/test_new_services.py` — 5 tests updated (CoachContext construction, nudge/post_session stubs)
+- `tests/coach/test_assessor.py` — 3 tests updated (AssessorInputs field removal)
+
+### Rationale
+Before building the DataAssembler, the dead `readiness_score` field caused confusion — it was present in multiple interfaces but always `None`. Removing it first made Phase 1 and 2 much cleaner. `ReadinessRecord` rename aligned terminology with actual domain language.
 
 ---
 
@@ -3112,6 +3257,68 @@ Note: `railway up` CLI reported "Deploy failed" due to its 2-min health-check re
 - Scores no longer reset — URL saved in Settings persists across cold starts
 - History, Plan, Coach, and WebSocket sessions all use the signed-in user's UUID, not a stale test UUID
 - Changing the URL in Settings now actually sticks
+
+---
+
+## What to Work on Next (as of 24 March 2026)
+
+### Score Architecture Overhaul — Phase Progress
+
+| Phase | Name | Status |
+|---|---|---|
+| Phase 0 | Dead code removal (readiness_score, ReadinessRecord rename) | ✅ Done — commit `231cebd` |
+| Phase 1 | DataAssembler — single source of truth for LLM data | ✅ Done — commit `944cd62` |
+| Phase 2 | ProfileUpdater — physio injection into Layer 1 nightly prompt | ✅ Done — commit `5bb72c2` |
+| Phase 3 | Morning brief, avoid items, coach watch notes, wake hook | ✅ Done — commit `269b289` |
+| **Phase 4** | **Wire Conversation — DataAssembler into live coach chat** | **⬅ NEXT** |
+| Phase 5 | Trigger endpoints — nudge_check, evening_checkin, night_closure | ⏳ Pending |
+| Phase 6 | Dead code removal — plan_replanner.py, assessor.py, prescriber.py | ⏳ Pending |
+| Phase 7 | Security hardening — rate limits, token cap audit, PII scrub | ⏳ Pending |
+
+### Phase 4 — Wire Conversation (PENDING APPROVAL)
+
+**Goal:** The LLM coach chat currently has no live physio data. A user asking "how am I doing today?" receives an answer built from static rule-based context, not from their actual scores. Phase 4 connects `DataAssembler` (built in Phase 1) into every conversation turn.
+
+**Scope:**
+
+#### 4A — `api/services/conversation_service.py`
+- `process_turn()` calls `assemble_for_user(session, user_id)` before `_build_ctx()`
+- Result passed into `_build_ctx()` as an optional `assembled: AssembledContext | None` arg
+- `build_coach_context()` receives today scores: `net_balance`, `stress_load_score`, `waking_recovery_score`, `avoid_items`
+
+#### 4B — `coach/prompt_templates.py`
+- `_build_conversation_turn()` system prompt gains a new `TODAY'S PHYSIO` section (injected only when `assembled` is not None):
+  - Today's scores in plain English ("stress load today: moderate-high | recovery: strong | balance: +4.2")
+  - 7-day direction ("net balance positive for 4 consecutive days — building momentum")
+  - Avoid items ("Avoid: high-intensity sessions today — residual fatigue signal from last 48h")
+- Section capped at ~300 tokens; overall prompt stays under 6k hard cap
+- Old `ctx.trajectory` (rule-based string) replaced with DataAssembler-driven equivalent
+
+#### 4C — Graceful degradation
+- If `assemble_for_user()` raises (DB timeout, no data), conversation continues without physio section
+- `AssembledContext.estimated_tokens == 0` treated as "no data" — section omitted
+- No hard failure path — LLM call always proceeds
+
+**What does NOT change in Phase 4:**
+- `context_builder.py` rule-based path remains (trimmed in Phase 6)
+- `conversation_service.py` existing turn logic unchanged except the assembly call
+- No new DB schema, no migrations
+- No API contract changes — frontend receives the same response shape
+
+**Files to change:** `api/services/conversation_service.py`, `coach/prompt_templates.py`
+**New tests:** `tests/api/test_conversation_service.py` (assembly wiring), `tests/coach/test_prompt_templates.py` (today's physio section injection/omission)
+
+### Parked bugs — carry forward from 16 March 2026
+
+| # | Bug | Location | Notes |
+|---|---|---|---|
+| P2 | `morning_brief` endpoint passes no scores to coach | `api/routers/coach.py` | Superseded by Phase 4 — live scores will flow through conversation, not just brief endpoint |
+| P5 | Coach push on capacity growth | `jobs/nightly_rebuild.py` | `_check_capacity_growth()` logs INFO on trigger but no coach nudge/push to user yet — defer to Phase 5 |
+
+### Ongoing rules
+- **No code changes without explicit user approval** (standing instruction)
+- JS/TS changes only → dev server hot reload (no EAS)
+- EAS build only for: native module changes, `app.json`, gradle/manifest changes
 
 ---
 
