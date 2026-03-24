@@ -18,11 +18,11 @@ import logging
 from datetime import UTC, date, datetime, timedelta
 from typing import Annotated, Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from api.db.database import get_db
+from api.db.database import get_db, AsyncSessionLocal
 from api.services.tracking_service import TrackingService
 
 logger = logging.getLogger(__name__)
@@ -38,10 +38,17 @@ async def _user_id(x_user_id: Annotated[str, Header()]) -> str:
 
 
 async def _tracking_svc(
+    request: Request,
     user_id: str = Depends(_user_id),
     db: AsyncSession = Depends(get_db),
 ) -> TrackingService:
-    return TrackingService(db_session=db, user_id=user_id)
+    llm_client = getattr(request.app.state, "llm_client", None)
+    return TrackingService(
+        db_session=db,
+        user_id=user_id,
+        session_factory=AsyncSessionLocal,
+        llm_client=llm_client,
+    )
 
 
 # ── Response models ────────────────────────────────────────────────────────────

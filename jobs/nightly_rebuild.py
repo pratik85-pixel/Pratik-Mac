@@ -8,7 +8,7 @@ Runs these tasks sequentially for all active users:
   2. Psych profile streak increment (yesterday's adherence → streak_current)
   3. Auto-tag pass stub (placeholder — pattern model not yet fully wired)
 
-Intended to run once per night (e.g. 02:00 local server time) via cron,
+Intended to run once per night at 00:00 IST (18:30 UTC) via APScheduler,
 APScheduler, or a cloud scheduler (AWS EventBridge, GCP Cloud Scheduler, etc.).
 
 Usage

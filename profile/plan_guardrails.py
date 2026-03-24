@@ -27,7 +27,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Optional
 
-from profile.profile_schema import PlanItem, UnifiedProfile
+from profile.profile_schema import AvoidItem, PlanItem, UnifiedProfile
 from tagging.activity_catalog import CATALOG
 
 log = logging.getLogger(__name__)
@@ -75,9 +75,10 @@ _FALLBACK_ITEM = PlanItem(
 
 @dataclass
 class ValidatedPlan:
-    items:           list[PlanItem] = field(default_factory=list)
-    guardrail_notes: list[str]      = field(default_factory=list)
-    was_modified:    bool           = False
+    items:           list[PlanItem]  = field(default_factory=list)
+    avoid_items:     list[AvoidItem] = field(default_factory=list)
+    guardrail_notes: list[str]       = field(default_factory=list)
+    was_modified:    bool            = False
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -86,6 +87,7 @@ def validate_plan(
     items: list[PlanItem],
     profile: UnifiedProfile,
     *,
+    avoid_items: Optional[list[AvoidItem]] = None,
     net_balance: Optional[float] = None,
     stress_score: Optional[int] = None,
     recovery_score: Optional[int] = None,
@@ -96,7 +98,9 @@ def validate_plan(
     Rules are applied sequentially — each rule sees the output of the prior one.
     The plan after all rules is guaranteed non-empty.
     """
-    result   = ValidatedPlan(items=list(items))
+    # Cap avoid_items at 3 (LLM is instructed to send ≤3 but enforce here too)
+    capped_avoid = (avoid_items or [])[:3]
+    result   = ValidatedPlan(items=list(items), avoid_items=capped_avoid)
     nb       = net_balance if net_balance is not None else 0.0
     ss       = stress_score    if stress_score    is not None else 50
     disc     = profile.psych.discipline_index

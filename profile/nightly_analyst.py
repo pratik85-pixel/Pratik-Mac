@@ -35,6 +35,7 @@ from datetime import date, datetime, UTC
 from typing import Any, Optional
 
 from profile.profile_schema import (
+    AvoidItem,
     UnifiedProfile,
     PlanItem,
 )
@@ -58,20 +59,41 @@ OUTPUT RULES
 - The WHAT CHANGED SINCE section must list concrete data changes, not impressions.
 - The ENGAGEMENT PROFILE section must be honest — if engagement is dropping, say so clearly.
 - The WATCH TODAY section must contain 1–3 actionable coach considerations for tomorrow.
+
+COACH WATCH NOTES RULES (the COACH WATCH NOTES section only)
+- Write 3–5 bullets. Each bullet is a specific observation the user would recognise about themselves.
+- Write in simple Indian English. Short sentences. Maximum 20 words per bullet.
+- Sound like a knowledgeable friend, not a clinical system.
+- Ground every bullet in a specific data signal in the input — no vague generalisations.
+- This section is shown to the user in the app — write for the user, not the developer.
+- Examples of good bullets:
+    "You haven't worn your band for 4 of the last 7 days — we're missing data."
+    "Your stress has been running high since Tuesday — 5 days in a row now."
+    "You tend to sleep late and your recovery has been poor most mornings."
+    "Stress usually hits you hardest between 9 and 11am on weekdays."
+    "Walking has helped your recovery every time you've done it this week."
+- If a data point is unavailable, skip that bullet — do not write "Insufficient data" here.
 """
 
 _LAYER2_SYSTEM = """\
 You are ZenFlow's daily planning engine. Given a user's personality snapshot and \
-their physiological scores for today, output a personalized daily plan as a JSON array.
+their physiological scores for today, output a personalized daily plan.
 
-OUTPUT RULES
-- Output ONLY a valid JSON array. No prose, no markdown, no explanation.
+OUTPUT FORMAT
+Output ONLY a valid JSON object with exactly two keys:
+  {
+    "plan": [...],
+    "avoid_items": [...]
+  }
+No prose, no markdown, no explanation outside the JSON.
+
+PLAN ARRAY RULES
 - Each item: {"slug": str, "priority": str, "duration_min": int, "reason": str}
 - slug: must be one of the valid slugs listed in the user prompt.
 - priority: "must_do" | "recommended" | "optional"
 - duration_min: integer, must be within the slug's allowed range.
-- reason: 1 sentence citing the user's specific trait or score that drives this item.
-  Example: "Your recovery score is 48 and walking is your most reliable recovery trigger."
+- reason: 1 sentence in simple Indian English citing the user's specific score or trait.
+  Example: "Recovery is at 48 — walking has helped you bounce back before."
 - Maximum 1 must_do item if discipline_index < 40.
 - Maximum 2 must_do items otherwise.
 - If engagement_tier is "at_risk" or "churned", add a short, low-friction item to \
@@ -80,6 +102,15 @@ OUTPUT RULES
 - If mood_baseline is "low" for 5+ days, add a mood-positive item and set tone to gentle.
 - Do NOT prescribe social_time if user is introvert AND stress_score > 70.
 - The reason field MUST reference a specific score, trait, or fact from the snapshot.
+
+AVOID ITEMS ARRAY RULES
+- Maximum 3 items. Can be empty [].
+- Each item: {"slug_or_label": str, "reason": str}
+- slug_or_label: a plain activity name e.g. "hard gym session", "late night", "alcohol"
+- reason: 1 sentence in simple Indian English citing the specific data that drives this.
+  Example: "Recovery is at 38 — pushing hard will make tomorrow worse."
+- Only flag things genuinely counter-indicated by the data. Do not add avoid items on green days.
+- Reason MUST cite a specific number or trend — never write generic advice.
 """
 
 
@@ -136,6 +167,7 @@ def run_layer2_plan(
 
     if llm_client is None:
         profile.suggested_plan = _fallback_plan(profile, net_balance)
+        profile.avoid_items = []
         return profile
 
     user_prompt = _build_layer2_user_prompt(
@@ -150,10 +182,11 @@ def run_layer2_plan(
     )
 
     plan_items: list[PlanItem] = []
+    avoid_items: list[AvoidItem] = []
     for attempt in range(2):
         try:
             raw = llm_client.chat(_LAYER2_SYSTEM, user_prompt)
-            plan_items = _parse_plan_json(raw)
+            plan_items, avoid_items = _parse_plan_json(raw)
             if plan_items:
                 break
         except Exception:
@@ -164,6 +197,7 @@ def run_layer2_plan(
         profile.plan_guardrail_notes.append("layer2_fallback: LLM unavailable")
 
     profile.suggested_plan = plan_items
+    profile.avoid_items = avoid_items
     return profile
 
 
@@ -327,6 +361,11 @@ WHAT CHANGED SINCE v{v - 1} ({today.isoformat()})
 WATCH TODAY
   (1–3 specific actionable considerations for the coach tomorrow, grounded in the data)
   (use score language: readiness/stress/recovery 0–100)
+
+COACH WATCH NOTES
+  (3–5 bullets, plain Indian English, max 20 words each)
+  (each bullet is grounded in a specific data signal above — no vague generalisations)
+  (this section surfaces in the app — write for the user, not the developer)
 """.strip()
 
 
@@ -378,23 +417,49 @@ Generate the plan now. Output only valid JSON array. No prose.
 
 # ── JSON parser ───────────────────────────────────────────────────────────────
 
-def _parse_plan_json(raw: str) -> list[PlanItem]:
-    """Extract and parse the JSON array from a Layer 2 LLM response."""
+def _parse_plan_json(raw: str) -> tuple[list[PlanItem], list[AvoidItem]]:
+    """Extract and parse the JSON from a Layer 2 LLM response.
+
+    Accepts two formats:
+      New: {"plan": [...], "avoid_items": [...]}
+      Legacy (backward-compat): bare JSON array [...]
+    """
     # Strip markdown code fences if present
     cleaned = re.sub(r"```(?:json)?", "", raw).strip().strip("`").strip()
-    # Find the first [ ... ] block
-    m = re.search(r"\[.*\]", cleaned, re.DOTALL)
-    if not m:
-        log.warning("Layer 2: no JSON array found in LLM output")
-        return []
-    try:
-        items = json.loads(m.group(0))
-    except json.JSONDecodeError as exc:
-        log.warning("Layer 2: JSON parse error: %s", exc)
-        return []
 
-    plan_items = []
-    for item in items:
+    # Try new object format first
+    obj_match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+    raw_plan: list[dict] = []
+    raw_avoid: list[dict] = []
+
+    if obj_match:
+        try:
+            obj = json.loads(obj_match.group(0))
+            if isinstance(obj, dict) and "plan" in obj:
+                raw_plan  = obj.get("plan", []) or []
+                raw_avoid = obj.get("avoid_items", []) or []
+            elif isinstance(obj, dict):
+                # Unexpected object shape — fall through to array search
+                obj = None
+        except json.JSONDecodeError:
+            obj = None
+    else:
+        obj = None
+
+    if obj is None:
+        # Backward compat: bare array
+        arr_match = re.search(r"\[.*\]", cleaned, re.DOTALL)
+        if not arr_match:
+            log.warning("Layer 2: no JSON found in LLM output")
+            return [], []
+        try:
+            raw_plan = json.loads(arr_match.group(0))
+        except json.JSONDecodeError as exc:
+            log.warning("Layer 2: JSON parse error: %s", exc)
+            return [], []
+
+    plan_items: list[PlanItem] = []
+    for item in raw_plan:
         if not isinstance(item, dict):
             continue
         slug     = item.get("slug", "")
@@ -415,7 +480,21 @@ def _parse_plan_json(raw: str) -> list[PlanItem]:
             duration_min=duration,
             reason=str(reason)[:300],
         ))
-    return plan_items
+
+    avoid_items: list[AvoidItem] = []
+    for item in raw_avoid[:3]:  # hard cap at 3
+        if not isinstance(item, dict):
+            continue
+        label  = item.get("slug_or_label", "")
+        reason = item.get("reason", "")
+        if not label:
+            continue
+        avoid_items.append(AvoidItem(
+            slug_or_label=str(label)[:100],
+            reason=str(reason)[:300],
+        ))
+
+    return plan_items, avoid_items
 
 
 # ── Fallback generators (no LLM) ─────────────────────────────────────────────
@@ -475,6 +554,11 @@ WHAT CHANGED SINCE v{profile.narrative_version - 1} ({today.isoformat()})
 WATCH TODAY
   Archetype: {archetype_line}. Training level: {profile.training_level}.
   Data confidence: {profile.data_confidence:.0%} — build more data for sharper coaching.
+
+COACH WATCH NOTES
+  • Keep it going — {profile.training_level} training level looks steady.
+  • Data confidence is at {profile.data_confidence:.0%} — more consistent band wear will sharpen your plan.
+  • Engagement: {e.engagement_tier or 'building'} — one session a day keeps the habit alive.
 """.strip()
 
 

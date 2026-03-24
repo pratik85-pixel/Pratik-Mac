@@ -1,0 +1,19 @@
+Phase 2: DataAssembler physio injection into Layer 1 prompt
+
+profile/profile_updater.py (NEW): _PhysioClient proxy wraps LLM client to
+prepend PHYSIOLOGICAL SNAPSHOT block to Layer 1 prompt (detected via system
+string). _build_physio_block() formats trajectory/windows/personal-model/
+population labels — no raw ms values, calibration-gated, empty-section safe.
+run_profile_update() assembles context, extracts today's scores from trajectory,
+wraps client, calls rebuild_unified_profile(). Fallback guarantee: nightly_analyst
+_fallback_narrative() still fires on LLM failure — no empty narrative ever written.
+
+jobs/nightly_rebuild.py: _rebuild_one_user() now calls run_profile_update()
+instead of rebuild_unified_profile() directly; scores come from DataAssembler.
+
+tests/profile/test_profile_updater.py (NEW, 24 tests all passing):
+_build_physio_block() and _PhysioClient fully covered.
+
+Fixes: narrative "Unknown throughout" because real physiological data
+(personal model, 7-day trajectory, stress/recovery windows) now reaches
+the Layer 1 LLM on every nightly rebuild.

@@ -24,7 +24,7 @@ from __future__ import annotations
 import logging
 from dataclasses import asdict
 from datetime import UTC, date, datetime, timedelta
-from typing import Optional, Sequence
+from typing import Any, Optional, Sequence
 
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -453,9 +453,17 @@ class TrackingService:
         result = await svc.close_day(target_date)
     """
 
-    def __init__(self, db_session: AsyncSession, user_id: str):
-        self._db  = db_session
-        self._uid = user_id
+    def __init__(
+        self,
+        db_session: AsyncSession,
+        user_id: str,
+        session_factory: Optional[Any] = None,
+        llm_client: Optional[Any] = None,
+    ):
+        self._db              = db_session
+        self._uid             = user_id
+        self._session_factory = session_factory
+        self._llm_client      = llm_client
 
     # ── Ingest ─────────────────────────────────────────────────────────────────
 
@@ -636,6 +644,19 @@ class TrackingService:
                 "BandWearSession carry-forward locked user=%s opening_balance=%.2f wake_ts=%s",
                 self._uid, opening_bal, window_start,
             )
+            # Fire morning brief generation as a background task (non-blocking)
+            if self._session_factory is not None:
+                import asyncio
+                import uuid as uuid_mod
+                from coach.morning_brief import generate_morning_brief
+                asyncio.create_task(
+                    generate_morning_brief(
+                        self._session_factory,
+                        uuid_mod.UUID(str(self._uid)),
+                        opening_bal,
+                        self._llm_client,
+                    )
+                )
 
         await self._db.flush()
 

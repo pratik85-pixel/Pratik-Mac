@@ -275,47 +275,51 @@ class TestFallbackPlan:
 class TestParsePlanJson:
     def test_valid_json_array(self):
         raw = '[{"slug": "breathing", "priority": "must_do", "duration_min": 10, "reason": "test"}]'
-        items = _parse_plan_json(raw)
+        items, avoid = _parse_plan_json(raw)
         assert len(items) == 1
         assert items[0].slug == "breathing"
         assert items[0].priority == "must_do"
         assert items[0].duration_min == 10
+        assert avoid == []
 
     def test_json_with_markdown_fences(self):
         raw = '```json\n[{"slug":"breathing","priority":"must_do","duration_min":10,"reason":"r"}]\n```'
-        items = _parse_plan_json(raw)
+        items, _ = _parse_plan_json(raw)
         assert len(items) == 1
         assert items[0].slug == "breathing"
 
     def test_invalid_priority_defaults_to_recommended(self):
         raw = '[{"slug": "walking", "priority": "unknown", "duration_min": 20, "reason": "test"}]'
-        items = _parse_plan_json(raw)
+        items, _ = _parse_plan_json(raw)
         assert items[0].priority == "recommended"
 
     def test_string_duration_coerced_to_int(self):
         raw = '[{"slug": "meditation", "priority": "optional", "duration_min": "15", "reason": "r"}]'
-        items = _parse_plan_json(raw)
+        items, _ = _parse_plan_json(raw)
         assert items[0].duration_min == 15
 
     def test_missing_slug_skipped(self):
         raw = '[{"priority": "must_do", "duration_min": 10, "reason": "r"}]'
-        items = _parse_plan_json(raw)
+        items, avoid = _parse_plan_json(raw)
         assert items == []
+        assert avoid == []
 
     def test_completely_invalid_json_returns_empty(self):
-        items = _parse_plan_json("not json at all")
+        items, avoid = _parse_plan_json("not json at all")
         assert items == []
+        assert avoid == []
 
     def test_empty_string_returns_empty(self):
-        items = _parse_plan_json("")
+        items, avoid = _parse_plan_json("")
         assert items == []
+        assert avoid == []
 
     def test_multiple_items_parsed(self):
         raw = '''[
             {"slug":"breathing","priority":"must_do","duration_min":10,"reason":"r1"},
             {"slug":"walking","priority":"recommended","duration_min":20,"reason":"r2"}
         ]'''
-        items = _parse_plan_json(raw)
+        items, _ = _parse_plan_json(raw)
         assert len(items) == 2
         assert items[0].slug == "breathing"
         assert items[1].slug == "walking"
@@ -323,5 +327,25 @@ class TestParsePlanJson:
     def test_reason_truncated_at_300_chars(self):
         long_reason = "x" * 400
         raw = f'[{{"slug":"breathing","priority":"must_do","duration_min":10,"reason":"{long_reason}"}}]'
-        items = _parse_plan_json(raw)
+        items, _ = _parse_plan_json(raw)
         assert len(items[0].reason) <= 300
+
+    def test_new_object_format_with_avoid_items(self):
+        raw = '''{
+            "plan": [{"slug":"breathing","priority":"must_do","duration_min":10,"reason":"r1"}],
+            "avoid_items": [{"slug_or_label":"late_night_screen","reason":"raised stress 23 points"}]
+        }'''
+        items, avoid = _parse_plan_json(raw)
+        assert len(items) == 1
+        assert items[0].slug == "breathing"
+        assert len(avoid) == 1
+        assert avoid[0].slug_or_label == "late_night_screen"
+        assert "23" in avoid[0].reason
+
+    def test_avoid_items_capped_at_3(self):
+        avoid_raw = [
+            {"slug_or_label": f"item_{i}", "reason": "reason"} for i in range(6)
+        ]
+        raw = f'{{"plan": [], "avoid_items": {avoid_raw}}}'.replace("'", '"')
+        _, avoid = _parse_plan_json(raw)
+        assert len(avoid) <= 3

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from datetime import datetime
 from typing import Annotated, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
@@ -64,6 +65,18 @@ class CoachReply(BaseModel):
     reply:           Optional[str]
     follow_up:       Optional[str]
     handoff_message: str
+
+
+class MorningBriefResponse(BaseModel):
+    day_state:      Optional[str]   # "green"|"yellow"|"red"
+    day_confidence: Optional[str]   # "high"|"medium"|"low"
+    brief_text:     Optional[str]
+    evidence:       Optional[str]
+    one_action:     Optional[str]
+    generated_for:  Optional[str]   # YYYY-MM-DD
+    is_stale:       bool            # True if generated_for < today IST
+    plan:           list[dict]      # suggested plan items from UUP
+    avoid_items:    list[dict]      # avoid items from UUP
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
@@ -201,6 +214,53 @@ async def close_conversation(
     """Explicitly close a conversation session."""
     await conv_svc.close_and_persist(conversation_id, db=db)
     return {"closed": True, "conversation_id": conversation_id}
+
+
+@router.get("/morning-brief", response_model=MorningBriefResponse)
+async def get_morning_brief(
+    user_id: str          = Depends(_user_id),
+    db:      AsyncSession = Depends(get_db),
+) -> MorningBriefResponse:
+    """
+    Return the cached morning brief for today.
+
+    The brief is generated at first wakeup (sleep→background transition)
+    and cached in UserUnifiedProfile. If no brief exists yet for today,
+    returns is_stale=True with whatever the last stored values are.
+    """
+    from zoneinfo import ZoneInfo
+    import api.db.schema as _db
+
+    uid = parse_uuid(user_id)
+    if uid is None:
+        raise HTTPException(status_code=401, detail="Invalid X-User-Id")
+
+    result = await db.execute(
+        select(_db.UserUnifiedProfile).where(_db.UserUnifiedProfile.user_id == uid)
+    )
+    uup = result.scalar_one_or_none()
+
+    IST = ZoneInfo("Asia/Kolkata")
+    from datetime import date as _date
+    today_ist = datetime.now(IST).date()
+
+    generated_for = uup.morning_brief_generated_for if uup else None
+    is_stale = (generated_for is None or generated_for < today_ist)
+
+    plan = uup.suggested_plan_json or [] if uup else []
+    avoid = uup.avoid_items_json or [] if uup else []
+
+    return MorningBriefResponse(
+        day_state      = uup.morning_brief_day_state if uup else None,
+        day_confidence = uup.morning_brief_day_confidence if uup else None,
+        brief_text     = uup.morning_brief_text if uup else None,
+        evidence       = uup.morning_brief_evidence if uup else None,
+        one_action     = uup.morning_brief_one_action if uup else None,
+        generated_for  = generated_for.isoformat() if generated_for else None,
+        is_stale       = is_stale,
+        plan           = plan,
+        avoid_items    = avoid,
+    )
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────

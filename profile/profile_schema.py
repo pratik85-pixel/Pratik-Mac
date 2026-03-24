@@ -147,6 +147,13 @@ class PlanItem:
 
 
 @dataclass
+class AvoidItem:
+    """One item the user should avoid tomorrow, per Layer 2 LLM output."""
+    slug_or_label: str            # activity slug or free-form label (e.g. "late_night_screen")
+    reason:        str            # plain-language reason grounded in today's data
+
+
+@dataclass
 class UnifiedProfile:
     """
     The complete persisted personality model for one user.
@@ -177,9 +184,10 @@ class UnifiedProfile:
     narrative_version:  int           = 1
 
     # ── Layer 2 — Plan (written by nightly_analyst.py) ────────────────────────
-    suggested_plan:     list[PlanItem] = field(default_factory=list)
-    plan_for_date:      Optional[date] = None
-    plan_guardrail_notes: list[str]   = field(default_factory=list)
+    suggested_plan:     list[PlanItem]  = field(default_factory=list)
+    avoid_items:        list[AvoidItem] = field(default_factory=list)
+    plan_for_date:      Optional[date]  = None
+    plan_guardrail_notes: list[str]    = field(default_factory=list)
 
     # ── Metadata ──────────────────────────────────────────────────────────────
     data_confidence:  float            = 0.0

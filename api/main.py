@@ -99,6 +99,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.session_service      = SessionService()
     app.state.coach_service        = CoachService(llm_client=llm)
     app.state.conversation_service = ConversationService(llm_client=llm)
+    app.state.llm_client           = llm  # shared ref for tracking wake hook
 
     logger.info("services initialised: session, coach, conversation")
 

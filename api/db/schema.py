@@ -11,7 +11,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import (
-    Boolean, Column, DateTime, Float, ForeignKey,
+    Boolean, Column, Date, DateTime, Float, ForeignKey,
     Integer, String, Text, JSON, Index
 )
 from sqlalchemy.dialects.postgresql import UUID
@@ -1041,6 +1041,11 @@ class UserUnifiedProfile(Base):
     best_nudge_window       = Column(String(5), nullable=True)    # "HH:MM"
     last_insight_delivered  = Column(Text, nullable=True)
 
+    # ── Coach Watch Notes (Layer 1 nightly) ───────────────────────────────────
+    # 3–5 hyper-personal insight bullets written by Layer 1 LLM.
+    # JSON: list[str]  — displayed in app profile tab + injected into morning brief.
+    coach_watch_notes       = Column(JSON, nullable=True)
+
     # ── Layer 2 — LLM-generated plan ──────────────────────────────────────────
     # Output of the nightly plan analyst LLM pass.
     # Validated by plan_guardrails.py before being committed to daily_plans.
@@ -1048,6 +1053,20 @@ class UserUnifiedProfile(Base):
     suggested_plan_json     = Column(JSON, nullable=True)
     plan_generated_for_date = Column(DateTime(timezone=True), nullable=True)
     plan_guardrail_notes    = Column(JSON, nullable=True)   # list of guardrail interventions
+    # Layer 2 don'ts — companion to suggested_plan_json.
+    # Format: [{"slug_or_label": str, "reason": str}]
+    avoid_items_json        = Column(JSON, nullable=True)
+
+    # ── Morning Brief (generated at wake-up / sleep→background transition) ────
+    # LLM-derived day assessment based on 7-day trend, written at wakeup.
+    # App reads these fields; no LLM call on app open.
+    morning_brief_text          = Column(Text, nullable=True)
+    morning_brief_day_state     = Column(String(10), nullable=True)    # "green"|"yellow"|"red"
+    morning_brief_day_confidence = Column(String(10), nullable=True)   # "high"|"medium"|"low"
+    morning_brief_evidence      = Column(Text, nullable=True)          # 1 sentence citing trend data
+    morning_brief_one_action    = Column(Text, nullable=True)          # one specific morning action
+    morning_brief_generated_for = Column(Date, nullable=True)          # IST calendar date
+    morning_brief_generated_at  = Column(DateTime(timezone=True), nullable=True)
 
     # ── Metadata ──────────────────────────────────────────────────────────────
     data_confidence         = Column(Float, nullable=True, default=0.0)  # 0–1

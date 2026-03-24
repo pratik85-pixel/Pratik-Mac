@@ -35,12 +35,35 @@ from profile.profile_schema import (
     EngagementProfile,
     CoachRelationship,
     UserFactRecord,
+    AvoidItem,
     PlanItem,
 )
 from profile.unified_profile_builder import build_unified_profile
 from profile.fact_extractor import ExtractedFact
 
 log = logging.getLogger(__name__)
+
+
+def _extract_watch_notes(narrative: Optional[str]) -> list[str]:
+    """Parse the COACH WATCH NOTES section from a Layer 1 narrative string."""
+    import re
+    if not narrative:
+        return []
+    # Match the section header and capture bullet lines until the next all-caps header or end
+    m = re.search(
+        r"COACH WATCH NOTES\n(.*?)(?=\n[A-Z][A-Z ]+\n|\Z)",
+        narrative,
+        re.DOTALL,
+    )
+    if not m:
+        return []
+    block = m.group(1)
+    bullets = []
+    for line in block.splitlines():
+        stripped = line.strip().lstrip("•-").strip()
+        if stripped:
+            bullets.append(stripped)
+    return bullets[:5]  # cap at 5
 
 
 # ── Load / Save ───────────────────────────────────────────────────────────────
@@ -75,10 +98,17 @@ async def save_unified_profile(
         for p in profile.suggested_plan
     ]
 
+    avoid_json = [
+        {"slug_or_label": a.slug_or_label, "reason": a.reason}
+        for a in profile.avoid_items
+    ]
+
     fields: dict[str, Any] = {
         "narrative_version":        profile.narrative_version,
         "coach_narrative":          profile.coach_narrative,
         "previous_narrative":       profile.previous_narrative,
+        "coach_watch_notes":        _extract_watch_notes(profile.coach_narrative),
+        "avoid_items_json":         avoid_json,
         "archetype_primary":        profile.archetype_primary,
         "archetype_secondary":      profile.archetype_secondary,
         "training_level":           profile.training_level,
@@ -227,11 +257,13 @@ async def rebuild_unified_profile(
     validated = validate_plan(
         profile.suggested_plan,
         profile,
+        avoid_items=profile.avoid_items,
         net_balance=net_balance,
         stress_score=stress_score,
         recovery_score=recovery_score,
     )
-    profile.suggested_plan      = validated.items
+    profile.suggested_plan       = validated.items
+    profile.avoid_items          = validated.avoid_items
     profile.plan_guardrail_notes = validated.guardrail_notes
 
     # -- Save --
@@ -507,6 +539,15 @@ def _row_to_profile(row: db.UserUnifiedProfile, user_id: str) -> UnifiedProfile:
             reason=p.get("reason", ""),
         ))
 
+    avoid_items = [
+        AvoidItem(
+            slug_or_label=a.get("slug_or_label", ""),
+            reason=a.get("reason", ""),
+        )
+        for a in (row.avoid_items_json or [])
+        if a.get("slug_or_label")
+    ]
+
     plan_date: Optional[date] = None
     if row.plan_generated_for_date:
         plan_date = row.plan_generated_for_date.date() if hasattr(row.plan_generated_for_date, "date") else None
@@ -567,6 +608,7 @@ def _row_to_profile(row: db.UserUnifiedProfile, user_id: str) -> UnifiedProfile:
         previous_narrative=row.previous_narrative,
         narrative_version=int(row.narrative_version or 1),
         suggested_plan=plan_items,
+        avoid_items=avoid_items,
         plan_for_date=plan_date,
         plan_guardrail_notes=row.plan_guardrail_notes or [],
         data_confidence=float(row.data_confidence or 0.0),
