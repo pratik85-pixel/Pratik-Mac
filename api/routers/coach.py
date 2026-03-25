@@ -320,9 +320,7 @@ async def nudge_check(
     if not (cfg.NUDGE_WINDOW_START_HOUR_IST <= now_ist.hour < cfg.NUDGE_WINDOW_END_HOUR_IST):
         return NudgeCheckResponse(should_nudge=False, message=None, reason="outside_window")
 
-    # Gate 2 — cap check
-    window_start = datetime.now(IST).astimezone().__class__.now() - timedelta(hours=4)
-    # Use UTC-aware cutoff for DB comparison
+    # Gate 2 — cap check (rolling 4h window, UTC-aware for DB timestamps)
     from datetime import timezone as _tz
     cutoff_utc = datetime.now(_tz.utc) - timedelta(hours=4)
     cap_result = await db.execute(
@@ -351,6 +349,16 @@ async def nudge_check(
         recovery_score = latest.get("waking_recovery"),
     )
     message = output.get("summary") or output.get("action")
+    if message:
+        db.add(
+            CoachMessage(
+                user_id=uid,
+                message_type="nudge",
+                summary=message[:8000],
+                reason="nudge_check_gate_passed",
+            )
+        )
+        await db.commit()
     return NudgeCheckResponse(should_nudge=True, message=message, reason="ok")
 
 

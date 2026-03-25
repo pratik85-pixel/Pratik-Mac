@@ -4,6 +4,7 @@ api/routers/plan.py
 Plan management and check-in endpoints.
 
 GET  /plan/today        — today's plan items (via PlanService)
+GET  /plan/home-status  — Home line: anchor intention + adherence + on_track (Phase 6)
 GET  /plan/week         — full week plan (session targets + schedule)
 POST /plan/check-in     — submit 3-question subjective check-in
 POST /plan/trigger-today — force-regenerate today's plan
@@ -62,6 +63,17 @@ async def today_plan(
     """
     plan_svc = PlanService(db=db, model_service=model_svc)
     return await plan_svc.get_or_create_today_plan(user_id)
+
+
+@router.get("/home-status")
+async def plan_home_status(
+    user_id:   str          = Depends(_user_id),
+    model_svc: ModelService = Depends(_model_svc),
+    db:        AsyncSession = Depends(get_db),
+) -> dict:
+    """Today's plan headline for Home (intention + adherence + on_track)."""
+    plan_svc = PlanService(db=db, model_service=model_svc)
+    return await plan_svc.get_home_plan_status(user_id)
 
 
 @router.get("/week")

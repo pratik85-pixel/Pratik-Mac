@@ -22,7 +22,7 @@ Design
 from __future__ import annotations
 
 import logging
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import UTC, date, datetime, timedelta
 from typing import Any, Optional, Sequence
 
@@ -34,11 +34,18 @@ from tracking.background_processor import BackgroundWindowResult, aggregate_back
 from tracking.stress_detector import StressWindowResult, detect_stress_windows, compute_stress_contributions
 from tracking.recovery_detector import RecoveryWindowResult, detect_recovery_windows, compute_recovery_contributions
 from tracking.daily_summarizer import DailySummaryResult, compute_daily_summary
+from tracking.cohort_insight import build_cohort_insight
+from tracking.stress_state import (
+    StressStateResult,
+    compute_stress_state,
+    median_rmssd_same_weekday_hour,
+)
 from tracking.wake_detector import WakeSleepBoundary, ContextTransition, detect_wake_sleep_boundary
 
 import numpy as np
 
 from api.db import schema as db
+from api.utils import parse_uuid
 from config import CONFIG
 
 logger = logging.getLogger(__name__)
@@ -210,6 +217,39 @@ def _seed_from_onboarding(onboarding: "Optional[dict]") -> "tuple[float, float, 
         freq = onboarding.get("exercise_frequency", "1-3x/week")
         tier = _EXERCISE_FREQ_TIERS.get(freq, _TIER_MODERATE)
     return tier["floor"], tier["ceiling"], tier["morning"]
+
+
+async def _load_background_since(
+    db_session: AsyncSession,
+    user_id: str,
+    since: datetime,
+) -> list[BackgroundWindowResult]:
+    """Load BackgroundWindow rows for user from ``since`` (inclusive), oldest first."""
+    result = await db_session.execute(
+        select(db.BackgroundWindow)
+        .where(db.BackgroundWindow.user_id == user_id)
+        .where(db.BackgroundWindow.window_start >= since)
+        .order_by(db.BackgroundWindow.window_start)
+    )
+    rows = result.scalars().all()
+    return [
+        BackgroundWindowResult(
+            user_id       = str(row.user_id),
+            window_start  = row.window_start,
+            window_end    = row.window_end,
+            context       = row.context,
+            rmssd_ms      = row.rmssd_ms,
+            hr_bpm        = row.hr_bpm,
+            lf_hf         = row.lf_hf,
+            confidence    = row.confidence,
+            acc_mean      = row.acc_mean,
+            gyro_mean     = row.gyro_mean,
+            n_beats       = row.n_beats,
+            artifact_rate = row.artifact_rate,
+            is_valid      = row.is_valid,
+        )
+        for row in rows
+    ]
 
 
 async def _load_all_background_for_model(
@@ -1181,6 +1221,139 @@ class TrackingService:
     async def get_personal_model(self) -> Optional[db.PersonalModel]:
         """Return the user's PersonalModel row (or None if it doesn't exist yet)."""
         return await _load_personal_model(self._db, self._uid)
+
+    async def get_stress_state(self, include_cohort: bool = False) -> StressStateResult:
+        """
+        Point-in-time stress zone + short trend for Home UX (Phase 2–3, 7).
+
+        Read-only: does not create PersonalModel rows (uses onboarding tier seeds
+        when no model exists yet).
+        """
+        cfg = CONFIG.tracking
+        now = datetime.now(UTC)
+        since = now - timedelta(days=cfg.STRESS_STATE_HISTORY_DAYS)
+        windows = await _load_background_since(self._db, self._uid, since)
+
+        uid = parse_uuid(self._uid)
+        onboarding_json: Optional[dict] = None
+        age_years: Optional[int] = None
+        if uid is not None:
+            user_row = await self._db.get(db.User, uid)
+            if user_row is not None and isinstance(user_row.onboarding, dict):
+                onboarding_json = user_row.onboarding
+                ag = onboarding_json.get("age")
+                if isinstance(ag, int):
+                    age_years = ag
+
+        personal = await _load_personal_model(self._db, self._uid)
+        if personal is None:
+            floor, ceiling, morning = _seed_from_onboarding(onboarding_json)
+            morning_ref = float(morning)
+            ceil_ms = float(ceiling)
+        else:
+            floor = float(personal.rmssd_floor or 22.0)
+            ceil_ms = float(personal.rmssd_ceiling) if personal.rmssd_ceiling else None
+            mr = personal.rmssd_morning_avg
+            if mr is None or mr <= 0:
+                morning_ref = (floor + (ceil_ms or 65.0)) / 2.0
+            else:
+                morning_ref = float(mr)
+
+        tod_med = median_rmssd_same_weekday_hour(
+            windows,
+            now,
+            cfg.STRESS_STATE_TIMEZONE,
+            cfg.STRESS_STATE_TOD_MIN_BUCKET_SAMPLES,
+        )
+        w_blend = cfg.STRESS_STATE_TOD_BLEND_MORNING_WEIGHT
+        if tod_med is not None:
+            index_ref = w_blend * morning_ref + (1.0 - w_blend) * tod_med
+            ref_type = "time_of_day"
+            tod_out: Optional[float] = tod_med
+        else:
+            index_ref = morning_ref
+            ref_type = "morning_avg"
+            tod_out = None
+
+        result = compute_stress_state(
+            now=now,
+            windows_history=windows,
+            personal_floor=floor,
+            personal_ref_morning=morning_ref,
+            index_reference_ms=index_ref,
+            reference_type=ref_type,
+            personal_ceiling=ceil_ms,
+            ema_alpha=cfg.STRESS_STATE_EMA_ALPHA,
+            recent_span_hours=cfg.STRESS_STATE_RECENT_SPAN_HOURS,
+            trend_lookback_minutes=cfg.STRESS_STATE_TREND_LOOKBACK_MINUTES,
+            trend_delta_threshold=cfg.STRESS_STATE_TREND_DELTA,
+            min_history_for_percentiles=cfg.STRESS_STATE_MIN_SAMPLES_PERCENTILE,
+            time_of_day_reference_ms=tod_out,
+        )
+
+        if include_cohort:
+            opt_in = bool(onboarding_json and onboarding_json.get("compare_to_peers") is True)
+            ce, cb, cd = build_cohort_insight(
+                include_requested=True,
+                user_opt_in=opt_in,
+                stress_index=result.stress_now_index,
+                age_years=age_years,
+            )
+            result = replace(
+                result,
+                cohort_enabled=ce,
+                cohort_band=cb,
+                cohort_disclaimer=cd,
+            )
+
+        return result
+
+    async def get_morning_recap(self) -> dict:
+        """Yesterday (IST) DailyStressSummary + whether to show recap card (Phase 5)."""
+        from zoneinfo import ZoneInfo
+
+        IST = ZoneInfo(CONFIG.tracking.STRESS_STATE_TIMEZONE)
+        yesterday = (datetime.now(IST).date() - timedelta(days=1))
+        row = await self._load_day_summary(yesterday)
+        uid = parse_uuid(self._uid)
+        ack_d: Optional[date] = None
+        if uid is not None:
+            res = await self._db.execute(
+                select(db.User.morning_recap_ack_for_date).where(db.User.id == uid)
+            )
+            ack_d = res.scalar_one_or_none()
+
+        should_show = row is not None and ack_d != yesterday
+        summary: Optional[dict] = None
+        if row is not None:
+            summary = {
+                "stress_load_score": row.stress_load_score,
+                "waking_recovery_score": getattr(row, "waking_recovery_score", None),
+                "net_balance": getattr(row, "net_balance", None),
+                "day_type": row.day_type,
+                "is_estimated": row.is_estimated,
+                "is_partial_data": row.is_partial_data,
+                "sleep_recovery_area": round(row.raw_recovery_area_sleep, 2),
+                "closing_balance": getattr(row, "closing_balance", None),
+            }
+
+        return {
+            "for_date": yesterday.isoformat(),
+            "should_show": should_show,
+            "acknowledged_for_date": ack_d == yesterday,
+            "summary": summary,
+        }
+
+    async def ack_morning_recap(self, for_date: date) -> None:
+        """Persist dismiss for morning recap (cross-device)."""
+        uid = parse_uuid(self._uid)
+        if uid is None:
+            return
+        user_row = await self._db.get(db.User, uid)
+        if user_row is None:
+            return
+        user_row.morning_recap_ack_for_date = for_date
+        await self._db.commit()
 
     async def compute_live_summary(
         self, target_date: date

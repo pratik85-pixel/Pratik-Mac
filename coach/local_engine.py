@@ -135,6 +135,36 @@ def _build_local_post_session(
     }
 
 
+def _build_local_morning_brief(
+    ctx: CoachContext,
+    rx: DailyPrescription,
+    tone: str,
+    opening: str,
+    closing: str,
+    reason: str,
+    focus: str,
+) -> dict:
+    traj = ctx.trajectory or "steady"
+    session_str = f"{rx.session_duration}-minute {rx.session_type.replace('_', ' ')}"
+    return {
+        "summary": (
+            f"{opening} Your pattern is {ctx.pattern_label} and the week shows {traj}. "
+            f"{reason} The plan keeps load aligned with where you are in {ctx.stage_in_words}. "
+            f"{closing}"
+        ),
+        "observation": (
+            f"Load trend reads as {ctx.load_trend} with recovery note: {ctx.recovery_pattern_note}. "
+            f"That combination supports {focus} today without adding extra pressure."
+        ),
+        "action": (
+            f"Schedule one {session_str} in the {rx.session_window} window and treat it as the anchor for the day."
+        ),
+        "window": f"Best window today: {rx.session_window}.",
+        "encouragement": "",
+        "follow_up_question": None,
+    }
+
+
 def _build_local_nudge(
     ctx: CoachContext,
     rx: DailyPrescription,
@@ -219,6 +249,7 @@ def _build_fallback_generic(
 
 
 _LOCAL_BUILDERS = {
+    "morning_brief":     _build_local_morning_brief,
     "post_session":      _build_local_post_session,
     "nudge":             _build_local_nudge,
     "weekly_review":     _build_local_weekly_review,

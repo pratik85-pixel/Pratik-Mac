@@ -31,6 +31,14 @@ from coach.context_builder import CoachContext
 # ── Required schema fields per trigger type ────────────────────────────────────
 
 _REQUIRED_FIELDS: dict[str, set[str]] = {
+    "morning_brief": {
+        "summary",
+        "observation",
+        "action",
+        "window",
+        "encouragement",
+        "follow_up_question",
+    },
     "post_session":  {"summary", "observation", "reinforcement", "next_session", "follow_up_question"},
     "nudge":         {"summary", "action", "follow_up_question"},
     "weekly_review": {"summary", "week_narrative", "dimension_spotlight", "action", "follow_up_question"},

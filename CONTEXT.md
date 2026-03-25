@@ -1,7 +1,46 @@
 # ZenFlow Verity — Project Context
 
-**Last updated:** 24 March 2026 — Score Architecture Overhaul Phases 0–3 complete: DataAssembler, ProfileUpdater with physio injection, morning brief infrastructure, wake hook ✅  
-*(Interim update — final update on CONTEXT.md after all phases complete)*
+**Last updated:** 25 March 2026 — Readiness UX **Phases 1–3, 5–7** in repo: copy deck + API docs; stress-state + TOD blend + cohort; morning recap + plan home-status. **Phase 4** = mobile Home UI (EAS). Deploy: **Railway** + **alembic upgrade** (`m9n0o1p2q3r4`).
+
+---
+
+## Session — 25 March 2026 (b) — Readiness UX phases 1–7 (backend + docs)
+
+### Phase 1 — Copy deck + IA
+
+- **`docs/readiness-ux-copy-deck.md`** — Zone/trend/confidence strings, empty states, global “what this is not,” cohort opt-in copy. **Pending:** legal/product sign-off.
+
+### Phase 2 — API contract
+
+- **`docs/readiness-stress-state-api.md`** — `GET /tracking/stress-state`, morning recap, plan home-status, mobile checklist.
+
+### Phase 3 — Smoothing + zones
+
+- Unchanged core: EMA, percentile cutpoints, tests in `tests/tracking/test_stress_state.py`.
+
+### Phase 4 — Home UI
+
+- **Out of this backend repo** — implement in Expo app per `readiness-stress-state-api.md` (EAS build).
+
+### Phase 5 — Morning recap → History
+
+- **Migration `m9n0o1p2q3r4`:** `users.morning_recap_ack_for_date` (DATE).  
+- **`GET /tracking/morning-recap`** — IST yesterday summary, `should_show`, `acknowledged_for_date`.  
+- **`POST /tracking/morning-recap/ack`** body `{ "for_date": "YYYY-MM-DD" }`.
+
+### Phase 6 — Plan + Home line
+
+- **`GET /plan/home-status`** — `anchor_intention`, `anchor_slug`, `items_total`, `items_completed`, `adherence_pct`, `on_track`, `day_type` (IST day, same as `/plan/today`).
+
+### Phase 7 — Time-of-day reference + cohort
+
+- **`tracking/stress_state.py`:** `median_rmssd_same_weekday_hour`; index ref = blend of morning + TOD median (`STRESS_STATE_TOD_*`, `STRESS_STATE_TIMEZONE`).  
+- **`tracking/cohort_insight.py`:** opt-in via onboarding `compare_to_peers: true`; `GET /tracking/stress-state?include_cohort=true` returns `cohort` object (placeholder band vs prior).
+
+### Deployment
+
+1. **Railway:** deploy API; run **`alembic upgrade head`**.  
+2. **EAS:** wire new endpoints on Home / Plan / History.
 
 ---
 

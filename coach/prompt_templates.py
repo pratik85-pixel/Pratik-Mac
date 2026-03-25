@@ -135,6 +135,47 @@ Output this JSON:
 """
 
 
+def _build_morning_brief(ctx: CoachContext, tone_desc: str) -> str:
+    stress = ctx.stress_score if ctx.stress_score is not None else "unavailable"
+    recovery = ctx.recovery_score if ctx.recovery_score is not None else "unavailable"
+    balance = ctx.net_balance if ctx.net_balance is not None else "unavailable"
+    return f"""\
+TRIGGER: morning_brief
+TONE: {ctx.tone}
+TONE INSTRUCTION: {tone_desc}
+
+USER PROFILE:
+    Pattern: {ctx.pattern_label}
+    {ctx.stage_in_words}
+
+TODAY'S SCORES (cite only these if you use numbers):
+    Stress load: {stress}/100
+    Recovery: {recovery}/100
+    Net balance: {balance}
+
+7-DAY CONTEXT:
+    Trajectory: {ctx.trajectory}
+    Load trend: {ctx.load_trend}
+    Recovery note: {ctx.recovery_pattern_note}
+    Sessions this week: {ctx.sessions_this_week}
+
+PRESCRIPTION:
+    Session type: {ctx.prescription.session_type}
+    Duration: {ctx.prescription.session_duration} minutes
+    Window: {ctx.prescription.session_window}
+
+Output this JSON:
+{{
+  "summary": "<20–45 words — morning state in plain language>",
+  "observation": "<10–35 words — what the scores imply today>",
+  "action": "<10–28 words — one clear move for the morning>",
+  "window": "<1 short sentence — when to act>",
+  "encouragement": "<optional — must include a digit if non-empty>",
+  "follow_up_question": "<short question, or null>"
+}}
+"""
+
+
 def _build_nudge(ctx: CoachContext, tone_desc: str) -> str:
     last_ago = (
         f"{ctx.last_session_ago_days} days" if ctx.last_session_ago_days else "unknown"
@@ -313,6 +354,7 @@ Output this JSON:
 # ── Dispatch table ────────────────────────────────────────────────────────────
 
 _TRIGGER_BUILDERS = {
+    "morning_brief":     _build_morning_brief,
     "post_session":      _build_post_session,
     "nudge":             _build_nudge,
     "weekly_review":     _build_weekly_review,

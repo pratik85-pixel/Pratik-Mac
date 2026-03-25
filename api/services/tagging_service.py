@@ -227,7 +227,7 @@ class TaggingService:
             plan_svc = PlanService(self._db, None)
             await plan_svc.confirm_plan_item(user_id, slug)
         except Exception:
-            pass 
+            logger.exception("plan adherence confirm_plan_item failed user=%s slug=%s", user_id, slug)
 
         return tag_result
 

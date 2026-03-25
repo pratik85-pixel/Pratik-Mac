@@ -46,6 +46,9 @@ class User(Base):
     training_level = Column(Integer, default=1)
     level_updated_at = Column(DateTime(timezone=True), nullable=True)
 
+    # Morning recap (Phase 5): user dismissed “close yesterday” card for this date
+    morning_recap_ack_for_date = Column(Date, nullable=True)
+
     # Relationships
     sessions       = relationship("Session", back_populates="user")
     personal_model = relationship("PersonalModel", back_populates="user", uselist=False)

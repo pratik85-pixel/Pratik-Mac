@@ -98,5 +98,45 @@ def build_pattern_model_from_windows(
     )
 
 def update_model_after_confirmation(model: Any, window: WindowRef, previous_tag: str):
-    pass
+    """
+    Incrementally update the user's TagPatternModel after a confirmed tag.
+
+    Keys patterns by "{window_type}:{tag}" so stress vs recovery never collide.
+    """
+    from tagging.auto_tagger import AUTOTAG_MIN_CONFIRMED, TagPattern
+    from tagging.tag_pattern_model import UserTagPatternModel
+
+    if not isinstance(model, UserTagPatternModel):
+        return model
+    tag = window.tag
+    if not tag or not str(tag).strip():
+        return model
+
+    wtype = window.window_type or "stress"
+    key = f"{wtype}:{tag}"
+    hour = window.started_at.hour
+    weekday = window.started_at.weekday()
+
+    if key not in model.patterns:
+        model.patterns[key] = TagPattern(tag=tag, window_type=wtype)
+
+    p = model.patterns[key]
+    p.tag = tag
+    p.window_type = wtype
+    p.confirmed_count += 1
+    p.hour_histogram[hour] = p.hour_histogram.get(hour, 0) + 1
+    p.weekday_counts[weekday] = p.weekday_counts.get(weekday, 0) + 1
+    if window.suppression_pct is not None:
+        n = p.confirmed_count
+        if n <= 1:
+            p.avg_suppression = float(window.suppression_pct)
+        else:
+            p.avg_suppression = (
+                p.avg_suppression * (n - 1) + float(window.suppression_pct)
+            ) / n
+
+    model.auto_tag_eligible_slugs = frozenset(
+        pat.tag for pat in model.patterns.values() if pat.confirmed_count >= AUTOTAG_MIN_CONFIRMED
+    )
+    return model
 

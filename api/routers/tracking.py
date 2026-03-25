@@ -10,6 +10,9 @@ GET  /tracking/stress-windows/{date}   — detected stress events for date
 GET  /tracking/recovery-windows/{date} — detected recovery events for date
 POST /tracking/tag-window              — user-confirmed tag on a stress/recovery window
 GET  /tracking/history                 — readiness trend (last N days, default 28)
+GET  /tracking/stress-state            — stress now (zone) + trend + optional cohort (Phase 2–3, 7)
+GET  /tracking/morning-recap           — yesterday summary + show/ack (Phase 5)
+POST /tracking/morning-recap/ack       — dismiss morning recap for a date
 """
 
 from __future__ import annotations
@@ -122,6 +125,55 @@ class HistoryEntry(BaseModel):
     net_balance:           Optional[float]
     day_type:              Optional[str]
     is_estimated:          bool
+
+
+class CohortInsightResponse(BaseModel):
+    enabled: bool
+    band: Optional[str] = None  # below_typical | typical | above_typical
+    disclaimer: str = ""
+
+
+class StressStateResponse(BaseModel):
+    """
+    Home hero: zone + trend. Zone ids map to Calm / Steady / Activated / Depleted.
+    """
+
+    stress_now_zone: Optional[str] = None       # calm | steady | activated | depleted
+    stress_now_index: Optional[float] = None  # 0 = calm vs ref, 1 = at floor
+    stress_now_percent: Optional[float] = None  # secondary display 0–100
+    trend: str                                # easing | stable | building | unclear
+    confidence: str                           # high | medium | low
+    reference_type: str = "morning_avg"
+    as_of: Optional[str] = None               # ISO timestamp of last window used
+    rmssd_smoothed_ms: Optional[float] = None
+    zone_cut_index_low: Optional[float] = None
+    zone_cut_index_mid: Optional[float] = None
+    zone_cut_index_high: Optional[float] = None
+    morning_reference_ms: Optional[float] = None
+    time_of_day_reference_ms: Optional[float] = None
+    cohort: Optional[CohortInsightResponse] = None
+
+
+class MorningRecapSummaryBlock(BaseModel):
+    stress_load_score: Optional[float] = None
+    waking_recovery_score: Optional[float] = None
+    net_balance: Optional[float] = None
+    day_type: Optional[str] = None
+    is_estimated: bool = False
+    is_partial_data: bool = False
+    sleep_recovery_area: Optional[float] = None
+    closing_balance: Optional[float] = None
+
+
+class MorningRecapResponse(BaseModel):
+    for_date: str
+    should_show: bool
+    acknowledged_for_date: bool
+    summary: Optional[MorningRecapSummaryBlock] = None
+
+
+class MorningRecapAckRequest(BaseModel):
+    for_date: str  # YYYY-MM-DD
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -362,6 +414,74 @@ async def ingest_beats(
         windows_processed=windows_processed,
         beats_received=len(beats),
     )
+
+
+@router.get("/stress-state", response_model=StressStateResponse)
+async def get_stress_state(
+    include_cohort: bool = False,
+    svc: TrackingService = Depends(_tracking_svc),
+) -> StressStateResponse:
+    """
+    Smoothed point-in-time stress vs personal reference + short trend.
+
+    Uses last ~8h of 5-min background windows for \"now\"; up to 28d history
+    for personal percentile zone cutpoints. When enough same DOW/hour samples
+    exist, blends in a time-of-day RMSSD median (see ``reference_type``).
+
+    ``include_cohort=true`` returns a ``cohort`` block only if the user opted in
+    via onboarding ``compare_to_peers: true`` (Phase 7 — approximate, disclaimer).
+    """
+    r = await svc.get_stress_state(include_cohort=include_cohort)
+    cohort: Optional[CohortInsightResponse] = None
+    if include_cohort:
+        cohort = CohortInsightResponse(
+            enabled=r.cohort_enabled,
+            band=r.cohort_band,
+            disclaimer=r.cohort_disclaimer,
+        )
+    return StressStateResponse(
+        stress_now_zone=r.stress_now_zone,
+        stress_now_index=r.stress_now_index,
+        stress_now_percent=r.stress_now_percent,
+        trend=r.trend,
+        confidence=r.confidence,
+        reference_type=r.reference_type,
+        as_of=r.as_of,
+        rmssd_smoothed_ms=r.rmssd_smoothed_ms,
+        zone_cut_index_low=r.zone_cut_index_low,
+        zone_cut_index_mid=r.zone_cut_index_mid,
+        zone_cut_index_high=r.zone_cut_index_high,
+        morning_reference_ms=r.morning_reference_ms,
+        time_of_day_reference_ms=r.time_of_day_reference_ms,
+        cohort=cohort,
+    )
+
+
+@router.get("/morning-recap", response_model=MorningRecapResponse)
+async def get_morning_recap(
+    svc: TrackingService = Depends(_tracking_svc),
+) -> MorningRecapResponse:
+    """Yesterday (IST) daily summary for the morning close card."""
+    raw = await svc.get_morning_recap()
+    blk = raw.get("summary")
+    summary = MorningRecapSummaryBlock(**blk) if blk else None
+    return MorningRecapResponse(
+        for_date=raw["for_date"],
+        should_show=raw["should_show"],
+        acknowledged_for_date=raw["acknowledged_for_date"],
+        summary=summary,
+    )
+
+
+@router.post("/morning-recap/ack")
+async def ack_morning_recap(
+    body: MorningRecapAckRequest,
+    svc: TrackingService = Depends(_tracking_svc),
+) -> dict:
+    """Mark morning recap as seen for ``for_date`` (usually yesterday, IST)."""
+    fd = _parse_date(body.for_date)
+    await svc.ack_morning_recap(fd)
+    return {"ok": True, "for_date": body.for_date}
 
 
 @router.get("/history", response_model=list[HistoryEntry])

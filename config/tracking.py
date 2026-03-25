@@ -135,6 +135,26 @@ class TrackingConfig(BaseSettings):
     # Active pre-calibration-lock only.
     MORNING_EWM_ALPHA: float = 0.2
 
+    # ── Stress state (now + trend) — tracking/stress_state, GET /tracking/stress-state
+    # EMA over consecutive 5-min RMSSD samples in the recent span
+    STRESS_STATE_EMA_ALPHA: float = 0.35
+    # Only windows with window_end >= now - span are used for “stress now”
+    STRESS_STATE_RECENT_SPAN_HOURS: float = 8.0
+    # Compare smoothed index now vs series ending around this many minutes ago
+    STRESS_STATE_TREND_LOOKBACK_MINUTES: int = 90
+    # Min delta on 0–1 stress index to label building / easing
+    STRESS_STATE_TREND_DELTA: float = 0.06
+    # Load this many days of background windows for personal percentile cutpoints
+    STRESS_STATE_HISTORY_DAYS: int = 28
+    # Minimum valid background stress-index samples to use percentile zones
+    STRESS_STATE_MIN_SAMPLES_PERCENTILE: int = 20
+
+    # Time-of-day reference (Phase 7): median RMSSD same weekday+hour in local TZ
+    STRESS_STATE_TIMEZONE: str = "Asia/Kolkata"
+    STRESS_STATE_TOD_MIN_BUCKET_SAMPLES: int = 8
+    # effective_index_ref = w * morning + (1-w) * tod_median when bucket eligible
+    STRESS_STATE_TOD_BLEND_MORNING_WEIGHT: float = 0.5
+
     class Config:
         env_prefix = "TRACKING_"
         case_sensitive = False

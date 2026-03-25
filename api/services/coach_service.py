@@ -130,6 +130,37 @@ USER FACTS:
 """
 
 
+def _llm_invoke_json(
+    llm_client: Any,
+    system_prompt: str,
+    user_prompt: str,
+) -> dict:
+    """
+    Support both ZenFlow's duck-typed `llm_client.chat(system, user) -> str`
+    and OpenAI-style `llm_client.chat.completions.create(...)`.
+    """
+    chat_fn = getattr(llm_client, "chat", None)
+    if callable(chat_fn):
+        raw_text = chat_fn(system_prompt, user_prompt)
+        raw_text = re.sub(r"^```[a-z]*\n?", "", raw_text.strip())
+        raw_text = re.sub(r"\n?```$", "", raw_text.strip())
+        return json.loads(raw_text)
+    # OpenAI client path (Phase 5 inline prompts)
+    response = llm_client.chat.completions.create(
+        model="gpt-4o",
+        temperature=0.6,
+        max_tokens=300,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": user_prompt},
+        ],
+    )
+    raw_text = response.choices[0].message.content or ""
+    raw_text = re.sub(r"^```[a-z]*\n?", "", raw_text.strip())
+    raw_text = re.sub(r"\n?```$", "", raw_text.strip())
+    return json.loads(raw_text)
+
+
 def _run_assembled_trigger(
     assembled: "AssembledContext",
     *,
@@ -149,21 +180,7 @@ def _run_assembled_trigger(
         return _assembled_fallback(assembled, trigger_type)
 
     try:
-        response = llm_client.chat.completions.create(
-            model="gpt-4o",
-            temperature=0.6,
-            max_tokens=300,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user",   "content": user_prompt},
-            ],
-        )
-        raw_text = response.choices[0].message.content or ""
-        # Strip markdown fences if present
-        raw_text = re.sub(r"^```[a-z]*\n?", "", raw_text.strip())
-        raw_text = re.sub(r"\n?```$", "", raw_text.strip())
-        parsed = json.loads(raw_text)
-        return parsed
+        return _llm_invoke_json(llm_client, system_prompt, user_prompt)
     except Exception as exc:
         logger.warning("assembled_trigger LLM failed trigger=%s: %s", trigger_type, exc)
         return _assembled_fallback(assembled, trigger_type)
@@ -264,6 +281,42 @@ class CoachService:
             stress_score=stress_score,
             recovery_score=recovery_score,
             psych_insight=psych_insight,
+        )
+        return generate_response(ctx, profile, llm_client=self._llm)
+
+    def morning_brief(
+        self,
+        fingerprint:        PersonalFingerprint,
+        profile:            NSHealthProfile,
+        *,
+        user_name:          str = "there",
+        habit_signals:      Optional[list[HabitSignal]] = None,
+        sessions_this_week: int = 0,
+        stress_score:       Optional[int] = None,
+        recovery_score:     Optional[int] = None,
+        psych_insight:      Optional[str] = None,
+        net_balance:        Optional[float] = None,
+    ) -> dict:
+        """On-demand morning brief via standard coach pipeline (tests + tooling)."""
+        prescription = self._prescription(profile, habit_signals or [])
+        milestone    = detect_milestone(profile, fingerprint)
+        tone         = select_tone(profile, milestone_detected=milestone is not None)
+
+        ctx = build_coach_context(
+            profile,
+            fingerprint,
+            trigger_type="morning_brief",
+            tone=tone,
+            prescription=prescription,
+            user_name=user_name,
+            habit_signals=habit_signals,
+            sessions_this_week=sessions_this_week,
+            milestone=milestone.label if milestone else None,
+            milestone_evidence=milestone.evidence if milestone else None,
+            stress_score=stress_score,
+            recovery_score=recovery_score,
+            psych_insight=psych_insight,
+            net_balance=net_balance,
         )
         return generate_response(ctx, profile, llm_client=self._llm)
 

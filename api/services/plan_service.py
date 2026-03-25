@@ -109,6 +109,60 @@ class PlanService:
 
         return plan.model_dump()
 
+    async def get_home_plan_status(self, user_id: str) -> dict:
+        """
+        Compact plan snapshot for Home (Phase 6): anchor intention + adherence + on_track.
+        Calendar day uses IST to match get_or_create_today_plan.
+        """
+        uid = parse_uuid(user_id)
+        empty: dict = {
+            "has_plan": False,
+            "plan_date": None,
+            "anchor_intention": None,
+            "anchor_slug": None,
+            "items_total": 0,
+            "items_completed": 0,
+            "adherence_pct": None,
+            "on_track": None,
+            "day_type": None,
+        }
+        if uid is None:
+            return empty
+
+        today = datetime.now(_IST).date()
+        today_dt = datetime(today.year, today.month, today.day, tzinfo=UTC)
+        row = await self._load_today_row(uid, today_dt)
+        if row is None:
+            return empty
+
+        d = self._row_to_dict(row)
+        items = d.get("items") or []
+        must_do = [i for i in items if i.get("priority") == "must_do"]
+        anchor = must_do[0] if must_do else (items[0] if items else None)
+        anchor_title = (anchor or {}).get("title") or None
+        anchor_slug = (anchor or {}).get("activity_type_slug") or (anchor or {}).get("id") or None
+        completed = sum(1 for i in items if i.get("has_evidence", False))
+        total = len(items)
+        adh = d.get("adherence_pct")
+        on_track: Optional[bool] = None
+        if total > 0:
+            if adh is not None:
+                on_track = adh >= 50.0
+            else:
+                on_track = completed >= max(1, total // 4)
+
+        return {
+            "has_plan": True,
+            "plan_date": d.get("plan_date"),
+            "anchor_intention": anchor_title,
+            "anchor_slug": anchor_slug,
+            "items_total": total,
+            "items_completed": completed,
+            "adherence_pct": adh,
+            "on_track": on_track,
+            "day_type": d.get("day_type"),
+        }
+
     # ── Record deviation ──────────────────────────────────────────────────────
 
     async def record_deviation(
