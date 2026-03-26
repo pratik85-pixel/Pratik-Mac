@@ -23,7 +23,7 @@ from sqlalchemy import select, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from outcomes.session_outcomes import SessionOutcome
-from api.db.database import get_db
+from api.db.database import get_db, AsyncSessionLocal
 from api.db.schema import CoachMessage, ConversationEvent
 from api.services.model_service import ModelService
 from api.services.coach_service import CoachService
@@ -313,15 +313,16 @@ async def close_conversation(
 
 @router.get("/morning-brief", response_model=MorningBriefResponse)
 async def get_morning_brief(
+    request: Request,
     user_id: str          = Depends(_user_id),
     db:      AsyncSession = Depends(get_db),
 ) -> MorningBriefResponse:
     """
     Return the cached morning brief for today.
 
-    The brief is generated at first wakeup (sleep→background transition)
-    and cached in UserUnifiedProfile. If no brief exists yet for today,
-    returns is_stale=True with whatever the last stored values are.
+    The brief is typically generated during morning reset and cached in
+    UserUnifiedProfile. If the cache is stale/missing for today, this endpoint
+    attempts a best-effort refresh before returning.
     """
     from zoneinfo import ZoneInfo
     import api.db.schema as _db
@@ -341,6 +342,21 @@ async def get_morning_brief(
 
     generated_for = uup.morning_brief_generated_for if uup else None
     is_stale = (generated_for is None or generated_for < today_ist)
+
+    if is_stale:
+        # Lazy refresh path: backfill today's brief when ingest-time trigger
+        # was missed (e.g., no qualifying reset event yet).
+        from coach.morning_brief import generate_morning_brief
+
+        llm_client = getattr(request.app.state, "llm_client", None)
+        await generate_morning_brief(AsyncSessionLocal, uid, llm_client)
+
+        result = await db.execute(
+            select(_db.UserUnifiedProfile).where(_db.UserUnifiedProfile.user_id == uid)
+        )
+        uup = result.scalar_one_or_none()
+        generated_for = uup.morning_brief_generated_for if uup else None
+        is_stale = (generated_for is None or generated_for < today_ist)
 
     plan = uup.suggested_plan_json or [] if uup else []
     avoid = uup.avoid_items_json or [] if uup else []
