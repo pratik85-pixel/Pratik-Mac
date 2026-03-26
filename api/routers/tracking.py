@@ -127,6 +127,7 @@ class HistoryEntry(BaseModel):
     net_balance:           Optional[float]
     day_type:              Optional[str]
     is_estimated:          bool
+    is_partial_data:       Optional[bool] = None
 
 
 class CohortInsightResponse(BaseModel):
@@ -511,6 +512,7 @@ async def get_history(
             net_balance           = getattr(row, 'net_balance', None),
             day_type              = row.day_type,
             is_estimated          = row.is_estimated,
+            is_partial_data       = getattr(row, 'is_partial_data', None),
         )
         for row in rows
     ]

@@ -127,10 +127,13 @@ async def _generate_and_store(
     # Build gap-annotated 7-day trajectory string
     traj_str = _build_trajectory_prompt(ctx.daily_trajectory, today_ist)
 
-    # Derive yesterday readiness and day state from latest trajectory entry
+    # Derive yesterday readiness/day state from explicit IST yesterday row.
+    yesterday_ist = today_ist - timedelta(days=1)
+    yesterday_row = _find_trajectory_row_for_date(ctx.daily_trajectory, yesterday_ist)
     latest_day = ctx.daily_trajectory[-1] if ctx.daily_trajectory else {}
-    yesterday_readiness = _readiness_from_net_balance(latest_day.get("net_balance"))
-    day_state = str(latest_day.get("day_type") or _day_state_from_readiness(yesterday_readiness))
+    source_row = yesterday_row or latest_day
+    yesterday_readiness = _readiness_from_net_balance(source_row.get("net_balance"))
+    day_state = str(source_row.get("day_type") or _day_state_from_readiness(yesterday_readiness))
     strain_target = _strain_target_from_state_and_readiness(day_state, yesterday_readiness)
 
     # Assemble user prompt
@@ -230,6 +233,15 @@ def _build_trajectory_prompt(trajectory: list[dict], today_ist: date) -> str:
 
     lines.sort()
     return "\n".join(lines) if lines else "  (no data available)"
+
+
+def _find_trajectory_row_for_date(trajectory: list[dict], target_date: date) -> Optional[dict]:
+    """Return trajectory row matching target_date (YYYY-MM-DD) if present."""
+    target = target_date.isoformat()
+    for row in trajectory:
+        if str(row.get("date", "")).startswith(target):
+            return row
+    return None
 
 
 def _build_user_prompt(

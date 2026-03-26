@@ -1746,9 +1746,10 @@ class TrackingService:
         start_ts = local_start.astimezone(UTC)
         end_ts = local_end.astimezone(UTC)
 
-        # Prefer finalized rows only — partial rows are overwritten every ingest and can
-        # match "yesterday IST" while still being today's live session (UTC session key).
-        row = await self._load_day_summary_finalized_in_utc_bounds(start_ts, end_ts)
+        # Prefer finalized rows; when missing, use stored partial row for the same IST
+        # bounds before computing a snapshot fallback. This keeps recap closer to
+        # History when nightly finalization has not run yet.
+        row = await self._load_day_summary_by_utc_bounds(start_ts, end_ts)
         recap_result: Optional[DailySummaryResult] = None
         if row is None:
             recap_result = await self._compute_recap_snapshot_for_ist_bounds(start_ts, end_ts, yesterday)
