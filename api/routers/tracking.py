@@ -504,7 +504,7 @@ async def get_history(
     if not 1 <= days <= 365:
         raise HTTPException(status_code=422, detail="`days` must be between 1 and 365.")
     rows = await svc.get_history(days=days)
-    return [
+    entries = [
         HistoryEntry(
             summary_date          = row.summary_date.date().isoformat() if row.summary_date else "",
             stress_load_score     = row.stress_load_score,
@@ -516,6 +516,42 @@ async def get_history(
         )
         for row in rows
     ]
+
+    # Keep today's History point in lockstep with Home by overlaying live summary.
+    # Stored rows can lag behind the latest open-session recomputation.
+    tz = ZoneInfo(CONFIG.tracking.STRESS_STATE_TIMEZONE)
+    today_local = datetime.now(tz).date()
+    live_today = await svc.compute_live_summary(today_local)
+    if live_today is not None:
+        today_key = today_local.isoformat()
+        replaced = False
+        for i, e in enumerate(entries):
+            if e.summary_date == today_key:
+                entries[i] = HistoryEntry(
+                    summary_date=today_key,
+                    stress_load_score=live_today.stress_load_score,
+                    waking_recovery_score=live_today.waking_recovery_score,
+                    net_balance=live_today.net_balance,
+                    day_type=live_today.day_type,
+                    is_estimated=live_today.is_estimated,
+                    is_partial_data=live_today.is_partial_data,
+                )
+                replaced = True
+                break
+        if not replaced:
+            entries.insert(
+                0,
+                HistoryEntry(
+                    summary_date=today_key,
+                    stress_load_score=live_today.stress_load_score,
+                    waking_recovery_score=live_today.waking_recovery_score,
+                    net_balance=live_today.net_balance,
+                    day_type=live_today.day_type,
+                    is_estimated=live_today.is_estimated,
+                    is_partial_data=live_today.is_partial_data,
+                ),
+            )
+    return entries
 
 
 # ── Private builder ────────────────────────────────────────────────────────────
