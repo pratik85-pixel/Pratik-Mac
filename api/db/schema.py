@@ -49,6 +49,9 @@ class User(Base):
     # Morning recap (Phase 5): user dismissed “close yesterday” card for this date
     morning_recap_ack_for_date = Column(Date, nullable=True)
 
+    # Last nap-safe morning cycle reset (local calendar day in STRESS_STATE_TIMEZONE)
+    last_morning_cycle_reset_local_date = Column(Date, nullable=True)
+
     # Relationships
     sessions       = relationship("Session", back_populates="user")
     personal_model = relationship("PersonalModel", back_populates="user", uselist=False)

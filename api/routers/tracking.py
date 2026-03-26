@@ -28,6 +28,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from api.db.database import get_db, AsyncSessionLocal
 from api.services.tracking_service import TrackingService
 from api.rate_limiter import ingest_limiter
+from config import CONFIG
+from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/tracking", tags=["tracking"])
@@ -157,6 +159,7 @@ class StressStateResponse(BaseModel):
 class MorningRecapSummaryBlock(BaseModel):
     stress_load_score: Optional[float] = None
     waking_recovery_score: Optional[float] = None
+    sleep_recovery_score: Optional[float] = None
     net_balance: Optional[float] = None
     day_type: Optional[str] = None
     is_estimated: bool = False
@@ -209,8 +212,12 @@ async def get_today_summary(
     1. Persisted DailyStressSummary row for today (finalized or partial).
     2. Live on-the-fly computation spanning from last morning read (no DB write).
     3. 404 — band not worn at all yet.
+
+    "Today" uses STRESS_STATE_TIMEZONE (IST) so Home matches History labels and
+    materialised rows keyed by IST calendar date.
     """
-    today = datetime.now(UTC).date()
+    tz = ZoneInfo(CONFIG.tracking.STRESS_STATE_TIMEZONE)
+    today = datetime.now(tz).date()
 
     personal = await svc.get_personal_model()
 

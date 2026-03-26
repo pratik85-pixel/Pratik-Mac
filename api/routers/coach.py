@@ -99,6 +99,72 @@ class NightClosureResponse(BaseModel):
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 
+async def _gated_nudge_decision(
+    *,
+    user_id: str,
+    db: AsyncSession,
+    model_svc: ModelService,
+    coach_svc: CoachService,
+) -> NudgeCheckResponse:
+    from zoneinfo import ZoneInfo
+    from datetime import timedelta, timezone as _tz
+    from sqlalchemy import func
+    import api.db.schema as _db
+    from coach.data_assembler import assemble_for_user
+    from config import CONFIG
+
+    uid = parse_uuid(user_id)
+    if uid is None:
+        raise HTTPException(status_code=401, detail="Invalid X-User-Id")
+
+    IST = ZoneInfo("Asia/Kolkata")
+    cfg = CONFIG.coach
+    now_ist = datetime.now(IST)
+
+    # Gate 1 — time window
+    if not (cfg.NUDGE_WINDOW_START_HOUR_IST <= now_ist.hour < cfg.NUDGE_WINDOW_END_HOUR_IST):
+        return NudgeCheckResponse(should_nudge=False, message=None, reason="outside_window")
+
+    # Gate 2 — cap check (rolling 4h window, UTC-aware for DB timestamps)
+    cutoff_utc = datetime.now(_tz.utc) - timedelta(hours=4)
+    cap_result = await db.execute(
+        select(func.count(_db.CoachMessage.id)).where(
+            _db.CoachMessage.user_id == uid,
+            _db.CoachMessage.message_type == "nudge",
+            _db.CoachMessage.created_at >= cutoff_utc,
+        )
+    )
+    nudges_in_window = cap_result.scalar() or 0
+    if nudges_in_window >= cfg.NUDGE_CAP_PER_4H:
+        return NudgeCheckResponse(should_nudge=False, message=None, reason="cap_reached")
+
+    # Gate 3 — data availability
+    assembled = await assemble_for_user(db, uid)
+    if not assembled.daily_trajectory:
+        return NudgeCheckResponse(should_nudge=False, message=None, reason="no_data")
+
+    # All gates passed — generate nudge
+    fp = await model_svc.get_fingerprint(user_id) or _empty_fp()
+    profile = await model_svc.get_profile(user_id)
+    latest = assembled.daily_trajectory[-1]
+    output = coach_svc.nudge(
+        fp, profile,
+        stress_score=latest.get("stress_load"),
+        recovery_score=latest.get("waking_recovery"),
+    )
+    message = output.get("summary") or output.get("action")
+    if message:
+        db.add(
+            CoachMessage(
+                user_id=uid,
+                message_type="nudge",
+                summary=message[:8000],
+                reason="nudge_check_gate_passed",
+            )
+        )
+        await db.commit()
+    return NudgeCheckResponse(should_nudge=True, message=message, reason="ok")
+
 @router.get("/post-session")
 async def post_session_brief(
     request:    Request,
@@ -134,13 +200,23 @@ async def nudge(
     user_id:   str          = Depends(_user_id),
     model_svc: ModelService = Depends(_model_svc),
     coach_svc: CoachService = Depends(_coach_svc),
+    db:        AsyncSession = Depends(get_db),
 ) -> dict:
-    """Generate a short mid-day motivational nudge."""
-    fp      = await model_svc.get_fingerprint(user_id) or _empty_fp()
-    profile = await model_svc.get_profile(user_id)
-
-    output = coach_svc.nudge(fp, profile)
-    return {"trigger": "nudge", "user_id": user_id, **output}
+    """Generate a short mid-day nudge when gates (window/cap/data) pass."""
+    decision = await _gated_nudge_decision(
+        user_id=user_id,
+        db=db,
+        model_svc=model_svc,
+        coach_svc=coach_svc,
+    )
+    return {
+        "trigger": "nudge",
+        "user_id": user_id,
+        "should_nudge": decision.should_nudge,
+        "reason": decision.reason,
+        "message": decision.message,
+        "summary": decision.message,
+    }
 
 
 @router.post("/conversation", response_model=CoachReply)
@@ -301,65 +377,12 @@ async def nudge_check(
 
     Returns should_nudge=True + generated message only when all gates pass.
     """
-    from zoneinfo import ZoneInfo
-    from datetime import timedelta
-    from sqlalchemy import func
-    import api.db.schema as _db
-    from coach.data_assembler import assemble_for_user
-    from config import CONFIG
-
-    uid = parse_uuid(user_id)
-    if uid is None:
-        raise HTTPException(status_code=401, detail="Invalid X-User-Id")
-
-    IST = ZoneInfo("Asia/Kolkata")
-    cfg = CONFIG.coach
-    now_ist = datetime.now(IST)
-
-    # Gate 1 — time window
-    if not (cfg.NUDGE_WINDOW_START_HOUR_IST <= now_ist.hour < cfg.NUDGE_WINDOW_END_HOUR_IST):
-        return NudgeCheckResponse(should_nudge=False, message=None, reason="outside_window")
-
-    # Gate 2 — cap check (rolling 4h window, UTC-aware for DB timestamps)
-    from datetime import timezone as _tz
-    cutoff_utc = datetime.now(_tz.utc) - timedelta(hours=4)
-    cap_result = await db.execute(
-        select(func.count(_db.CoachMessage.id)).where(
-            _db.CoachMessage.user_id    == uid,
-            _db.CoachMessage.message_type == "nudge",
-            _db.CoachMessage.created_at >= cutoff_utc,
-        )
+    return await _gated_nudge_decision(
+        user_id=user_id,
+        db=db,
+        model_svc=model_svc,
+        coach_svc=coach_svc,
     )
-    nudges_in_window = cap_result.scalar() or 0
-    if nudges_in_window >= cfg.NUDGE_CAP_PER_4H:
-        return NudgeCheckResponse(should_nudge=False, message=None, reason="cap_reached")
-
-    # Gate 3 — data availability
-    assembled = await assemble_for_user(db, uid)
-    if not assembled.daily_trajectory:
-        return NudgeCheckResponse(should_nudge=False, message=None, reason="no_data")
-
-    # All gates passed — generate a nudge
-    fp      = await model_svc.get_fingerprint(user_id) or _empty_fp()
-    profile = await model_svc.get_profile(user_id)
-    latest  = assembled.daily_trajectory[-1]
-    output  = coach_svc.nudge(
-        fp, profile,
-        stress_score   = latest.get("stress_load"),
-        recovery_score = latest.get("waking_recovery"),
-    )
-    message = output.get("summary") or output.get("action")
-    if message:
-        db.add(
-            CoachMessage(
-                user_id=uid,
-                message_type="nudge",
-                summary=message[:8000],
-                reason="nudge_check_gate_passed",
-            )
-        )
-        await db.commit()
-    return NudgeCheckResponse(should_nudge=True, message=message, reason="ok")
 
 
 @router.get("/evening-checkin", response_model=EveningCheckinResponse)

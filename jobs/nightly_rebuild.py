@@ -131,13 +131,14 @@ async def _increment_streak(session, user_id) -> None:
 
 async def _auto_tag_pass(session, user_id) -> int:
     """
-    Placeholder for the nightly auto-tag pass.
-    Full implementation: iterate untagged StressWindow/RecoveryWindow rows,
-    query TagPatternModel, write tag_source='auto_tagged'.
-    Returns number of windows newly tagged.
+    Run nightly auto-tag pass via TaggingService.
+    Returns number of newly tagged windows.
     """
-    # TODO: implement full auto-tag pass using TagPatternModel
-    return 0
+    from api.services.tagging_service import TaggingService
+
+    svc = TaggingService(db=session)
+    result = await svc.run_auto_tag_pass(str(user_id))
+    return int(result.tagged_count or 0)
 
 
 # ── Capacity growth detection ─────────────────────────────────────────────────
@@ -443,6 +444,8 @@ async def _rebuild_one_user(
     import api.db.schema as db
     from api.services.profile_service import rebuild_unified_profile
     from api.services.psych_service import load_psych_profile
+    from api.services.model_service import ModelService
+    from api.services.plan_service import PlanService
 
     result: dict = {
         "user_id": str(user_id),
@@ -502,6 +505,16 @@ async def _rebuild_one_user(
         result["narrative_version"] = profile.narrative_version
         result["engagement_tier"]   = profile.engagement.engagement_tier
         result["plan_items"]        = len(profile.suggested_plan)
+
+        # ── Step 1b: Materialise today's DailyPlan once/day (IST) ────────────
+        # Ensures Plan tab is ready before first user open.
+        try:
+            model_svc = ModelService(db=session)
+            plan_svc = PlanService(db=session, model_service=model_svc)
+            plan_dict = await plan_svc.get_or_create_today_plan(str(user_id), force_regen=True)
+            result["plan_items"] = len(plan_dict.get("items", []))
+        except Exception as exc:
+            log.warning("plan materialisation failed user=%s: %s", user_id, exc)
 
         # Streak increment
         await _increment_streak(session, user_id)

@@ -3,14 +3,16 @@ coach/morning_brief.py
 
 Stream 4 — Morning brief generator.
 
-Generates a single-screen day assessment for the user, cached at the moment
-the band transitions from sleep → background (i.e. first wakeup detection).
-This means the brief is ready when the user opens the app — not generated
-on app open, which would add latency.
+Generates a single-screen day assessment for the user, cached when the morning
+reset runs: either sleep → background after overnight wear (Scenario A, with
+nap-safety gates), or the forced no–overnight-wear path after the daily anchor
+(Scenario B — first background ingest after anchor with no band in the prior
+inter-anchor window). This keeps the brief ready when the user opens the app
+without generating on every app open.
 
 Public API
 ----------
-    await generate_morning_brief(session_factory, user_id, opening_balance, llm_client)
+    await generate_morning_brief(session_factory, user_id, llm_client)
 
 The function opens its own DB session from the factory so it can run as a
 fire-and-forget asyncio.create_task() without interfering with the ingest
@@ -28,7 +30,8 @@ LLM output schema
 
 Deterministic fallback (no LLM)
 --------------------------------
-avg net_balance over available trajectory days + band coverage count → rule map.
+Uses yesterday readiness + recent trajectory + coverage to produce a
+2–3 line brief and a strain target.
 """
 
 from __future__ import annotations
@@ -50,11 +53,15 @@ data-grounded day assessment that the user will read the moment they wake up.
 
 Rules
 -----
-- day_state  : "green" (surplus), "yellow" (balanced/caution), "red" (debt/rest)
+- day_state  : "green" | "yellow" | "red"
 - day_confidence: "high" if ≥4 band days available in last 7, else "medium" or "low"
-- brief_text : 1–2 sentences. Plain Indian English. Encouraging tone. Cite one real number.
-- evidence   : 1–2 sentences. Specific data signals that drove the assessment.
+- brief_text : STRICTLY 2–3 lines. Must include:
+  1) type of day (green/yellow/red),
+  2) yesterday readiness score,
+  3) today's strain target and what it implies.
+- evidence   : trajectory-based only (past days trend), 1–2 sentences.
 - one_action : One clear, doable action for today (≤15 words). No disclaimers.
+- Never use the phrase "opening balance". Use readiness language only.
 
 Output ONLY valid JSON matching this schema — no prose, no markdown fences:
 {
@@ -71,7 +78,6 @@ Output ONLY valid JSON matching this schema — no prose, no markdown fences:
 async def generate_morning_brief(
     session_factory: Callable,
     user_id: uuid_mod.UUID,
-    opening_balance: float,
     llm_client: Optional[Any],
 ) -> None:
     """
@@ -82,7 +88,7 @@ async def generate_morning_brief(
     """
     try:
         async with session_factory() as session:
-            await _generate_and_store(session, user_id, opening_balance, llm_client)
+            await _generate_and_store(session, user_id, llm_client)
     except Exception:
         log.exception("generate_morning_brief failed user=%s", user_id)
 
@@ -92,7 +98,6 @@ async def generate_morning_brief(
 async def _generate_and_store(
     session,
     user_id: uuid_mod.UUID,
-    opening_balance: float,
     llm_client: Optional[Any],
 ) -> None:
     from zoneinfo import ZoneInfo
@@ -122,18 +127,19 @@ async def _generate_and_store(
     # Build gap-annotated 7-day trajectory string
     traj_str = _build_trajectory_prompt(ctx.daily_trajectory, today_ist)
 
-    # Sleep recovery efficiency from most recent trajectory day
-    sleep_eff: Optional[str] = None
-    if ctx.daily_trajectory:
-        latest = ctx.daily_trajectory[-1]
-        sleep_eff = latest.get("sleep_recovery_efficiency") or latest.get("day_type")
+    # Derive yesterday readiness and day state from latest trajectory entry
+    latest_day = ctx.daily_trajectory[-1] if ctx.daily_trajectory else {}
+    yesterday_readiness = _readiness_from_net_balance(latest_day.get("net_balance"))
+    day_state = str(latest_day.get("day_type") or _day_state_from_readiness(yesterday_readiness))
+    strain_target = _strain_target_from_state_and_readiness(day_state, yesterday_readiness)
 
     # Assemble user prompt
     user_prompt = _build_user_prompt(
         today=today_ist,
-        opening_balance=opening_balance,
         traj_str=traj_str,
-        sleep_eff=sleep_eff,
+        day_state=day_state,
+        yesterday_readiness=yesterday_readiness,
+        strain_target=strain_target,
         watch_notes=watch_notes,
         band_days=band_days,
     )
@@ -148,7 +154,13 @@ async def _generate_and_store(
             log.exception("morning_brief LLM call failed user=%s — using fallback", user_id)
 
     if result is None:
-        result = _deterministic_brief(ctx.daily_trajectory, band_days)
+        result = _deterministic_brief(
+            ctx.daily_trajectory,
+            band_days,
+            day_state=day_state,
+            yesterday_readiness=yesterday_readiness,
+            strain_target=strain_target,
+        )
 
     # Persist
     now_utc = datetime.now(UTC)
@@ -203,15 +215,13 @@ def _build_trajectory_prompt(trajectory: list[dict], today_ist: date) -> str:
         d = _parse_date(row.get("date", ""))
         if d is None:
             continue
-        nb  = row.get("net_balance")
         sl  = row.get("stress_load")
         wr  = row.get("waking_recovery")
         dt  = row.get("day_type", "unknown")
-        nb_str = f"{nb:+.1f}" if nb is not None else "?"
         sl_str = str(round(sl)) if sl is not None else "?"
         wr_str = str(round(wr)) if wr is not None else "?"
         lines.append(
-            f"  {d.isoformat()}: net_balance={nb_str}, stress={sl_str}/100, "
+            f"  {d.isoformat()}: stress={sl_str}/100, "
             f"recovery={wr_str}/100, day_type={dt}"
         )
 
@@ -225,17 +235,19 @@ def _build_trajectory_prompt(trajectory: list[dict], today_ist: date) -> str:
 def _build_user_prompt(
     *,
     today: date,
-    opening_balance: float,
     traj_str: str,
-    sleep_eff: Optional[str],
+    day_state: str,
+    yesterday_readiness: int,
+    strain_target: int,
     watch_notes: list[str],
     band_days: int,
 ) -> str:
     notes_str = "\n".join(f"  • {n}" for n in watch_notes) if watch_notes else "  • None"
     return f"""
 TODAY: {today.isoformat()}
-OPENING BALANCE (carry-forward from last night): {opening_balance:+.1f}
-SLEEP / RECOVERY EFFICIENCY (last night): {sleep_eff or 'Unknown'}
+TODAY DAY TYPE: {day_state}
+YESTERDAY READINESS SCORE: {yesterday_readiness}
+TODAY STRAIN TARGET: {strain_target}
 
 7-DAY TRAJECTORY (oldest → newest, IST dates):
 {traj_str}
@@ -286,38 +298,42 @@ def _parse_brief_json(raw: str) -> Optional[dict]:
 
 # ── Deterministic fallback ────────────────────────────────────────────────────
 
-def _deterministic_brief(trajectory: list[dict], band_days: int) -> dict:
+def _deterministic_brief(
+    trajectory: list[dict],
+    band_days: int,
+    *,
+    day_state: str,
+    yesterday_readiness: int,
+    strain_target: int,
+) -> dict:
     """Rule-based morning brief when LLM is unavailable."""
-    nb_values = [
-        row["net_balance"]
-        for row in trajectory
-        if row.get("net_balance") is not None
-    ]
-    avg_nb = sum(nb_values) / len(nb_values) if nb_values else 0.0
-    days_available = len(nb_values)
+    state = day_state if day_state in ("green", "yellow", "red") else _day_state_from_readiness(yesterday_readiness)
+    recent = trajectory[-4:] if trajectory else []
+    stress_vals = [r.get("stress_load") for r in recent if r.get("stress_load") is not None]
+    recov_vals = [r.get("waking_recovery") for r in recent if r.get("waking_recovery") is not None]
+    trend_note = "recent trend is mixed"
+    if len(stress_vals) >= 2 and len(recov_vals) >= 2:
+        s_delta = float(stress_vals[-1]) - float(stress_vals[0])
+        r_delta = float(recov_vals[-1]) - float(recov_vals[0])
+        if r_delta >= 4 and s_delta <= 2:
+            trend_note = "recovery trend improved while stress stayed controlled"
+        elif s_delta >= 6:
+            trend_note = "stress trended up over recent days"
+        elif r_delta <= -4:
+            trend_note = "recovery trended down over recent days"
 
-    # State
-    if avg_nb >= 10.0:
-        state = "green"
-        brief = (
-            f"Your last {days_available} days average a net balance of {avg_nb:+.1f} — "
-            "you're in a good place. Keep the morning session going."
-        )
-        action = "Start with a 10-minute breathing session."
-    elif avg_nb >= -20.0:
-        state = "yellow"
-        brief = (
-            f"Average net balance is {avg_nb:+.1f} over {days_available} days — "
-            "balanced, but keep the easy wins coming."
-        )
-        action = "One short breathing or stretching session today."
-    else:
-        state = "red"
-        brief = (
-            f"Net balance has been {avg_nb:+.1f} over {days_available} days — "
-            "your body needs recovery today."
-        )
-        action = "5 minutes of breathing only — no hard training today."
+    brief = (
+        f"Today is a {state} day. Your readiness score of {yesterday_readiness} "
+        f"supports a strain target of {strain_target}.\n"
+        "Your body signal suggests this target is realistic for today."
+    )
+    action = (
+        "Do your hardest planned block early."
+        if state == "green"
+        else "Keep intensity moderate and pace your sessions."
+        if state == "yellow"
+        else "Prioritize recovery blocks and avoid hard exertion."
+    )
 
     # Confidence
     if band_days >= 4:
@@ -331,7 +347,7 @@ def _deterministic_brief(trajectory: list[dict], band_days: int) -> dict:
         "day_state":      state,
         "day_confidence": confidence,
         "brief_text":     brief,
-        "evidence":       f"{days_available}/7 days of data available, avg net_balance {avg_nb:+.1f}.",
+        "evidence":       f"Past trajectory shows {trend_note}. {len(recent)}/4 recent days available.",
         "one_action":     action,
     }
 
@@ -343,3 +359,27 @@ def _parse_date(s: str) -> Optional[date]:
         return date.fromisoformat(s[:10])
     except (ValueError, TypeError):
         return None
+
+
+def _readiness_from_net_balance(net_balance: Any) -> int:
+    try:
+        if net_balance is None:
+            return 50
+        v = ((float(net_balance) + 30.0) / 60.0) * 100.0
+        return int(round(max(0.0, min(100.0, v))))
+    except Exception:
+        return 50
+
+
+def _day_state_from_readiness(readiness: int) -> str:
+    if readiness >= 70:
+        return "green"
+    if readiness >= 45:
+        return "yellow"
+    return "red"
+
+
+def _strain_target_from_state_and_readiness(day_state: str, readiness: int) -> int:
+    base = 70 if day_state == "green" else 55 if day_state == "yellow" else 40
+    adj = 8 if readiness >= 80 else 4 if readiness >= 65 else 0 if readiness >= 45 else -6
+    return int(max(30, min(90, base + adj)))

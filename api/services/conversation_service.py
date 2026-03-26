@@ -199,6 +199,10 @@ class ConversationService:
         uid = parse_uuid(user_id)
         assembled: Optional[AssembledContext] = None
         avoid_items_raw: list[dict] = []
+        psych_insight: Optional[str] = None
+        uup_narrative: Optional[str] = None
+        user_facts_lines: list[str] = []
+        engagement_tier: Optional[str] = None
         if db is not None and uid is not None:
             try:
                 assembled = await assemble_for_user(db, uid)
@@ -208,12 +212,21 @@ class ConversationService:
                         {"slug_or_label": a.slug_or_label, "reason": a.reason}
                         for a in uup.avoid_items
                     ]
+                if assembled is not None:
+                    psych_insight = assembled.psych_insight
+                    uup_narrative = assembled.coach_narrative
+                    user_facts_lines = list(assembled.user_facts or [])
+                    engagement_tier = assembled.engagement_tier
             except Exception:
                 logger.warning(
                     "DataAssembler failed for user=%s — proceeding without physio", user_id
                 )
                 assembled = None
                 avoid_items_raw = []
+                psych_insight = None
+                uup_narrative = None
+                user_facts_lines = []
+                engagement_tier = None
 
         # Extract today scores from assembled trajectory (most recent day)
         _net_bal: Optional[float] = None
@@ -247,6 +260,10 @@ class ConversationService:
                 net_balance=_net_bal,
                 stress_score=_stress_sc,
                 recovery_score=_recovery_sc,
+                psych_insight=psych_insight,
+                uup_narrative=uup_narrative,
+                user_facts=user_facts_lines,
+                engagement_tier=engagement_tier,
                 avoid_items=avoid_items_raw,
             )
 

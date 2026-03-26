@@ -181,7 +181,7 @@ class PlanService:
         if uid is None:
             return ""
 
-        today = date.today()
+        today = datetime.now(_IST).date()
         today_dt = datetime(today.year, today.month, today.day, tzinfo=UTC)
         plan_row = await self._load_today_row(uid, today_dt)
         plan_id = plan_row.id if plan_row is not None else uuid.uuid4()
@@ -241,11 +241,15 @@ class PlanService:
         uid: uuid.UUID,
         today_dt: datetime,
     ) -> Optional[DailyPlanRow]:
+        next_day_dt = today_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+        from datetime import timedelta
+        next_day_dt = next_day_dt + timedelta(days=1)
         result = await self._db.execute(
             select(DailyPlanRow)
             .where(
                 DailyPlanRow.user_id == uid,
                 DailyPlanRow.plan_date >= today_dt,
+                DailyPlanRow.plan_date < next_day_dt,
             )
             .order_by(DailyPlanRow.generated_at.desc())
             .limit(1)
@@ -394,14 +398,14 @@ class PlanService:
         Runs IntradayMatcher using the confirmed tag.
         Updates the daily plan's items_json if an item matches.
         """
-        from datetime import date, datetime, UTC
+        from datetime import datetime, UTC
         from api.utils import parse_uuid
         from tagging.intraday_matcher import IntradayMatcher
         from sqlalchemy.orm.attributes import flag_modified
         
         uid = parse_uuid(user_id)
         if not uid: return False
-        today = date.today()
+        today = datetime.now(_IST).date()
         today_dt = datetime(today.year, today.month, today.day, tzinfo=UTC)
         plan_row = await self._load_today_row(uid, today_dt)
         if not plan_row or not plan_row.items_json:
@@ -422,14 +426,14 @@ class PlanService:
         recalculates adherence_pct, and persists the change.
         Returns True if a matching item was found and updated.
         """
-        from datetime import date, datetime, UTC
+        from datetime import datetime, UTC
         from sqlalchemy.orm.attributes import flag_modified
 
         uid = parse_uuid(user_id)
         if not uid:
             return False
 
-        today = date.today()
+        today = datetime.now(_IST).date()
         today_dt = datetime(today.year, today.month, today.day, tzinfo=UTC)
         plan_row = await self._load_today_row(uid, today_dt)
         if not plan_row or not plan_row.items_json:
