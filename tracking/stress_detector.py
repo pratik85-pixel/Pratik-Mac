@@ -5,12 +5,15 @@ Detects stress events from a sequence of BackgroundWindowResult objects.
 
 Algorithm:
     1. For each valid window, compare rmssd_ms against the user's personal morning average.
-    2. A window "breaches" if rmssd_ms < personal_morning_avg × STRESS_THRESHOLD_PCT
-       OR if rmssd dropped > STRESS_RATE_TRIGGER_PCT compared to the previous window.
-    3. Consecutive breaching windows are merged into candidate events.
-    4. A candidate becomes a StressWindowResult if it spans >= STRESS_MIN_WINDOWS windows.
-    5. Adjacent events with gap <= STRESS_MERGE_GAP_MINUTES are merged into one.
-    6. Each event records max suppression, duration, and a tag candidate based on motion.
+    2. Layer 1 breach: rmssd_ms < personal_morning_avg × STRESS_THRESHOLD_PCT
+       OR rmssd dropped > STRESS_RATE_TRIGGER_PCT vs previous window.
+    3. Layer 2 (Phase 2): if personal_resting_hr is set, require hr_bpm ≥ resting + STRESS_HR_CORROBORATION_BPM.
+    4. Bridge micro-recovery: False runs shorter than STRESS_RECOVERY_CONFIRMATION_WINDOWS
+       sandwiched between stressed windows are treated as still stressed.
+    5. Consecutive breaching windows are merged into candidate events.
+    6. A candidate becomes a StressWindowResult if it spans >= STRESS_MIN_WINDOWS windows.
+    7. Adjacent events with gap <= STRESS_MERGE_GAP_MINUTES are merged into one.
+    8. Each event records max suppression, duration, and a tag candidate based on motion.
 
 Motion differentiation:
     - Windows with acc_mean > MOTION_ACTIVE_THRESHOLD → "physical_load_candidate"
@@ -67,12 +70,41 @@ class StressWindowResult:
     _source_windows:          list = field(default_factory=list, repr=False, compare=False)
 
 
+def _collapse_short_non_breaches(breaching: list[bool], max_gap_windows: int) -> list[bool]:
+    """
+    Bridge short False runs between True runs (micro-recovery inside one episode).
+
+    If max_gap_windows is N, gaps of length 1 .. N-1 between stressed regions are filled True.
+    """
+    if not breaching or max_gap_windows <= 1:
+        return list(breaching)
+    n = len(breaching)
+    out = list(breaching)
+    i = 0
+    while i < n:
+        if out[i]:
+            i += 1
+            continue
+        j = i
+        while j < n and not out[j]:
+            j += 1
+        gap_len = j - i
+        has_true_before = any(out[k] for k in range(i))
+        has_true_after = any(out[k] for k in range(j, n))
+        if gap_len > 0 and gap_len < max_gap_windows and has_true_before and has_true_after:
+            for k in range(i, j):
+                out[k] = True
+        i = j
+    return out
+
+
 def detect_stress_windows(
     windows: list[BackgroundWindowResult],
     personal_morning_avg: float,
     personal_floor: float,
     wake_ts: Optional[datetime] = None,
     sleep_ts: Optional[datetime] = None,
+    personal_resting_hr: Optional[float] = None,
 ) -> list[StressWindowResult]:
     """
     Detect stress events from a day's worth of BackgroundWindowResult objects.
@@ -92,6 +124,9 @@ def detect_stress_windows(
         If provided, only windows at or after wake_ts are included.
     sleep_ts : datetime, optional
         If provided, only windows before sleep_ts are included.
+    personal_resting_hr : float, optional
+        If set (from PersonalModel.rmssd_resting_hr_bpm), HR must be ≥ resting + STRESS_HR_CORROBORATION_BPM
+        to confirm a breach. If None or hr_bpm missing, Layer 2 does not block (graceful degradation).
 
     Returns
     -------
@@ -132,8 +167,21 @@ def detect_stress_windows(
             drop_pct = (prev_rmssd - rmssd) / prev_rmssd
             rate_breach = drop_pct > cfg.STRESS_RATE_TRIGGER_PCT
 
-        breaching.append(threshold_breach or rate_breach)
+        layer1_breach = threshold_breach or rate_breach
+
+        # Layer 2 — HR corroboration (optional; does not block when HR missing)
+        hr_ok = True
+        if personal_resting_hr is not None and w.hr_bpm is not None:
+            hr_ok = w.hr_bpm >= (personal_resting_hr + cfg.STRESS_HR_CORROBORATION_BPM)
+
+        breaching.append(layer1_breach and hr_ok)
         prev_rmssd = rmssd
+
+    # Bridge micro-recovery gaps (non-breach streaks shorter than sustained recovery)
+    breaching = _collapse_short_non_breaches(
+        breaching,
+        cfg.STRESS_RECOVERY_CONFIRMATION_WINDOWS,
+    )
 
     # Step 2: group consecutive breaching windows into raw candidates
     candidates: list[list[BackgroundWindowResult]] = []

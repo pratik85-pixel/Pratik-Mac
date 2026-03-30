@@ -113,6 +113,7 @@ class DailySummaryResult:
 
     # ── Credit-card scores ─────────────────────────────────────────
     waking_recovery_score:        Optional[float] = None   # display only, clamped 0–100
+    sleep_recovery_score:         Optional[float] = None   # display only, clamped 0-100
     net_balance:                  Optional[float] = None   # raw: recovery% - stress% + opening_balance
 
     # ── Continuous balance thread ──────────────────────────────────
@@ -267,11 +268,27 @@ def compute_daily_summary(
         recovery_pct_raw = round(total_recovery_area / ns_capacity_recovery * 100.0, 2)
 
     # ── Display scores (clamped 0–100 for UI rendering only) ─────────────────
+    # Separate denominators per score type now that each is a standalone metric:
+    #   waking_recovery_score → denominator = log_range × 960  (16-hr waking day)
+    #   sleep_recovery_score  → denominator = log_range × 480  (8-hr sleep period)
+    # net_balance uses ns_capacity_recovery (1440) unchanged for backward compat.
+    ns_capacity_waking_display = log_recovery_range * cfg.DAILY_CAPACITY_WAKING_MINUTES   # 960
+    ns_capacity_sleep_display  = log_recovery_range * cfg.DAILY_CAPACITY_SLEEP_MINUTES     # 480
     stress_load: Optional[float] = None
     waking_recovery_score: Optional[float] = None
-    if stress_pct_raw is not None:
+    sleep_recovery_score: Optional[float] = None
+    waking_recovery_pct_raw: Optional[float] = None
+    sleep_recovery_pct_raw: Optional[float] = None
+    if stress_pct_raw is not None and ns_capacity_waking_display > 0:
+        waking_recovery_pct_raw = round(actual_recovery_area_waking / ns_capacity_waking_display * 100.0, 2)
+        sleep_recovery_pct_raw  = round(actual_recovery_area_sleep  / ns_capacity_sleep_display  * 100.0, 2) if ns_capacity_sleep_display > 0 else 0.0
         stress_load           = round(_clamp(stress_pct_raw, 0.0, 100.0), 1)
-        waking_recovery_score = round(_clamp(recovery_pct_raw or 0.0, 0.0, 100.0), 1)
+        waking_recovery_score = round(_clamp(waking_recovery_pct_raw or 0.0, 0.0, 100.0), 1)
+        sleep_recovery_score  = round(_clamp(sleep_recovery_pct_raw  or 0.0, 0.0, 100.0), 1)
+
+
+    elif stress_pct_raw is not None:
+        stress_load = round(_clamp(stress_pct_raw, 0.0, 100.0), 1)
 
     # Fill stress window contributions (uses stress denominator for % calc)
     compute_stress_contributions(stress_windows, ns_capacity_stress)
@@ -335,6 +352,7 @@ def compute_daily_summary(
         capacity_floor_used=cap_floor,
         capacity_version=capacity_version,
         waking_recovery_score=waking_recovery_score,
+        sleep_recovery_score=sleep_recovery_score,
         net_balance=net_balance,
         opening_balance=opening_balance,
         opening_recovery=opening_recovery,

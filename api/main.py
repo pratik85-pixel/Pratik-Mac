@@ -26,7 +26,20 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from api.config import get_settings
-from api.routers import stream, session, user, coach, outcomes, plan, tracking, tagging, psych, profile, band_sessions
+from api.routers import (
+    stream,
+    session,
+    user,
+    coach,
+    outcomes,
+    plan,
+    tracking,
+    tagging,
+    psych,
+    profile,
+    band_sessions,
+    notifications,
+)
 from api.services.session_service import SessionService
 from api.services.coach_service import CoachService
 from api.services.conversation_service import ConversationService
@@ -110,13 +123,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         scheduler = AsyncIOScheduler(timezone="UTC")
         scheduler.add_job(
             run_nightly_rebuild,
-            CronTrigger(hour=18, minute=30, timezone="UTC"),  # 00:00 IST midnight fallback
+            # 06:30 AM IST == 01:00 UTC (IST is UTC+5:30)
+            CronTrigger(hour=1, minute=0, timezone="UTC"),
             id="nightly_rebuild",
-            name="Nightly calibration + adherence (18:30 UTC / 00:00 IST midnight)",
+            name="Nightly calibration + narrative (01:00 UTC / 06:30 IST)",
             replace_existing=True,
         )
         scheduler.start()
-        logger.info("nightly scheduler started — next run 18:30 UTC (00:00 IST midnight)")
+        logger.info("nightly scheduler started — next run 01:00 UTC (06:30 IST)")
     else:
         logger.warning("apscheduler not installed — nightly rebuild will not run automatically")
 
@@ -160,12 +174,14 @@ def create_app() -> FastAPI:
     app.include_router(user.router)
     app.include_router(coach.router)
     app.include_router(outcomes.router)
+    app.include_router(outcomes.router_v1)
     app.include_router(plan.router)
     app.include_router(tracking.router)
     app.include_router(tagging.router)
     app.include_router(psych.router)
     app.include_router(profile.router)
     app.include_router(band_sessions.router)
+    app.include_router(notifications.router)
 
     # ── Health check ──────────────────────────────────────────────────────────
     @app.get("/health", tags=["meta"])

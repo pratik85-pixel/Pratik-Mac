@@ -34,21 +34,55 @@ class PatternModelBuildResult:
     sport_stressors: list = field(default_factory=list)
 
 
+# Catalog: which activity tags are valid on stress vs recovery windows.
+# "walking" is treated as mixed — allowed on stress (daily movement under load).
+_STRESS_TAGS = frozenset({"running", "walking"})
+_RECOVERY_TAGS = frozenset({"yoga"})
+
+
 def validate_tag(slug: str, window_type: str) -> Tuple[bool, str]:
     if not slug or not slug.strip():
         return False, "Tag slug must not be empty."
-    return True, ""
+
+    s = slug.strip().lower()
+    wt = (window_type or "").strip().lower()
+
+    if s not in _STRESS_TAGS and s not in _RECOVERY_TAGS:
+        return False, f"Unknown activity tag: {slug!r}"
+
+    if wt == "stress":
+        if s in _STRESS_TAGS:
+            return True, ""
+        # recovery-only tag on a stress window
+        return False, "This tag is for recovery windows, not stress."
+
+    if wt == "recovery":
+        if s in _RECOVERY_TAGS:
+            return True, ""
+        return False, "This tag is for stress windows, not recovery."
+
+    return False, f"Unsupported window type: {window_type!r}"
 
 
 def apply_user_tag(window: WindowRef, tag: str) -> TagResult:
     ok, err = validate_tag(tag, window.window_type)
     if not ok:
-        return TagResult(success=False, tag_applied=None, error=err)
-    
+        return TagResult(
+            success=False,
+            window_id=window.window_id,
+            tag_applied=None,
+            error=err,
+        )
+
     window.tag = tag
     window.tag_source = "user_confirmed"
-    
-    return TagResult(success=True, tag_applied=tag, tag_source="user_confirmed")
+
+    return TagResult(
+        success=True,
+        window_id=window.window_id,
+        tag_applied=tag,
+        tag_source="user_confirmed",
+    )
 
 
 def run_auto_tag_pass(model, windows: List[WindowRef]) -> AutoTagPassResult:

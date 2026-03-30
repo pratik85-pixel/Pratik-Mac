@@ -12,7 +12,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     Boolean, Column, Date, DateTime, Float, ForeignKey,
-    Integer, String, Text, JSON, Index
+    Integer, String, Text, JSON, Index, UniqueConstraint, text
 )
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import DeclarativeBase, relationship
@@ -32,6 +32,10 @@ class User(Base):
     created_at    = Column(DateTime(timezone=True), server_default=func.now())
     name          = Column(String(120), nullable=False)
     email         = Column(String(255), unique=True, nullable=True)
+    # Expo push token for mobile notifications (single active device token v1).
+    push_token    = Column(String(255), nullable=True)
+    push_platform = Column(String(20), nullable=True)  # ios | android
+    push_token_updated_at = Column(DateTime(timezone=True), nullable=True)
 
     # Onboarding answers (raw — used to seed initial archetype hypothesis)
     onboarding    = Column(JSON, nullable=True)
@@ -150,6 +154,8 @@ class PersonalModel(Base):
     rmssd_weekday_avg = Column(Float, nullable=True)
     rmssd_weekend_avg = Column(Float, nullable=True)
     rmssd_morning_avg = Column(Float, nullable=True)
+    # Median resting HR (BPM) from calibration background windows — Phase 2 stress gate
+    rmssd_resting_hr_bpm = Column(Float, nullable=True)
 
     # Recovery arc
     recovery_arc_mean_hours  = Column(Float, nullable=True)
@@ -417,6 +423,61 @@ class CheckIn(Base):
     rmssd_same_day = Column(Float, nullable=True)
 
     user = relationship("User", back_populates="check_ins")
+
+
+# ── Notification Events (v1) ───────────────────────────────────────────────────
+
+class NotificationEvent(Base):
+    __tablename__ = "notification_events"
+
+    id            = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id       = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    created_at    = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    expires_at    = Column(DateTime(timezone=True), nullable=True)
+    acted_at      = Column(DateTime(timezone=True), nullable=True)
+
+    category      = Column(String(30), nullable=False)   # event_trigger|nudge|check_in
+    priority      = Column(String(20), nullable=False, default="normal")
+    status        = Column(String(20), nullable=False, default="unread")  # unread|acted|dismissed|expired
+    requires_action = Column(Boolean, nullable=False, default=False)
+
+    title         = Column(String(200), nullable=False)
+    body          = Column(Text, nullable=True)
+    deeplink      = Column(String(500), nullable=True)
+    dedupe_key    = Column(String(255), nullable=True)
+    payload_json  = Column(JSON, nullable=True)
+
+    __table_args__ = (
+        Index("ix_notification_events_user_created", "user_id", "created_at"),
+        Index("ix_notification_events_user_status", "user_id", "status"),
+        Index("ix_notification_events_dedupe_key", "dedupe_key"),
+        # One logical event should map to one row per user.
+        # Keep dedupe_key nullable for old rows, but enforce uniqueness when present.
+        Index(
+            "uq_notification_events_user_dedupe_key",
+            "user_id",
+            "dedupe_key",
+            unique=True,
+            postgresql_where=text("dedupe_key IS NOT NULL"),
+        ),
+    )
+
+
+class NotificationAction(Base):
+    __tablename__ = "notification_actions"
+
+    id              = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    notification_id = Column(UUID(as_uuid=True), ForeignKey("notification_events.id"), nullable=False)
+    user_id         = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    action_type     = Column(String(30), nullable=False)  # tag_event|submit_checkin|dismiss
+    request_json    = Column(JSON, nullable=True)
+    idempotency_key = Column(String(255), nullable=True)
+    created_at      = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("ix_notification_actions_user_created", "user_id", "created_at"),
+        UniqueConstraint("user_id", "idempotency_key", name="uq_notification_actions_user_idempotency"),
+    )
 
 
 # ── Coach Messages ─────────────────────────────────────────────────────────────
@@ -1062,6 +1123,15 @@ class UserUnifiedProfile(Base):
     # Layer 2 don'ts — companion to suggested_plan_json.
     # Format: [{"slug_or_label": str, "reason": str}]
     avoid_items_json        = Column(JSON, nullable=True)
+
+    # ── Layer 2 narrative metadata ─────────────────────────────────────────────
+    # IST calendar date the current coach_narrative was written for.
+    # Used for idempotency (skip regen if already today's) and for morning_brief
+    # to decide whether to trigger an inline Layer 2 regen before Layer 3.
+    coach_narrative_date        = Column(Date, nullable=True)
+
+    # Layer 3 plan-specific brief text (cached; derived from narrative + plan items).
+    plan_brief_text             = Column(Text, nullable=True)
 
     # ── Morning Brief (generated at wake-up / sleep→background transition) ────
     # LLM-derived day assessment based on 7-day trend, written at wakeup.

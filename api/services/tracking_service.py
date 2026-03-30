@@ -35,6 +35,12 @@ from tracking.background_processor import BackgroundWindowResult, aggregate_back
 from tracking.stress_detector import StressWindowResult, detect_stress_windows, compute_stress_contributions
 from tracking.recovery_detector import RecoveryWindowResult, detect_recovery_windows, compute_recovery_contributions
 from tracking.daily_summarizer import DailySummaryResult, compute_daily_summary
+from tracking.cycle_boundaries import (
+    local_today,
+    recap_yesterday_local_date,
+    utc_instant_bounds_for_local_calendar_date,
+)
+from tracking.locked_metrics_contract import contract_metadata_for_row
 from tracking.cohort_insight import build_cohort_insight
 from tracking.stress_state import (
     StressStateResult,
@@ -76,6 +82,79 @@ def _parse_hhmm(value: Optional[str]) -> Optional[tuple[int, int]]:
 MORNING_WAKE_WINDOW_PRE_HOURS = 2
 MORNING_WAKE_WINDOW_POST_HOURS = 4
 MIN_SLEEP_MINUTES_FOR_MORNING_RESET = 90.0
+
+# Scenario B nuance: allow first wear shortly before anchor (e.g. 06:00 for 07:00 anchor)
+# to still execute the morning reset at first post-anchor ingest.
+SCENARIO_B_PRE_ANCHOR_FIRST_WEAR_GRACE_MINUTES = 180
+
+# When stress/recovery windows are re-detected, start/end times shift slightly.
+# Exact (started_at, ended_at) match fails; overlap carry preserves user tags.
+_TAG_OVERLAP_MIN_FRACTION = 0.45
+
+
+def _normalize_ts_utc(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=UTC, microsecond=0)
+    return dt.astimezone(UTC).replace(microsecond=0)
+
+
+def _overlap_interval_seconds(
+    a0: datetime,
+    a1: datetime,
+    b0: datetime,
+    b1: datetime,
+) -> float:
+    a0, a1 = _normalize_ts_utc(a0), _normalize_ts_utc(a1)
+    b0, b1 = _normalize_ts_utc(b0), _normalize_ts_utc(b1)
+    s = max(a0, b0)
+    e = min(a1, b1)
+    if e <= s:
+        return 0.0
+    return (e - s).total_seconds()
+
+
+def _carry_user_tag_from_prior_intervals(
+    *,
+    started_at: datetime,
+    ended_at: datetime,
+    exact_key: tuple[datetime, datetime],
+    exact_map: dict[tuple[datetime, datetime], tuple[str, str | None]],
+    prior_intervals: list[tuple[datetime, datetime, str, str]],
+    min_overlap_fraction: float = _TAG_OVERLAP_MIN_FRACTION,
+) -> tuple[Optional[str], Optional[str]]:
+    """
+    Resolve user tag for a newly detected window: exact key first, else best overlap
+    with any prior user-tagged interval (same calendar stress/recovery episode after recompute).
+    """
+    exact = exact_map.get(exact_key)
+    if exact is not None:
+        return exact[0], exact[1] or "user_confirmed"
+    ns = _normalize_ts_utc(started_at)
+    ne = _normalize_ts_utc(ended_at)
+    dur_new = (ne - ns).total_seconds()
+    if dur_new <= 0:
+        return None, None
+    best_tag: Optional[str] = None
+    best_src: Optional[str] = None
+    best_frac = 0.0
+    for ps, pe, tag, src in prior_intervals:
+        ps_u = _normalize_ts_utc(ps)
+        pe_u = _normalize_ts_utc(pe)
+        dur_p = (pe_u - ps_u).total_seconds()
+        if dur_p <= 0:
+            continue
+        ov = _overlap_interval_seconds(ns, ne, ps_u, pe_u)
+        if ov <= 0:
+            continue
+        denom = min(dur_new, dur_p)
+        frac = ov / denom if denom > 0 else 0.0
+        if frac >= min_overlap_fraction and frac > best_frac:
+            best_frac = frac
+            best_tag = tag
+            best_src = src
+    if best_tag is not None:
+        return best_tag, best_src or "user_confirmed"
+    return None, None
 
 
 def anchor_utc_for_local_calendar_date(
@@ -504,11 +583,22 @@ async def _run_calibration_batch(
     snap.sleep_windows_count  = len(sleep_wins)
     snap.rmssd_sleep_avg_clean = round(rmssd_sleep_avg_clean, 1) if rmssd_sleep_avg_clean is not None else None
 
+    # Resting HR for Phase 2 stress corroboration (median over clean background windows)
+    clean_bg_hr = [
+        w.hr_bpm for w in clean
+        if getattr(w, "context", None) == "background" and w.hr_bpm is not None
+    ]
+    resting_hr_median: Optional[float] = None
+    if len(clean_bg_hr) >= 3:
+        resting_hr_median = float(np.median(clean_bg_hr))
+
     # --- Update personal model if confidence is adequate ---
     if filter_result.confidence >= 0.65 and rmssd_floor_clean is not None and rmssd_ceiling_clean is not None:
         personal.rmssd_floor                 = round(rmssd_floor_clean, 1)
         personal.rmssd_ceiling               = round(rmssd_ceiling_clean, 1)
         personal.rmssd_morning_avg           = round(rmssd_morning_avg_clean, 1)  # always set with floor+ceiling
+        if resting_hr_median is not None:
+            personal.rmssd_resting_hr_bpm = round(resting_hr_median, 1)
         # Persist sleep baseline if enough overnight data was available
         if rmssd_sleep_avg_clean is not None:
             personal.rmssd_sleep_avg     = round(rmssd_sleep_avg_clean, 1)
@@ -621,7 +711,11 @@ class TrackingService:
             waking_minutes=max(0.0, (now_utc - summary_start_utc).total_seconds() / 60.0),
             stress_load_score=round(_clamp_pct(stress_pct_raw), 1),
             day_type=None,
-            waking_recovery_score=round(_clamp_pct(recovery_pct_raw), 1),
+            # Snapshot path only stores combined recovery_pct on BandWearSession.
+            # Keep waking/sleep split unknown here to avoid mislabeling combined
+            # values as waking-only.
+            waking_recovery_score=None,
+            sleep_recovery_score=None,
             net_balance=round(float(net_balance), 2),
             closing_balance=round(float(net_balance), 2),
             stress_pct_raw=float(stress_pct_raw),
@@ -697,6 +791,22 @@ class TrackingService:
         )
         return r.scalar_one_or_none() is not None
 
+    async def _first_background_window_start_in_range(
+        self,
+        start_utc: datetime,
+        end_utc: datetime,
+    ) -> Optional[datetime]:
+        """Earliest BackgroundWindow.window_start in [start, end), else None."""
+        r = await self._db.execute(
+            select(db.BackgroundWindow.window_start)
+            .where(db.BackgroundWindow.user_id == self._uid)
+            .where(db.BackgroundWindow.window_start >= start_utc)
+            .where(db.BackgroundWindow.window_start < end_utc)
+            .order_by(db.BackgroundWindow.window_start.asc())
+            .limit(1)
+        )
+        return r.scalar_one_or_none()
+
     async def _should_perform_scenario_b_forced_reset(
         self,
         window_start_utc: datetime,
@@ -728,8 +838,19 @@ class TrackingService:
             return False, None
 
         anchor_prev_utc = self._anchor_utc_for_local_date(d - timedelta(days=1), personal)
-        if await self._has_background_window_in_range(anchor_prev_utc, anchor_d_utc):
-            return False, None
+        first_pre_anchor = await self._first_background_window_start_in_range(
+            anchor_prev_utc,
+            anchor_d_utc,
+        )
+        if first_pre_anchor is not None:
+            # If pre-anchor data exists far before anchor, this was overnight wear,
+            # so Scenario B must not fire. But if first wear starts only shortly
+            # before anchor (e.g. 06:00 for 07:00 anchor), keep Scenario B eligible.
+            grace_cutoff = anchor_d_utc - timedelta(
+                minutes=SCENARIO_B_PRE_ANCHOR_FIRST_WEAR_GRACE_MINUTES
+            )
+            if first_pre_anchor < grace_cutoff:
+                return False, None
         if await self._has_background_window_in_range(anchor_d_utc, window_start_utc):
             return False, None
 
@@ -753,9 +874,18 @@ class TrackingService:
                     from api.services.model_service import ModelService
                     from api.services.plan_service import PlanService
 
+                    track_svc = TrackingService(
+                        session,
+                        str(self._uid),
+                        session_factory=self._session_factory,
+                        llm_client=self._llm_client,
+                    )
                     model_svc = ModelService(session)
                     plan_svc = PlanService(session, model_svc)
-                    await plan_svc.get_or_create_today_plan(str(self._uid), force_regen=True)
+                    if await track_svc.has_strict_yesterday_summary():
+                        await plan_svc.get_or_create_today_plan(str(self._uid), force_regen=True)
+                    else:
+                        await plan_svc.delete_today_plan_if_exists(str(self._uid))
             except Exception as exc:
                 logger.warning(
                     "Morning bundle: plan regen failed user=%s: %s",
@@ -1288,12 +1418,10 @@ class TrackingService:
         if band_session is not None:
             # Key the row to the IST calendar day when the session started so History
             # summary_date aligns with Home "today" for users in STRESS_STATE_TIMEZONE.
-            ist = ZoneInfo(CONFIG.tracking.STRESS_STATE_TIMEZONE)
-            session_date = band_session.started_at.astimezone(ist).date()
+            session_date = local_today(band_session.started_at)
             day_start    = datetime(session_date.year, session_date.month, session_date.day, tzinfo=UTC)
         else:
-            ist = ZoneInfo(CONFIG.tracking.STRESS_STATE_TIMEZONE)
-            today     = datetime.now(ist).date()
+            today     = local_today()
             day_start = datetime(today.year, today.month, today.day, tzinfo=UTC)
 
         # If the row for this start date is already finalised, nothing to do.
@@ -1302,11 +1430,15 @@ class TrackingService:
             return
 
         if band_session is not None:
+            personal = await _bootstrap_personal_model(self._db, self._uid)
+            cycle_start_utc = await self._resolve_reset_anchor_utc(datetime.now(UTC), personal)
+            # Product contract: gap-based session reopen must not restart daily scores.
+            # Always score live from the active reset-cycle anchor.
             live = await self._compute_session_summary(
-                session_start   = band_session.started_at,
+                session_start   = cycle_start_utc,
                 session_end     = datetime.now(UTC),
-                opening_balance = band_session.opening_balance,
-                wake_locked_at  = band_session.wake_locked_at,
+                opening_balance = 0.0,
+                wake_locked_at  = None,
             )
         else:
             live = await self.compute_live_summary(day_start.date())
@@ -1325,6 +1457,11 @@ class TrackingService:
 
         row.stress_load_score         = live.stress_load_score
         row.day_type                  = live.day_type
+        row.wake_ts                   = live.wake_ts
+        row.sleep_ts                  = live.sleep_ts
+        row.wake_detection_method     = live.wake_detection_method
+        row.sleep_detection_method    = live.sleep_detection_method
+        row.waking_minutes            = live.waking_minutes
         row.raw_suppression_area      = live.raw_suppression_area
         row.raw_recovery_area_sleep   = live.raw_recovery_area_sleep
         row.raw_recovery_area_zenflow = live.raw_recovery_area_zenflow
@@ -1385,6 +1522,7 @@ class TrackingService:
             windows              = bg_windows,
             personal_morning_avg = morning_rmssd,
             personal_floor       = capacity_floor,
+            personal_resting_hr  = getattr(personal, "rmssd_resting_hr_bpm", None),
         )
         raw_stress = compute_stress_contributions(raw_stress, max_suppression)
 
@@ -1396,6 +1534,14 @@ class TrackingService:
             zenflow_session_intervals = zenflow_intervals,
         )
         raw_recovery = compute_recovery_contributions(raw_recovery, max_recovery)
+
+        # Preserve user-confirmed tags across recompute.
+        # Detection rows are rebuilt (delete+insert), so row IDs are unstable.
+        # We carry user tags forward by matching window time bounds.
+        def _win_key(started_at: datetime, ended_at: datetime) -> tuple[datetime, datetime]:
+            s = started_at.astimezone(UTC).replace(microsecond=0) if started_at.tzinfo else started_at.replace(tzinfo=UTC, microsecond=0)
+            e = ended_at.astimezone(UTC).replace(microsecond=0) if ended_at.tzinfo else ended_at.replace(tzinfo=UTC, microsecond=0)
+            return s, e
 
         # Null out FK references in daily_stress_summaries before deleting windows.
         # Without this, PostgreSQL raises ForeignKeyViolationError because the
@@ -1409,15 +1555,57 @@ class TrackingService:
 
         # Delete old windows for today and re-insert
         existing_s = await _load_existing_stress_windows(self._db, self._uid, day_start, day_end)
+        tagged_stress_by_key: dict[tuple[datetime, datetime], tuple[str, str | None]] = {}
+        prior_stress_tagged: list[tuple[datetime, datetime, str, str]] = []
+        for row in existing_s:
+            tag = getattr(row, "tag", None)
+            source = getattr(row, "tag_source", None)
+            if tag and source and str(source).startswith("user"):
+                tagged_stress_by_key[_win_key(row.started_at, row.ended_at)] = (str(tag), source)
+                prior_stress_tagged.append((row.started_at, row.ended_at, str(tag), source))
         for row in existing_s:
             await self._db.delete(row)
 
         existing_r = await _load_existing_recovery_windows(self._db, self._uid, day_start, day_end)
+        tagged_recovery_by_key: dict[tuple[datetime, datetime], tuple[str, str | None]] = {}
+        prior_recovery_tagged: list[tuple[datetime, datetime, str, str]] = []
+        for row in existing_r:
+            tag = getattr(row, "tag", None)
+            source = getattr(row, "tag_source", None)
+            if tag and source and str(source).startswith("user"):
+                tagged_recovery_by_key[_win_key(row.started_at, row.ended_at)] = (str(tag), source)
+                prior_recovery_tagged.append((row.started_at, row.ended_at, str(tag), source))
         for row in existing_r:
             await self._db.delete(row)
 
         for sw in raw_stress:
+            key = _win_key(sw.started_at, sw.ended_at)
+            t, src = _carry_user_tag_from_prior_intervals(
+                started_at=sw.started_at,
+                ended_at=sw.ended_at,
+                exact_key=key,
+                exact_map=tagged_stress_by_key,
+                prior_intervals=prior_stress_tagged,
+            )
+            if t is not None:
+                sw.tag = t
+                sw.tag_source = src or "user_confirmed"
+
+        for sw in raw_stress:
             self._db.add(_to_db_stress(sw))
+
+        for rw in raw_recovery:
+            key = _win_key(rw.started_at, rw.ended_at)
+            t, src = _carry_user_tag_from_prior_intervals(
+                started_at=rw.started_at,
+                ended_at=rw.ended_at,
+                exact_key=key,
+                exact_map=tagged_recovery_by_key,
+                prior_intervals=prior_recovery_tagged,
+            )
+            if t is not None:
+                rw.tag = t
+                rw.tag_source = src or "user_confirmed"
         for rw in raw_recovery:
             self._db.add(_to_db_recovery(rw))
 
@@ -1642,6 +1830,35 @@ class TrackingService:
         )
         return result.scalars().first()
 
+    async def resolve_strict_recap_anchor(self) -> tuple[date, datetime, datetime]:
+        """
+        IST calendar "yesterday" for morning recap + UTC [start, end) bounds.
+
+        DailyStressSummary rows are keyed to the IST calendar date of the wear
+        session (see _materialise_daily_score). The recap card asks for that same
+        IST yesterday — not ``last_morning_cycle_reset_local_date - 1 day``, which
+        incorrectly shifted the lookup two days back whenever the last reset was
+        yesterday but today's reset had not yet updated the user row.
+        """
+        recap_for_date = recap_yesterday_local_date()
+        start_ts, end_ts = utc_instant_bounds_for_local_calendar_date(recap_for_date)
+        return recap_for_date, start_ts, end_ts
+
+    async def load_strict_recap_daily_row(self) -> Optional[db.DailyStressSummary]:
+        """
+        Strict DailyStressSummary row for recap_for_date (IST day bounds only).
+
+        No snapshot / inferred fallback — if the row is missing, downstream surfaces
+        (recap, coach brief, plan) must stay empty for this cycle.
+        """
+        start_ts, end_ts = (await self.resolve_strict_recap_anchor())[1:3]
+        return await self._load_day_summary_by_utc_bounds(start_ts, end_ts)
+
+    async def has_strict_yesterday_summary(self) -> bool:
+        """True iff a DB row exists for the strict recap IST day."""
+        row = await self.load_strict_recap_daily_row()
+        return row is not None
+
     async def _compute_recap_snapshot_for_ist_bounds(
         self,
         start_ts: datetime,
@@ -1650,7 +1867,9 @@ class TrackingService:
     ) -> Optional[DailySummaryResult]:
         """
         Read-only snapshot for [start_ts, end_ts) using only windows in that range.
-        Used when no finalized DailyStressSummary exists yet for morning recap.
+
+        Deprecated for morning recap (strict row-only contract); kept for tests or
+        ad-hoc diagnostics.
         """
         local_tz = ZoneInfo(CONFIG.tracking.STRESS_STATE_TIMEZONE)
         prev_ist = ist_calendar_date - timedelta(days=1)
@@ -1736,23 +1955,12 @@ class TrackingService:
         )
 
     async def get_morning_recap(self) -> dict:
-        """Yesterday (IST) DailyStressSummary + whether to show recap card (Phase 5)."""
-        from zoneinfo import ZoneInfo
+        """Reset-anchored recap day + whether to show recap card (Phase 5).
 
-        local_tz = ZoneInfo(CONFIG.tracking.STRESS_STATE_TIMEZONE)
-        yesterday = (datetime.now(local_tz).date() - timedelta(days=1))
-        local_start = datetime(yesterday.year, yesterday.month, yesterday.day, tzinfo=local_tz)
-        local_end = local_start + timedelta(days=1)
-        start_ts = local_start.astimezone(UTC)
-        end_ts = local_end.astimezone(UTC)
-
-        # Prefer finalized rows; when missing, use stored partial row for the same IST
-        # bounds before computing a snapshot fallback. This keeps recap closer to
-        # History when nightly finalization has not run yet.
-        row = await self._load_day_summary_by_utc_bounds(start_ts, end_ts)
-        recap_result: Optional[DailySummaryResult] = None
-        if row is None:
-            recap_result = await self._compute_recap_snapshot_for_ist_bounds(start_ts, end_ts, yesterday)
+        Strict IST-day lookup only: if there is no DailyStressSummary row for
+        ``for_date``, summary is null (no inferred snapshot).
+        """
+        recap_for_date, _, _ = await self.resolve_strict_recap_anchor()
 
         uid = parse_uuid(self._uid)
         ack_d: Optional[date] = None
@@ -1760,19 +1968,34 @@ class TrackingService:
             res = await self._db.execute(
                 select(db.User.morning_recap_ack_for_date).where(db.User.id == uid)
             )
-            ack_d = res.scalar_one_or_none()
+            row_user = res.one_or_none()
+            if row_user is not None:
+                ack_d = row_user[0]
 
-        should_show = (row is not None or recap_result is not None) and ack_d != yesterday
+        row = await self.load_strict_recap_daily_row()
+
+        should_show = row is not None and ack_d != recap_for_date
         summary: Optional[dict] = None
         if row is not None:
             sleep_recovery_score: Optional[float] = None
-            if row.ns_capacity_recovery and row.ns_capacity_recovery > 0:
+            try:
+                cap = float(row.ns_capacity_recovery) if row.ns_capacity_recovery is not None else None
+                raw_area = float(row.raw_recovery_area_sleep) if row.raw_recovery_area_sleep is not None else None
+            except (TypeError, ValueError):
+                cap, raw_area = None, None
+            if (
+                row.sleep_ts is not None
+                and cap is not None
+                and cap > 0
+                and raw_area is not None
+            ):
                 sleep_recovery_score = round(
-                    max(0.0, min(100.0, (row.raw_recovery_area_sleep / row.ns_capacity_recovery) * 100.0)),
+                    max(0.0, min(100.0, (raw_area / cap) * 100.0)),
                     1,
                 )
             summary = {
                 "stress_load_score": row.stress_load_score,
+                "recovery_score": getattr(row, "waking_recovery_score", None),
                 "waking_recovery_score": getattr(row, "waking_recovery_score", None),
                 "sleep_recovery_score": sleep_recovery_score,
                 "net_balance": getattr(row, "net_balance", None),
@@ -1781,32 +2004,18 @@ class TrackingService:
                 "is_partial_data": row.is_partial_data,
                 "sleep_recovery_area": round(row.raw_recovery_area_sleep, 2),
                 "closing_balance": getattr(row, "closing_balance", None),
-            }
-        elif recap_result is not None:
-            ns_cap_rec = getattr(recap_result, "ns_capacity_recovery_used", None) or 0.0
-            raw_sleep = recap_result.raw_recovery_area_sleep
-            sleep_recovery_score: Optional[float] = None
-            if ns_cap_rec and ns_cap_rec > 0:
-                sleep_recovery_score = round(
-                    max(0.0, min(100.0, (raw_sleep / ns_cap_rec) * 100.0)),
-                    1,
-                )
-            summary = {
-                "stress_load_score": recap_result.stress_load_score,
-                "waking_recovery_score": recap_result.waking_recovery_score,
-                "sleep_recovery_score": sleep_recovery_score,
-                "net_balance": recap_result.net_balance,
-                "day_type": recap_result.day_type,
-                "is_estimated": recap_result.is_estimated,
-                "is_partial_data": True,
-                "sleep_recovery_area": round(raw_sleep, 2),
-                "closing_balance": recap_result.closing_balance,
+                **contract_metadata_for_row(
+                    is_estimated=bool(row.is_estimated),
+                    is_partial_data=bool(getattr(row, "is_partial_data", False)),
+                    calibration_days=int(getattr(row, "calibration_days", 0) or 0),
+                    summary_source="persisted_row",
+                ),
             }
 
         return {
-            "for_date": yesterday.isoformat(),
+            "for_date": recap_for_date.isoformat(),
             "should_show": should_show,
-            "acknowledged_for_date": ack_d == yesterday,
+            "acknowledged_for_date": ack_d == recap_for_date,
             "summary": summary,
         }
 
@@ -1842,11 +2051,15 @@ class TrackingService:
         # Prefer band-session scope over UTC calendar day
         band_session = await self._get_open_band_session()
         if band_session is not None:
+            personal = await _bootstrap_personal_model(self._db, self._uid)
+            cycle_start_utc = await self._resolve_reset_anchor_utc(now, personal)
+            # Product contract: no gap/new-session reset.
+            # Compute over the whole active cycle (anchor → now), not open-session start.
             return await self._compute_session_summary(
-                session_start   = band_session.started_at,
+                session_start   = cycle_start_utc,
                 session_end     = now,
-                opening_balance = band_session.opening_balance,
-                wake_locked_at  = band_session.wake_locked_at,
+                opening_balance = 0.0,
+                wake_locked_at  = None,
             )
 
         personal = await _bootstrap_personal_model(self._db, self._uid)

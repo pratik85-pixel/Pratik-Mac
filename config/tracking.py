@@ -54,13 +54,25 @@ class TrackingConfig(BaseSettings):
     STRESS_MIN_WINDOWS: int = 3
 
     # Adjacent events with gap ≤ this (minutes) are merged into one event
-    STRESS_MERGE_GAP_MINUTES: int = 5
+    # Phase 2: 45 min so sustained stressors (e.g. long calls) stay one episode
+    STRESS_MERGE_GAP_MINUTES: int = 45
 
     # Rate-of-change trigger: RMSSD dropped > this fraction in a single window
     STRESS_RATE_TRIGGER_PCT: float = 0.20
 
+    # Phase 2: HR corroboration — breach must also show HR ≥ resting + this (BPM)
+    STRESS_HR_CORROBORATION_BPM: float = 8.0
+
+    # Phase 2: consecutive non-breach windows shorter than this are bridged
+    # (micro-recovery during one stress episode; does not split the event)
+    STRESS_RECOVERY_CONFIRMATION_WINDOWS: int = 3
+
     # Minimum contribution fraction of daily capacity to warrant a nudge
     STRESS_MIN_NUDGE_CONTRIBUTION: float = 0.03
+
+    # downstream: tracking/stress_detector.should_nudge
+    MAX_TAGGING_NUDGES_PER_DAY: int = 3
+    NUDGE_SIGNIFICANT_SPIKE_OVERRIDE_PCT: float = 0.25
 
     # ── Recovery Detection ─────────────────────────────────────────────────
     # downstream: tracking/recovery_detector
@@ -79,8 +91,9 @@ class TrackingConfig(BaseSettings):
     #   - score never drifts DOWN just because time passes (old bug)
     #   - early-morning events are honest (small % of full-day budget)
     #   - users can directly compare across time-of-day
-    DAILY_CAPACITY_WAKING_MINUTES: int = 960    # 16 h × 60 min — stress budget (waking only)
-    DAILY_CAPACITY_RECOVERY_MINUTES: int = 1440  # 24 h × 60 min — recovery budget (full day)
+    DAILY_CAPACITY_WAKING_MINUTES: int = 960    # 16 h × 60 min — stress + waking recovery budget
+    DAILY_CAPACITY_SLEEP_MINUTES: int = 480     # 8 h × 60 min  — sleep recovery display denominator
+    DAILY_CAPACITY_RECOVERY_MINUTES: int = 1440  # 24 h × 60 min — full-day (net_balance only)
 
     # ── Day Type Thresholds (MorningRead → green/yellow/red) ───────────────────
     # downstream: api/services/tracking_service (morning read ingest)

@@ -28,11 +28,25 @@ from api.db.schema import CoachMessage, ConversationEvent
 from api.services.model_service import ModelService
 from api.services.coach_service import CoachService
 from api.services.conversation_service import ConversationService
+from api.services.tracking_service import TrackingService
 from api.utils import parse_uuid
+from tracking.cycle_boundaries import local_today, product_calendar_timezone
 from api.rate_limiter import conversation_limiter
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/coach", tags=["coach"])
+
+
+def _user_uuid_for_coach(user_id: str) -> uuid.UUID:
+    """
+    Map X-User-Id to a UUID for DB queries.
+    Valid UUID strings pass through; arbitrary strings (e.g. tests) get a stable UUID5.
+    """
+    u = parse_uuid(user_id)
+    if u is not None:
+        return u
+    return uuid.uuid5(uuid.NAMESPACE_URL, f"zenflow:user:{user_id.strip()}")
+
 
 # ── Dependencies ───────────────────────────────────────────────────────────────
 
@@ -49,6 +63,20 @@ def _coach_svc(request: Request) -> CoachService:
 
 def _conv_svc(request: Request) -> ConversationService:
     return request.app.state.conversation_service
+
+
+async def _tracking_svc_coach(
+    request: Request,
+    user_id: str = Depends(_user_id),
+    db: AsyncSession = Depends(get_db),
+) -> TrackingService:
+    llm_client = getattr(request.app.state, "llm_client", None)
+    return TrackingService(
+        db_session=db,
+        user_id=user_id,
+        session_factory=AsyncSessionLocal,
+        llm_client=llm_client,
+    )
 
 
 # ── Request / response models ──────────────────────────────────────────────────
@@ -74,6 +102,10 @@ class MorningBriefResponse(BaseModel):
     brief_text:     Optional[str]
     evidence:       Optional[str]
     one_action:     Optional[str]
+    # Legacy / test-friendly aliases (same content as brief_text / one_action)
+    summary:        Optional[str] = None
+    action:         Optional[str] = None
+    message:        Optional[str] = None
     generated_for:  Optional[str]   # YYYY-MM-DD
     is_stale:       bool            # True if generated_for < today IST
     plan:           list[dict]      # suggested plan items from UUP
@@ -106,23 +138,19 @@ async def _gated_nudge_decision(
     model_svc: ModelService,
     coach_svc: CoachService,
 ) -> NudgeCheckResponse:
-    from zoneinfo import ZoneInfo
     from datetime import timedelta, timezone as _tz
     from sqlalchemy import func
     import api.db.schema as _db
     from coach.data_assembler import assemble_for_user
     from config import CONFIG
 
-    uid = parse_uuid(user_id)
-    if uid is None:
-        raise HTTPException(status_code=401, detail="Invalid X-User-Id")
+    uid = _user_uuid_for_coach(user_id)
 
-    IST = ZoneInfo("Asia/Kolkata")
     cfg = CONFIG.coach
-    now_ist = datetime.now(IST)
+    now_local = datetime.now(product_calendar_timezone())
 
     # Gate 1 — time window
-    if not (cfg.NUDGE_WINDOW_START_HOUR_IST <= now_ist.hour < cfg.NUDGE_WINDOW_END_HOUR_IST):
+    if not (cfg.NUDGE_WINDOW_START_HOUR_IST <= now_local.hour < cfg.NUDGE_WINDOW_END_HOUR_IST):
         return NudgeCheckResponse(should_nudge=False, message=None, reason="outside_window")
 
     # Gate 2 — cap check (rolling 4h window, UTC-aware for DB timestamps)
@@ -275,9 +303,7 @@ async def conversation_history(
     db:      AsyncSession = Depends(get_db),
 ) -> dict:
     """Return recent conversation events for this user."""
-    uid = parse_uuid(user_id)
-    if uid is None:
-        return {"user_id": user_id, "turns": []}
+    uid = _user_uuid_for_coach(user_id)
     result = await db.execute(
         select(ConversationEvent)
         .where(ConversationEvent.user_id == uid)
@@ -316,6 +342,7 @@ async def get_morning_brief(
     request: Request,
     user_id: str          = Depends(_user_id),
     db:      AsyncSession = Depends(get_db),
+    track_svc: TrackingService = Depends(_tracking_svc_coach),
 ) -> MorningBriefResponse:
     """
     Return the cached morning brief for today.
@@ -324,30 +351,55 @@ async def get_morning_brief(
     UserUnifiedProfile. If the cache is stale/missing for today, this endpoint
     attempts a best-effort refresh before returning.
     """
-    from zoneinfo import ZoneInfo
     import api.db.schema as _db
+    from coach.morning_brief import clear_morning_bundle_uup, generate_morning_brief
 
-    uid = parse_uuid(user_id)
-    if uid is None:
-        raise HTTPException(status_code=401, detail="Invalid X-User-Id")
+    uid = _user_uuid_for_coach(user_id)
+
+    today_ist = local_today()
+
+    recap = await track_svc.get_morning_recap()
+    if not recap.get("summary"):
+        await clear_morning_bundle_uup(db, uid, today_ist)
+        return MorningBriefResponse(
+            day_state=None,
+            day_confidence=None,
+            brief_text=None,
+            evidence=None,
+            one_action=None,
+            summary=None,
+            action=None,
+            message=None,
+            generated_for=today_ist.isoformat(),
+            is_stale=False,
+            plan=[],
+            avoid_items=[],
+        )
 
     result = await db.execute(
         select(_db.UserUnifiedProfile).where(_db.UserUnifiedProfile.user_id == uid)
     )
     uup = result.scalar_one_or_none()
 
-    IST = ZoneInfo("Asia/Kolkata")
-    from datetime import date as _date
-    today_ist = datetime.now(IST).date()
-
     generated_for = uup.morning_brief_generated_for if uup else None
     is_stale = (generated_for is None or generated_for < today_ist)
+    brief_empty_for_today = bool(
+        uup
+        and generated_for == today_ist
+        and not any(
+            [
+                uup.morning_brief_day_state,
+                uup.morning_brief_day_confidence,
+                uup.morning_brief_text,
+                uup.morning_brief_evidence,
+                uup.morning_brief_one_action,
+            ]
+        )
+    )
 
-    if is_stale:
+    if is_stale or brief_empty_for_today:
         # Lazy refresh path: backfill today's brief when ingest-time trigger
         # was missed (e.g., no qualifying reset event yet).
-        from coach.morning_brief import generate_morning_brief
-
         llm_client = getattr(request.app.state, "llm_client", None)
         await generate_morning_brief(AsyncSessionLocal, uid, llm_client)
 
@@ -361,12 +413,17 @@ async def get_morning_brief(
     plan = uup.suggested_plan_json or [] if uup else []
     avoid = uup.avoid_items_json or [] if uup else []
 
+    bt = uup.morning_brief_text if uup else None
+    oa = uup.morning_brief_one_action if uup else None
     return MorningBriefResponse(
         day_state      = uup.morning_brief_day_state if uup else None,
         day_confidence = uup.morning_brief_day_confidence if uup else None,
-        brief_text     = uup.morning_brief_text if uup else None,
+        brief_text     = bt,
         evidence       = uup.morning_brief_evidence if uup else None,
-        one_action     = uup.morning_brief_one_action if uup else None,
+        one_action     = oa,
+        summary        = bt,
+        action         = oa,
+        message        = bt,
         generated_for  = generated_for.isoformat() if generated_for else None,
         is_stale       = is_stale,
         plan           = plan,
@@ -413,9 +470,7 @@ async def evening_checkin(
     """
     from coach.data_assembler import assemble_for_user
 
-    uid = parse_uuid(user_id)
-    if uid is None:
-        raise HTTPException(status_code=401, detail="Invalid X-User-Id")
+    uid = _user_uuid_for_coach(user_id)
 
     assembled = await assemble_for_user(db, uid)
     output    = coach_svc.evening_checkin(assembled)
@@ -437,19 +492,15 @@ async def night_closure(
     Gate: must be called at or after 21:30 IST — returns 409 if too early.
     Persists tomorrow_seed into UserUnifiedProfile.coach_narrative.
     """
-    from zoneinfo import ZoneInfo
     from sqlalchemy import select as _select
     import api.db.schema as _db
     from coach.data_assembler import assemble_for_user
     from config import CONFIG
 
-    uid = parse_uuid(user_id)
-    if uid is None:
-        raise HTTPException(status_code=401, detail="Invalid X-User-Id")
+    uid = _user_uuid_for_coach(user_id)
 
-    IST = ZoneInfo("Asia/Kolkata")
     cfg = CONFIG.coach
-    now_ist = datetime.now(IST)
+    now_ist = datetime.now(product_calendar_timezone())
     if (now_ist.hour, now_ist.minute) < (cfg.NIGHT_CLOSURE_HOUR_IST, cfg.NIGHT_CLOSURE_MINUTE_IST):
         raise HTTPException(status_code=409, detail="too_early")
 

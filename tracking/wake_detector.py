@@ -18,9 +18,9 @@ Two-tier detection — band data takes absolute precedence:
         Tier 2 (no band):   last_background_window_ts + 30 min buffer,
                             then 22:00 IST hardcoded
 
-IMPORTANT — typical_sleep_time is intentionally NOT used as a sleep gate.
-It must never cut off stress accumulation when the band is actively streaming.
-Historical sleep time is display/coach-framing only, not a scoring boundary.
+When no band transitions exist, ``typical_sleep_time`` (with ``typical_wake_time``)
+is used to place ``sleep_ts`` on the calendar day. Live ``background → sleep``
+transitions still take precedence over historical typicals.
 """
 
 from __future__ import annotations
@@ -123,9 +123,6 @@ def detect_wake_sleep_boundary(
             wake_method = "morning_read_anchor"
 
     # ── Sleep time detection ────────────────────────────────────────────────
-    # typical_sleep_time is intentionally NOT consulted here — it must never
-    # gate stress accumulation when live band data is present. Historical sleep
-    # time is display/coach-framing only, not a scoring boundary.
 
     # Tier 1 (band worn): background → sleep context transition
     if context_transitions:
@@ -138,9 +135,14 @@ def detect_wake_sleep_boundary(
                         sleep_method = "sleep_transition"
                         break
 
-    # Tier 2 (no band): last background window + buffer → hardcoded
+    # Tier 2 (no band): typical sleep → last background + buffer → hardcoded
     if sleep_ts is None:
-        if last_background_window_ts is not None:
+        if typical_sleep_time:
+            sleep_ts = _parse_time_on_date(typical_sleep_time, day_date)
+            if sleep_ts <= wake_ts:
+                sleep_ts = sleep_ts + timedelta(days=1)
+            sleep_method = "historical_pattern"
+        elif last_background_window_ts is not None:
             sleep_ts = last_background_window_ts + timedelta(minutes=30)
             sleep_method = "last_background"
         else:

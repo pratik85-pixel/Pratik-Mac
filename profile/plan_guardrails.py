@@ -89,6 +89,7 @@ def validate_plan(
     *,
     avoid_items: Optional[list[AvoidItem]] = None,
     net_balance: Optional[float] = None,
+    readiness_score: Optional[float] = None,
     stress_score: Optional[int] = None,
     recovery_score: Optional[int] = None,
 ) -> ValidatedPlan:
@@ -103,6 +104,11 @@ def validate_plan(
     result   = ValidatedPlan(items=list(items), avoid_items=capped_avoid)
     nb       = net_balance if net_balance is not None else 0.0
     ss       = stress_score    if stress_score    is not None else 50
+    # Red day: readiness < 45 (primary), or legacy net_balance debt when readiness omitted
+    is_red_day = (
+        (readiness_score is not None and float(readiness_score) < 45.0)
+        or (readiness_score is None and nb < -20.0)
+    )
     disc     = profile.psych.discipline_index
     social   = profile.psych.social_energy_type
     tier     = profile.engagement.engagement_tier or "medium"
@@ -148,15 +154,20 @@ def validate_plan(
             )
             result.was_modified = True
 
-    # ── R4: Red balance — restorative items only ───────────────────────────────────────
-    if nb < -20.0:
+    # ── R4: Red day — restorative items only (readiness < 45 or legacy net_balance < -20)
+    if is_red_day:
         performance_slugs = {"work_sprint", "sports", "cold_shower"}
         before = len(result.items)
         result.items = [i for i in result.items if i.slug not in performance_slugs]
         removed = before - len(result.items)
         if removed:
+            rs_note = (
+                f"readiness={readiness_score:.0f}"
+                if readiness_score is not None
+                else f"net_balance={nb:.1f}"
+            )
             result.guardrail_notes.append(
-                f"R4_red_balance: removed {removed} performance items (net_balance={nb:.1f})"
+                f"R4_red_day: removed {removed} performance items ({rs_note})"
             )
             result.was_modified = True
 

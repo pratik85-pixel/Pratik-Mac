@@ -21,13 +21,30 @@ Both prompts use placeholders populated by build_prompts().
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from coach.context_builder import CoachContext
 from coach.tone_selector import TONE_DESCRIPTIONS
+from coach.input_builder import CoachInputPacket
 
+import json
+
+
+# ── Conversation topic scope guardrail (shared across all surfaces) ──────────
+
+CONVERSATION_TOPIC_SCOPE = """\
+Topic scope guardrail (CRITICAL):
+  - Allowed: fitness, physical training, exercise, recovery, sleep, stress management,
+    breathing, physical health, mental health, emotional wellbeing, nutrition (as it
+    relates to performance/recovery), and mindfulness.
+  - Deflection: if the user asks for anything outside this scope, respond with a single
+    warm deflection exactly as:
+      "I'm focused on your health and nervous system — let me know if there's something in that space I can help with."
+  - No hard block: boundary cases like "I'm stressed about work" are in scope; handle gracefully.\
+"""
 
 # ── System prompt (persona contract) ─────────────────────────────────────────
 
-_SYSTEM_PROMPT = """\
+_SYSTEM_PROMPT = f"""\
 You are the ZenFlow Verity coach — a calm, direct, evidence-based nervous system guide.
 
 Your role:
@@ -55,6 +72,8 @@ Output format:
     Respond ONLY with valid JSON matching the schema for the given trigger type.
     Do not include markdown fences, explanation, or text outside the JSON object.
 
+{CONVERSATION_TOPIC_SCOPE}
+
 Score citation rule (CRITICAL):
     When citing a number in your JSON response, you MUST use one of:
         readiness score (0–100), stress score (0–100), or recovery score (0–100).
@@ -74,6 +93,310 @@ Personality rule:
     Do not reference the personality snapshot explicitly — use it to inform your language,
     not to narrate it back to the user.
 """
+
+# ── Layer 2 — Daily Coaching Narrative prompt ────────────────────────────────
+
+_LAYER2_NARRATIVE_SYSTEM = """\
+You are ZenFlow's daily coaching narrative writer.
+
+Your job:
+  1) Read the user's personality snapshot inputs and today's physiological context.
+  2) Write ONE coherent internal narrative the coach will read.
+
+Non-negotiable rules
+--------------------
+- No medical/technical terms. If unsure, write "Insufficient data".
+- Never suggest clinical treatment or diagnose.
+- Be grounded: every major statement must map to a provided data signal.
+- Use simple Indian English. Short sentences.
+- The output MUST use EXACTLY the section headers below and in the same order.
+- Bullet points MUST start with "•" and be 1 sentence each.
+
+Output headers (exact, ordered):
+PHYSIO PROFILE
+YESTERDAY RECAP
+SUBJECTIVE ALIGNMENT
+BEHAVIORAL SIGNALS
+LONGITUDINAL SIGNALS
+WHAT THEY LIKE / WHAT HELPS
+READINESS VERDICT
+WATCH TODAY
+"""
+
+
+def build_layer2_narrative_prompt(packet: CoachInputPacket) -> tuple[str, str]:
+    """
+    Build (system_prompt, user_prompt) for the single comprehensive Layer 2 call.
+    """
+
+    # The user prompt intentionally contains structured primitives. The model
+    # is still constrained to write short, grounded prose in the narrative.
+    def _json(x: Any, *, max_chars: int = 6000) -> str:
+        raw = json.dumps(x, ensure_ascii=False, default=str)
+        return raw if len(raw) <= max_chars else raw[:max_chars] + "…"
+
+    today_row = None
+    yesterday_row = None
+    if packet.daily_trajectory:
+        for r in packet.daily_trajectory:
+            if r.get("date") == packet.today_local_date:
+                today_row = r
+        if packet.daily_trajectory:
+            # Best-effort: yesterday is the row before today in the oldest→newest list.
+            if today_row is not None:
+                idx = packet.daily_trajectory.index(today_row)
+                if idx - 1 >= 0:
+                    yesterday_row = packet.daily_trajectory[idx - 1]
+            elif len(packet.daily_trajectory) >= 2:
+                today_row = packet.daily_trajectory[-1]
+                yesterday_row = packet.daily_trajectory[-2]
+
+    return (
+        _LAYER2_NARRATIVE_SYSTEM,
+        f"""\
+USER_ID: {packet.user_id}
+TODAY_LOCAL_DATE: {packet.today_local_date}
+
+PERSONAL_MODEL:
+{_json(packet.personal_model)}
+
+DAILY_TRAJECTORY_14D:
+{_json(packet.daily_trajectory)}
+
+TODAY_ROW (best-effort):
+{_json(today_row)}
+
+YESTERDAY_ROW (best-effort):
+{_json(yesterday_row)}
+
+MORNING_READS_7D:
+{_json(packet.morning_reads)}
+
+STRESS_WINDOWS_48H:
+{_json(packet.stress_windows_48h)}
+
+RECOVERY_WINDOWS_48H:
+{_json(packet.recovery_windows_48h)}
+
+BACKGROUND_BINS_24H:
+{_json(packet.background_bins_24h)}
+
+CHECK_INS_7D:
+{_json(packet.check_ins_7d)}
+
+HABIT_EVENTS_72H:
+{_json(packet.habit_events_72h)}
+
+ANXIETY_EVENTS_14D:
+{_json(packet.anxiety_events_14d)}
+
+CONVERSATION_EVENTS_3D:
+{_json(packet.conversation_events_3d)}
+
+USER_FACTS:
+{_json(packet.user_facts)}
+
+TAG_PATTERN:
+{_json(packet.tag_pattern)}
+
+USER_HABITS:
+{_json(packet.user_habits)}
+
+SESSIONS_14D:
+{_json(packet.sessions_14d)}
+
+PLAN_DEVIATIONS_30D:
+{_json(packet.plan_deviations_30d)}
+
+ADHERENCE_30D:
+{_json(packet.adherence_30d)}
+
+EXISTING_UUP_NARRATIVE (previous narrative for continuity; can be empty):
+{_json(packet.uup.get("previous_coach_narrative"), max_chars=2000)}
+""".strip(),
+    )
+
+
+# ── Layer 3 — Morning brief prompt (narrative consumer) ─────────────────────
+
+_L3_MORNING_BRIEF_SYSTEM = f"""\
+You are ZenFlow's morning coach.
+You are given:
+  1) COACH NARRATIVE (Layer 2 output) as the primary source of truth, and
+  2) a small structured packet with today's/yesterday's 0–100 scores.
+
+Rules
+-----
+- Output ONLY valid JSON with exactly these keys:
+  {{
+    "day_state":      "green"|"yellow"|"red",
+    "day_confidence": "high"|"medium"|"low",
+    "brief_text":     string (STRICTLY 2–3 lines),
+    "evidence":       string (1 sentence),
+    "one_action":     string (<=15 words)
+  }}
+- Never use markdown fences.
+- Do not include any extra keys.
+- Never give medical advice or diagnosis.
+- Never output raw physiological values. You MAY cite only:
+  readiness score, stress score, or recovery score (all 0–100) if present in the packet.
+
+{CONVERSATION_TOPIC_SCOPE}
+"""
+
+
+def build_layer3_morning_brief_prompt(
+    packet: CoachInputPacket,
+    uup_narrative: str,
+) -> tuple[str, str]:
+    """
+    Build (system_prompt, user_prompt) for the Layer 3 morning brief call.
+    """
+    # Build best-effort yesterday slice from packet.daily_trajectory.
+    yesterday_date = None
+    try:
+        y_dt = datetime.strptime(packet.today_local_date, "%Y-%m-%d").date()  # type: ignore[name-defined]
+        yesterday_date = (y_dt - timedelta(days=1)).isoformat()  # type: ignore[name-defined]
+    except Exception:
+        yesterday_date = None
+
+    yesterday_row = None
+    if packet.daily_trajectory and yesterday_date:
+        for r in packet.daily_trajectory:
+            if r.get("date") == yesterday_date:
+                yesterday_row = r
+                break
+
+    latest_row = packet.daily_trajectory[-1] if packet.daily_trajectory else {}
+
+    def _row_min(r: Any) -> dict[str, Any]:
+        return {
+            "date": r.get("date"),
+            "day_type": r.get("day_type"),
+            "readiness_score": r.get("readiness_score"),
+            "waking_recovery_score": r.get("waking_recovery_score") or r.get("waking_recovery_score"),
+            "sleep_recovery_score": r.get("sleep_recovery_score"),
+            "stress_load_score": r.get("stress_load_score"),
+        }
+
+    # Keep narrative length bounded; narrative is already sanitized by our pipeline.
+    narrative_excerpt = (uup_narrative or "")[:5000]
+
+    user_prompt = f"""\
+TODAY_LOCAL_DATE: {packet.today_local_date}
+
+COACH NARRATIVE (Layer 2):
+{narrative_excerpt}
+
+SCORES PACKET (best-effort; only cite 0–100 scores):
+  YESTERDAY_ROW:
+{json.dumps(_row_min(yesterday_row or {}), ensure_ascii=False, default=str)}
+
+  LATEST_DAY_ROW:
+{json.dumps(_row_min(latest_row or {}), ensure_ascii=False, default=str)}
+
+Write the morning brief now. Output ONLY valid JSON.
+""".strip()
+
+    return _L3_MORNING_BRIEF_SYSTEM, user_prompt
+
+
+# ── Layer 3 — Plan brief + donts prompt ────────────────────────────────────
+
+_L3_PLAN_BRIEF_SYSTEM = """\
+You are ZenFlow's plan brief writer.
+Use COACH NARRATIVE (Layer 2 output) plus the given plan items as context.
+
+Rules
+-----
+- Output ONLY valid JSON with exactly these keys:
+  {
+    "brief": string (STRICTLY 2 sentences),
+    "avoid_items": [
+      {"slug_or_label": string, "reason": string}  // 0..2 items
+    ]
+  }
+- Never include markdown fences or extra keys.
+- Never give medical advice or diagnosis.
+- Never output raw physiological values; cite only readiness/stress/recovery 0–100 scores if needed.
+
+Topic scope guardrail:
+- Allowed topics are limited to health/fitness/wellness/sleep/recovery and related emotional wellbeing.
+- Deflection (exact text):
+  "I'm focused on your health and nervous system — let me know if there's something in that space I can help with."
+"""
+
+
+def build_layer3_plan_brief_prompt(
+    packet: CoachInputPacket,
+    uup_narrative: str,
+    plan_items: list[dict[str, Any]],
+) -> tuple[str, str]:
+    narrative_excerpt = (uup_narrative or "")[:5000]
+    user_prompt = f"""\
+TODAY_LOCAL_DATE: {packet.today_local_date}
+
+COACH NARRATIVE (Layer 2):
+{narrative_excerpt}
+
+TODAY PLAN ITEMS (from /plan/today):
+{json.dumps(plan_items, ensure_ascii=False, default=str)[:5000]}
+
+SCORES (best-effort; only cite 0–100):
+{json.dumps(packet.daily_trajectory[-1] if packet.daily_trajectory else {}, ensure_ascii=False, default=str)[:1000]}
+
+Generate:
+  - "brief": 2 sentences explaining why this plan was built for today, grounded in narrative.
+  - "avoid_items": 0..2 specific donts with reasons grounded in narrative and matching to plan items.
+Output ONLY valid JSON.
+""".strip()
+    return _L3_PLAN_BRIEF_SYSTEM, user_prompt
+
+
+# ── Layer 3 — Nudge prompt ──────────────────────────────────────────────────
+
+_L3_NUDGE_SYSTEM = """\
+You are ZenFlow's nudge generator.
+Write ONE short nudge message personalized to the trigger using COACH NARRATIVE (Layer 2).
+
+Rules
+-----
+- Output ONLY valid JSON with exactly:
+  { "message": string }
+- message length <= 60 words.
+- Never give medical advice or diagnosis.
+- Never output raw physiological values; cite only readiness/stress/recovery 0–100 scores if present.
+- Never output markdown fences or any extra keys.
+
+Topic scope guardrail:
+- Allowed: fitness, physical training, exercise, recovery, sleep, stress management, breathing,
+  physical health, mental health, emotional wellbeing, nutrition (as it relates to performance/recovery), and mindfulness.
+- Deflection (exact text):
+  "I'm focused on your health and nervous system — let me know if there's something in that space I can help with."
+"""
+
+
+def build_layer3_nudge_prompt(
+    packet: CoachInputPacket,
+    uup_narrative: str,
+    trigger_type: str,
+    trigger_context: dict[str, Any],
+) -> tuple[str, str]:
+    narrative_excerpt = (uup_narrative or "")[:5000]
+    # Trigger context must be short and structured; it should not include unsafe user text.
+    user_prompt = f"""\
+TODAY_LOCAL_DATE: {packet.today_local_date}
+TRIGGER_TYPE: {trigger_type}
+
+COACH NARRATIVE (Layer 2):
+{narrative_excerpt}
+
+TRIGGER_CONTEXT (structured facts):
+{json.dumps(trigger_context, ensure_ascii=False, default=str)[:2000]}
+
+Write the nudge now. Output ONLY valid JSON.
+""".strip()
+    return _L3_NUDGE_SYSTEM, user_prompt
 
 # ── Trigger-specific user prompt templates ────────────────────────────────────
 

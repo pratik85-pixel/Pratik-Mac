@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, date, datetime, timedelta
-from typing import Annotated, Optional
+from typing import Annotated, Literal, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from pydantic import BaseModel
@@ -28,8 +28,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from api.db.database import get_db, AsyncSessionLocal
 from api.services.tracking_service import TrackingService
 from api.rate_limiter import ingest_limiter
-from config import CONFIG
-from zoneinfo import ZoneInfo
+from tracking.cycle_boundaries import local_today
+from tracking.locked_metrics_contract import contract_metadata_for_row
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/tracking", tags=["tracking"])
@@ -62,7 +62,11 @@ async def _tracking_svc(
 class DailySummaryResponse(BaseModel):
     summary_date:          str
     stress_load_score:     Optional[float]
+    recovery_score:        Optional[float] = None
     waking_recovery_score: Optional[float] = None
+    sleep_recovery_score:  Optional[float] = None
+    sleep_recovery_night_date: Optional[str] = None   # YYYY-MM-DD (previous night)
+    sleep_recovery_subtext: Optional[str] = None      # UI hint for date context
     net_balance:           Optional[float] = None
     day_type:              Optional[str]
     calibration_days:      int
@@ -75,6 +79,11 @@ class DailySummaryResponse(BaseModel):
     ns_capacity_used:      Optional[float] = None   # (ceiling - floor) × 960
     rmssd_morning_avg:     Optional[float] = None   # personal morning baseline (ms)
     rmssd_ceiling:         Optional[float] = None   # personal RMSSD ceiling (ms)
+    # Phase 1 — locked metrics contract (does not alter numeric scores)
+    metrics_contract_id:   str = "zenflow_locked_v1"
+    score_confidence:      Literal["high", "medium", "low"] = "high"
+    score_confidence_reasons: list[str] = []
+    summary_source:        Literal["live_compute", "persisted_row"] = "persisted_row"
 
 
 class WaveformPoint(BaseModel):
@@ -123,11 +132,19 @@ class TagWindowRequest(BaseModel):
 class HistoryEntry(BaseModel):
     summary_date:          str
     stress_load_score:     Optional[float]
+    recovery_score:        Optional[float] = None
     waking_recovery_score: Optional[float]
+    sleep_recovery_score:  Optional[float] = None
+    sleep_recovery_night_date: Optional[str] = None   # YYYY-MM-DD (previous night)
+    sleep_recovery_subtext: Optional[str] = None      # UI hint for date context
     net_balance:           Optional[float]
     day_type:              Optional[str]
     is_estimated:          bool
     is_partial_data:       Optional[bool] = None
+    metrics_contract_id:   str = "zenflow_locked_v1"
+    score_confidence:      Literal["high", "medium", "low"] = "high"
+    score_confidence_reasons: list[str] = []
+    summary_source:        Literal["live_compute", "persisted_row"] = "persisted_row"
 
 
 class CohortInsightResponse(BaseModel):
@@ -159,14 +176,21 @@ class StressStateResponse(BaseModel):
 
 class MorningRecapSummaryBlock(BaseModel):
     stress_load_score: Optional[float] = None
+    recovery_score: Optional[float] = None
     waking_recovery_score: Optional[float] = None
     sleep_recovery_score: Optional[float] = None
+    sleep_recovery_night_date: Optional[str] = None   # YYYY-MM-DD (previous night)
+    sleep_recovery_subtext: Optional[str] = None      # UI hint for date context
     net_balance: Optional[float] = None
     day_type: Optional[str] = None
     is_estimated: bool = False
     is_partial_data: bool = False
     sleep_recovery_area: Optional[float] = None
     closing_balance: Optional[float] = None
+    metrics_contract_id: str = "zenflow_locked_v1"
+    score_confidence: Literal["high", "medium", "low"] = "high"
+    score_confidence_reasons: list[str] = []
+    summary_source: Literal["live_compute", "persisted_row"] = "persisted_row"
 
 
 class MorningRecapResponse(BaseModel):
@@ -196,6 +220,75 @@ def _fmt_ts(ts: Optional[datetime]) -> Optional[str]:
     return ts.isoformat() if ts else None
 
 
+def _sleep_recovery_context(summary_date: Optional[date]) -> tuple[Optional[str], Optional[str]]:
+    """Return (night_date_iso, subtext) for sleep recovery display context."""
+    if summary_date is None:
+        return None, None
+    night_date = (summary_date - timedelta(days=1)).isoformat()
+    return night_date, f"For night of {night_date}"
+
+
+# ── Daily summary builder (Phase 1 contract metadata — scores unchanged) ─────
+
+def _pipeline_meta(
+    row: object,
+    summary_source: Literal["live_compute", "persisted_row"],
+) -> dict:
+    """Phase 1 contract fields — derived from existing flags only; scores unchanged."""
+    return contract_metadata_for_row(
+        is_estimated=bool(getattr(row, "is_estimated", False)),
+        is_partial_data=bool(getattr(row, "is_partial_data", False)),
+        calibration_days=int(getattr(row, "calibration_days", 0) or 0),
+        summary_source=summary_source,
+    )
+
+
+def _build_summary_response(
+    row,
+    personal=None,
+    *,
+    summary_source: Literal["live_compute", "persisted_row"] = "persisted_row",
+) -> DailySummaryResponse:
+    summary_local_date = row.summary_date.date() if getattr(row, "summary_date", None) else None
+    sleep_night_date, sleep_subtext = _sleep_recovery_context(summary_local_date)
+
+    # Sleep recovery is only meaningful when a validated sleep boundary (sleep_ts) exists.
+    # Return None when boundary is missing so the UI can show "—" instead of 0%.
+    sleep_recovery_score = None
+    if getattr(row, "sleep_ts", None) is not None:
+        if getattr(row, "sleep_recovery_score", None) is not None:
+            sleep_recovery_score = getattr(row, "sleep_recovery_score", None)
+        elif getattr(row, "ns_capacity_recovery", None) and row.ns_capacity_recovery > 0:
+            raw_sleep = getattr(row, "raw_recovery_area_sleep", 0.0) or 0.0
+            sleep_recovery_score = round(
+                max(0.0, min(100.0, (raw_sleep / row.ns_capacity_recovery) * 100.0)),
+                1,
+            )
+
+    meta = _pipeline_meta(row, summary_source)
+    return DailySummaryResponse(
+        summary_date          = row.summary_date.date().isoformat() if row.summary_date else "",
+        stress_load_score     = row.stress_load_score,
+        recovery_score        = getattr(row, 'waking_recovery_score', None),
+        waking_recovery_score = getattr(row, 'waking_recovery_score', None),
+        sleep_recovery_score  = sleep_recovery_score,
+        sleep_recovery_night_date = sleep_night_date,
+        sleep_recovery_subtext = sleep_subtext,
+        net_balance           = getattr(row, 'net_balance', None),
+        day_type              = row.day_type,
+        calibration_days      = row.calibration_days or 0,
+        is_estimated          = row.is_estimated,
+        is_partial_data       = row.is_partial_data,
+        wake_ts               = _fmt_ts(getattr(row, 'wake_ts', None)),
+        sleep_ts              = _fmt_ts(getattr(row, 'sleep_ts', None)),
+        waking_minutes        = getattr(row, 'waking_minutes', None),
+        ns_capacity_used      = getattr(row, 'ns_capacity_used', None),
+        rmssd_morning_avg     = personal.rmssd_morning_avg if personal else None,
+        rmssd_ceiling         = personal.rmssd_ceiling if personal else None,
+        **meta,
+    )
+
+
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 
 @router.get("/daily-summary", response_model=DailySummaryResponse)
@@ -217,20 +310,19 @@ async def get_today_summary(
     "Today" uses STRESS_STATE_TIMEZONE (IST) so Home matches History labels and
     materialised rows keyed by IST calendar date.
     """
-    tz = ZoneInfo(CONFIG.tracking.STRESS_STATE_TIMEZONE)
-    today = datetime.now(tz).date()
+    today = local_today()
 
     personal = await svc.get_personal_model()
 
     # 1. Live computation (always preferred for today — avoids stale midnight rows)
     live = await svc.compute_live_summary(today)
     if live is not None:
-        return _build_summary_response(live, personal)
+        return _build_summary_response(live, personal, summary_source="live_compute")
 
     # 2. Fallback: persisted summary (finalized row or manually written)
     row = await svc.get_daily_summary(today)
     if row is not None:
-        return _build_summary_response(row, personal)
+        return _build_summary_response(row, personal, summary_source="persisted_row")
 
     raise HTTPException(status_code=404, detail="No summary available yet.")
 
@@ -243,12 +335,14 @@ async def get_summary_by_date(
     """Return the three numbers for a specific date (YYYY-MM-DD)."""
     target   = _parse_date(date_str)
     personal = await svc.get_personal_model()
-    row      = await svc.get_daily_summary(target)
+    row = await svc.get_daily_summary(target)
+    src: Literal["live_compute", "persisted_row"] = "persisted_row"
     if row is None:
         row = await svc.compute_live_summary(target)
+        src = "live_compute"
     if row is None:
         raise HTTPException(status_code=404, detail=f"No summary found for {date_str}.")
-    return _build_summary_response(row, personal)
+    return _build_summary_response(row, personal, summary_source=src)
 
 
 @router.get("/waveform/{date_str}", response_model=list[WaveformPoint])
@@ -473,6 +567,11 @@ async def get_morning_recap(
     raw = await svc.get_morning_recap()
     blk = raw.get("summary")
     summary = MorningRecapSummaryBlock(**blk) if blk else None
+    if summary is not None:
+        recap_date = _parse_date(raw["for_date"])
+        sleep_night_date, sleep_subtext = _sleep_recovery_context(recap_date)
+        summary.sleep_recovery_night_date = sleep_night_date
+        summary.sleep_recovery_subtext = sleep_subtext
     return MorningRecapResponse(
         for_date=raw["for_date"],
         should_show=raw["should_show"],
@@ -506,35 +605,70 @@ async def get_history(
     rows = await svc.get_history(days=days)
     entries = [
         HistoryEntry(
-            summary_date          = row.summary_date.date().isoformat() if row.summary_date else "",
-            stress_load_score     = row.stress_load_score,
-            waking_recovery_score = getattr(row, 'waking_recovery_score', None),
-            net_balance           = getattr(row, 'net_balance', None),
-            day_type              = row.day_type,
-            is_estimated          = row.is_estimated,
-            is_partial_data       = getattr(row, 'is_partial_data', None),
+            summary_date=row.summary_date.date().isoformat() if row.summary_date else "",
+            stress_load_score=row.stress_load_score,
+            recovery_score=getattr(row, "waking_recovery_score", None),
+            waking_recovery_score=getattr(row, "waking_recovery_score", None),
+            sleep_recovery_score=(
+                (
+                    getattr(row, "sleep_recovery_score", None)
+                    if getattr(row, "sleep_recovery_score", None) is not None
+                    else (
+                        round(
+                            max(
+                                0.0,
+                                min(
+                                    100.0,
+                                    (((getattr(row, "raw_recovery_area_sleep", 0.0) or 0.0) / row.ns_capacity_recovery) * 100.0),
+                                ),
+                            ),
+                            1,
+                        )
+                        if getattr(row, "ns_capacity_recovery", None) and row.ns_capacity_recovery > 0
+                        else None
+                    )
+                )
+                if getattr(row, "sleep_ts", None) is not None
+                else None
+            ),
+            sleep_recovery_night_date=_sleep_recovery_context(row.summary_date.date() if row.summary_date else None)[0],
+            sleep_recovery_subtext=_sleep_recovery_context(row.summary_date.date() if row.summary_date else None)[1],
+            net_balance=getattr(row, "net_balance", None),
+            day_type=row.day_type,
+            is_estimated=row.is_estimated,
+            is_partial_data=getattr(row, "is_partial_data", None),
+            **_pipeline_meta(row, "persisted_row"),
         )
         for row in rows
     ]
 
-    # Keep today's History point in lockstep with Home by overlaying live summary.
+    # Keep History in lockstep with the morning-reset cycle (not midnight rollover).
+    # Derive effective "today" from the same recap day anchor used by Home recap.
+    recap = await svc.get_morning_recap()
+    recap_for_date = _parse_date(recap["for_date"])
+    cycle_today_local = recap_for_date + timedelta(days=1)
+
+    # Overlay live summary for the active cycle day.
     # Stored rows can lag behind the latest open-session recomputation.
-    tz = ZoneInfo(CONFIG.tracking.STRESS_STATE_TIMEZONE)
-    today_local = datetime.now(tz).date()
-    live_today = await svc.compute_live_summary(today_local)
+    live_today = await svc.compute_live_summary(cycle_today_local)
     if live_today is not None:
-        today_key = today_local.isoformat()
+        today_key = cycle_today_local.isoformat()
         replaced = False
         for i, e in enumerate(entries):
             if e.summary_date == today_key:
                 entries[i] = HistoryEntry(
                     summary_date=today_key,
                     stress_load_score=live_today.stress_load_score,
+                    recovery_score=live_today.waking_recovery_score,
                     waking_recovery_score=live_today.waking_recovery_score,
+                    sleep_recovery_score=getattr(live_today, 'sleep_recovery_score', None),
+                    sleep_recovery_night_date=_sleep_recovery_context(cycle_today_local)[0],
+                    sleep_recovery_subtext=_sleep_recovery_context(cycle_today_local)[1],
                     net_balance=live_today.net_balance,
                     day_type=live_today.day_type,
                     is_estimated=live_today.is_estimated,
                     is_partial_data=live_today.is_partial_data,
+                    **_pipeline_meta(live_today, "live_compute"),
                 )
                 replaced = True
                 break
@@ -544,32 +678,16 @@ async def get_history(
                 HistoryEntry(
                     summary_date=today_key,
                     stress_load_score=live_today.stress_load_score,
+                    recovery_score=live_today.waking_recovery_score,
                     waking_recovery_score=live_today.waking_recovery_score,
+                    sleep_recovery_score=getattr(live_today, 'sleep_recovery_score', None),
+                    sleep_recovery_night_date=_sleep_recovery_context(cycle_today_local)[0],
+                    sleep_recovery_subtext=_sleep_recovery_context(cycle_today_local)[1],
                     net_balance=live_today.net_balance,
                     day_type=live_today.day_type,
                     is_estimated=live_today.is_estimated,
                     is_partial_data=live_today.is_partial_data,
+                    **_pipeline_meta(live_today, "live_compute"),
                 ),
             )
     return entries
-
-
-# ── Private builder ────────────────────────────────────────────────────────────
-
-def _build_summary_response(row, personal=None) -> DailySummaryResponse:
-    return DailySummaryResponse(
-        summary_date          = row.summary_date.date().isoformat() if row.summary_date else "",
-        stress_load_score     = row.stress_load_score,
-        waking_recovery_score = getattr(row, 'waking_recovery_score', None),
-        net_balance           = getattr(row, 'net_balance', None),
-        day_type              = row.day_type,
-        calibration_days      = row.calibration_days or 0,
-        is_estimated          = row.is_estimated,
-        is_partial_data       = row.is_partial_data,
-        wake_ts               = _fmt_ts(getattr(row, 'wake_ts', None)),
-        sleep_ts              = _fmt_ts(getattr(row, 'sleep_ts', None)),
-        waking_minutes        = getattr(row, 'waking_minutes', None),
-        ns_capacity_used      = getattr(row, 'ns_capacity_used', None),
-        rmssd_morning_avg     = personal.rmssd_morning_avg if personal else None,
-        rmssd_ceiling         = personal.rmssd_ceiling if personal else None,
-    )

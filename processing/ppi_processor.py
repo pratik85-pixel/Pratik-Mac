@@ -82,8 +82,9 @@ def compute_ppi_metrics(
     mean_hr  = 60000.0 / mean_ppi
 
     # ── Confidence ────────────────────────────────────────────────────────────
-    # Scales up with n_beats, degrades with artifact_rate
-    beat_confidence = min(1.0, n / 60.0)         # saturates at 1 min of data (~60 beats)
+    # Scales strictly with n_beats up to ~120 beats (no early plateau at 60),
+    # then degrades with artifact_rate.
+    beat_confidence = min(1.0, n / 120.0)
     artifact_penalty = max(0.0, 1.0 - artifact_rate * 3.0)
     confidence = beat_confidence * artifact_penalty
 

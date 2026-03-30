@@ -107,9 +107,11 @@ async def run_profile_update(
     net_balance    = latest.get("net_balance")
     stress_score   = latest.get("stress_load")
     recovery_score = latest.get("waking_recovery")
+    readiness_raw  = latest.get("readiness_score")
 
     stress_int   = int(round(stress_score))   if stress_score   is not None else None
     recovery_int = int(round(recovery_score)) if recovery_score is not None else None
+    readiness_f  = float(readiness_raw) if readiness_raw is not None else None
 
     # Step 3 — build physio block (no raw ms values)
     physio_block = _build_physio_block(ctx)
@@ -123,6 +125,7 @@ async def run_profile_update(
         user_id,
         llm_client=wrapped,
         net_balance=net_balance,
+        readiness_score=readiness_f,
         stress_score=stress_int,
         recovery_score=recovery_int,
         assessment=assessment,

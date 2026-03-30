@@ -188,6 +188,7 @@ async def rebuild_unified_profile(
     *,
     llm_client: Optional[Any] = None,
     net_balance: Optional[float] = None,
+    readiness_score: Optional[float] = None,
     stress_score: Optional[int] = None,
     recovery_score: Optional[int] = None,
     available_slugs: Optional[list[str]] = None,
@@ -246,6 +247,7 @@ async def rebuild_unified_profile(
         profile,
         llm_client=llm_client,
         net_balance=net_balance,
+        readiness_score=readiness_score,
         stress_score=stress_score,
         recovery_score=recovery_score,
         available_slugs=slugs,
@@ -259,6 +261,7 @@ async def rebuild_unified_profile(
         profile,
         avoid_items=profile.avoid_items,
         net_balance=net_balance,
+        readiness_score=readiness_score,
         stress_score=stress_score,
         recovery_score=recovery_score,
     )

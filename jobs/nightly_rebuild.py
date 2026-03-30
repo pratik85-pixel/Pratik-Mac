@@ -8,8 +8,10 @@ Runs these tasks sequentially for all active users:
   2. Psych profile streak increment (yesterday's adherence → streak_current)
   3. Auto-tag pass stub (placeholder — pattern model not yet fully wired)
 
-Intended to run once per night at 00:00 IST (18:30 UTC) via APScheduler,
-APScheduler, or a cloud scheduler (AWS EventBridge, GCP Cloud Scheduler, etc.).
+Intended to run once per morning at 6:30 AM IST (01:00 UTC) via APScheduler,
+or a cloud scheduler (AWS EventBridge, GCP Cloud Scheduler, etc.).
+This timing ensures a full night of sleep data has been collected before
+the narrative is generated, giving the readiness verdict full context.
 
 Usage
 -----
@@ -18,7 +20,7 @@ Standalone execution (for cron / docker entrypoint):
 
 FastAPI APScheduler integration (add to api/main.py lifespan):
     from jobs.nightly_rebuild import run_nightly_rebuild
-    scheduler.add_job(run_nightly_rebuild, trigger="cron", hour=2, minute=0)
+    scheduler.add_job(run_nightly_rebuild, trigger="cron", hour=1, minute=0)  # 6:30 AM IST = 01:00 UTC
 
 Environment variables used:
     OPENAI_API_KEY     — LLM key (optional; fallback runs if absent)
@@ -38,10 +40,139 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 from datetime import UTC, datetime, timedelta
 from typing import Any, Optional
 
 log = logging.getLogger(__name__)
+
+
+def _extract_watch_today_bullets(narrative: Optional[str]) -> list[str]:
+    """
+    Extract WATCH TODAY bullets from the narrative text.
+    """
+    if not narrative:
+        return []
+
+    m = re.search(
+        r"WATCH TODAY\s*\n(.*?)(?=\n[A-Z][A-Z ]+\n|\Z)",
+        narrative,
+        flags=re.DOTALL,
+    )
+    if not m:
+        return []
+
+    block = m.group(1)
+    bullets: list[str] = []
+    for line in block.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(("•", "-", "*")):
+            cleaned = stripped.lstrip("•-*").strip()
+            if cleaned:
+                bullets.append(cleaned)
+    return bullets[:5]
+
+
+def _fallback_layer2_narrative(packet: Any) -> str:
+    """
+    Deterministic Layer 2 narrative when LLM is disabled.
+    """
+    today_row = None
+    yesterday_row = None
+    if getattr(packet, "daily_trajectory", None):
+        for r in packet.daily_trajectory:
+            if r.get("date") == packet.today_local_date:
+                today_row = r
+        if today_row is not None:
+            idx = packet.daily_trajectory.index(today_row)
+            if idx - 1 >= 0:
+                yesterday_row = packet.daily_trajectory[idx - 1]
+        elif len(packet.daily_trajectory) >= 2:
+            today_row = packet.daily_trajectory[-1]
+            yesterday_row = packet.daily_trajectory[-2]
+
+    readiness = (today_row or {}).get("readiness_score")
+    waking = (today_row or {}).get("waking_recovery_score")
+    sleep = (today_row or {}).get("sleep_recovery_score")
+    stress = (today_row or {}).get("stress_load_score")
+    day_type = (today_row or {}).get("day_type")
+
+    # Keep this simple and grounded: we only cite available numbers.
+    readiness_s = f"{readiness:.1f}" if readiness is not None else "unknown"
+    waking_s = f"{waking:.1f}" if waking is not None else "unknown"
+    sleep_s = f"{sleep:.1f}" if sleep is not None else "unknown"
+    stress_s = f"{stress:.1f}" if stress is not None else "unknown"
+
+    # Decide push vs protect heuristically from readiness.
+    try:
+        readiness_v = float(readiness) if readiness is not None else 50.0
+    except Exception:
+        readiness_v = 50.0
+
+    if readiness_v >= 70:
+        verdict = "push"
+        watch = [
+            "Start with a light warm-up, then do your main block.",
+            "If stress spikes during the session, switch to breathing_only immediately.",
+            "Keep the rest of the day active but not aggressive.",
+        ]
+    elif readiness_v >= 45:
+        verdict = "maintain"
+        watch = [
+            "Keep intensity moderate and pace your breathing between sets.",
+            "Choose recovery-friendly movement if stress rises again.",
+            "Don’t stack late nights onto a busy training day.",
+        ]
+    else:
+        verdict = "protect"
+        watch = [
+            "Protect recovery first: short breathing + easy movement only.",
+            "Avoid hard effort if you feel reactivity building.",
+            "Plan an earlier wind-down to help your sleep rebound.",
+        ]
+
+    checkins = getattr(packet, "check_ins_7d", None) or []
+    last_checkin = checkins[0] if checkins else None
+    if last_checkin:
+        reactivity = last_checkin.get("reactivity")
+        focus = last_checkin.get("focus")
+        recovery = last_checkin.get("recovery")
+    else:
+        reactivity = focus = recovery = None
+
+    reactivity_s = str(reactivity) if reactivity is not None else "unknown"
+    focus_s = str(focus) if focus is not None else "unknown"
+    recovery_s = str(recovery) if recovery is not None else "unknown"
+
+    return f"""\
+PHYSIO PROFILE
+• Today readiness is {readiness_s}/100, with waking recovery {waking_s}/100 and sleep recovery {sleep_s}/100.
+• Stress load is {stress_s}/100, so your system likely has {verdict} capacity for the day.
+
+YESTERDAY RECAP
+• Yesterday day type was {((yesterday_row or {}).get("day_type") or "unknown")}. Your readiness trend is now {'improving' if verdict=='push' else 'needs care'}.
+
+SUBJECTIVE ALIGNMENT
+• Your latest check-in scores: reactivity {reactivity_s}/5, focus {focus_s}/5, recovery {recovery_s}/5.
+• If reactivity is high while recovery is low, choose the protective version of today.
+
+BEHAVIORAL SIGNALS
+• Recent habit events and sessions should guide your next step, but no specific event detail is available in fallback mode.
+
+LONGITUDINAL SIGNALS
+• Over the last two weeks, your plan consistency and recovery signals suggest a {verdict} approach today.
+
+WHAT THEY LIKE / WHAT HELPS
+• Use what typically helps you recover; if sleep recovery is low, prioritize wind-down routines.
+
+READINESS VERDICT
+• Verdict: {verdict.upper()} today (day type: {day_type or 'unknown'}).
+
+WATCH TODAY
+• {watch[0]}
+• {watch[1]}
+• {watch[2]}
+""".strip()
 
 
 # ── Active user detection ─────────────────────────────────────────────────────
@@ -83,12 +214,11 @@ async def _increment_streak(session, user_id) -> None:
     Updates UserPsychProfile.
     """
     from sqlalchemy import select, and_, func
-    from zoneinfo import ZoneInfo
     import api.db.schema as db
+    from tracking.cycle_boundaries import recap_yesterday_local_date
 
-    # Use IST date so "yesterday" matches the plan_date stored with IST calendar day
-    _IST = ZoneInfo("Asia/Kolkata")
-    yesterday = (datetime.now(_IST) - timedelta(days=1)).date()
+    # Use product local date so "yesterday" matches the plan_date calendar day
+    yesterday = recap_yesterday_local_date()
     yesterday_start = datetime.combine(yesterday, datetime.min.time()).replace(tzinfo=UTC)
     yesterday_end   = datetime.combine(yesterday, datetime.max.time()).replace(tzinfo=UTC)
 
@@ -499,12 +629,47 @@ async def _rebuild_one_user(
         profile = await run_profile_update(
             session,
             user_id,
-            llm_client=llm_client,
+            # Disable LLM for Layer 1/2 inside unified_profile rebuild.
+            # We will overwrite `coach_narrative` with Phase 4 Layer 2 below
+            # using a single dedicated prompt.
+            llm_client=None,
             assessment=assessment,
         )
         result["narrative_version"] = profile.narrative_version
         result["engagement_tier"]   = profile.engagement.engagement_tier
         result["plan_items"]        = len(profile.suggested_plan)
+
+        # ── Step 1c: Phase 4 Layer 2 narrative (single call) ────────────────
+        # Rebuild `UUP.coach_narrative` using CoachInputPacket + Layer 2 prompt.
+        try:
+            from coach.input_builder import build_coach_input_packet
+            from coach.prompt_templates import build_layer2_narrative_prompt
+            from sqlalchemy import select
+
+            packet = await build_coach_input_packet(session, user_id)
+            sys_prompt, user_prompt = build_layer2_narrative_prompt(packet)
+
+            if llm_client is not None:
+                raw = llm_client.chat(sys_prompt, user_prompt)
+                narrative = (raw or "").strip()
+                if not narrative:
+                    narrative = _fallback_layer2_narrative(packet)
+            else:
+                narrative = _fallback_layer2_narrative(packet)
+
+            # Persist Layer 2 narrative + WATCH TODAY bullets
+            uup_res = await session.execute(
+                select(db.UserUnifiedProfile).where(db.UserUnifiedProfile.user_id == user_id)
+            )
+            uup_row = uup_res.scalar_one_or_none()
+            if uup_row is not None:
+                from tracking.cycle_boundaries import local_today
+                uup_row.coach_narrative = narrative
+                uup_row.coach_narrative_date = local_today()
+                uup_row.coach_watch_notes = _extract_watch_today_bullets(narrative)
+                await session.commit()
+        except Exception as exc:
+            log.warning("layer2_narrative failed user=%s error=%s", user_id, exc)
 
         # ── Step 1b: Materialise today's DailyPlan once/day (IST) ────────────
         # Ensures Plan tab is ready before first user open.

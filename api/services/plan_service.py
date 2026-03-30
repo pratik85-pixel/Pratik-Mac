@@ -22,12 +22,11 @@ Dependencies
 from __future__ import annotations
 
 import logging
+import json
+import re
 import uuid
 from datetime import date, datetime, UTC
 from typing import Optional
-from zoneinfo import ZoneInfo
-
-_IST = ZoneInfo("Asia/Kolkata")
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -48,6 +47,12 @@ from coach.prescriber import (
     plan_to_items_json,
 )
 from api.services.profile_service import load_unified_profile
+from tracking.cycle_boundaries import local_today
+from tracking.plan_readiness_contract import (
+    plan_api_contract_metadata,
+    plan_day_type_from_load_score,
+    plan_readiness_from_load_score,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -57,9 +62,61 @@ class PlanService:
     Stateless async service — instantiated per-request via FastAPI dependency.
     """
 
-    def __init__(self, db: AsyncSession, model_service: ModelService) -> None:
+    def __init__(
+        self,
+        db: AsyncSession,
+        model_service: ModelService,
+        llm_client: Optional[Any] = None,
+    ) -> None:
         self._db        = db
         self._model_svc = model_service
+        self._llm_client = llm_client
+
+    @staticmethod
+    def empty_plan_payload() -> dict:
+        """Payload when strict yesterday summary is missing (no valid plan for the day)."""
+        return {
+            "id":               None,
+            "plan_date":        None,
+            "day_type":         None,
+            "readiness_score":  None,
+            "stage":            None,
+            "items":            [],
+            "prescriber_notes": [],
+            "adherence_pct":    None,
+            "brief":            None,
+            "avoid_items":     [],
+            **plan_api_contract_metadata(),
+        }
+
+    @staticmethod
+    def empty_home_plan_status() -> dict:
+        """Same shape as get_home_plan_status when no plan exists."""
+        return {
+            "has_plan": False,
+            "plan_date": None,
+            "anchor_intention": None,
+            "anchor_slug": None,
+            "items_total": 0,
+            "items_completed": 0,
+            "adherence_pct": None,
+            "on_track": None,
+            "day_type": None,
+        }
+
+    async def delete_today_plan_if_exists(self, user_id: str) -> None:
+        """Remove today's DailyPlan row so a stale plan cannot reappear after strict gating."""
+        uid = parse_uuid(user_id)
+        if uid is None:
+            return
+        today = local_today()
+        today_dt = datetime(today.year, today.month, today.day, tzinfo=UTC)
+        row = await self._load_today_row(uid, today_dt)
+        if row is None:
+            return
+        await self._db.delete(row)
+        await self._db.commit()
+        logger.info("delete_today_plan_if_exists user=%s", user_id)
 
     # ── Today's plan ──────────────────────────────────────────────────────────
 
@@ -76,7 +133,7 @@ class PlanService:
         and persisted (replacing any existing row for today).
         """
         uid = parse_uuid(user_id)
-        today = datetime.now(_IST).date()   # IST calendar date to match user's day
+        today = local_today()
         today_dt = datetime(today.year, today.month, today.day, tzinfo=UTC)
 
         if uid is not None and not force_regen:
@@ -99,7 +156,18 @@ class PlanService:
                 if uup_plan is not None:
                     await self._persist_plan(uid, uup_plan, today_dt)
                     logger.info("plan_source=uup user=%s", user_id)
-                    return uup_plan.model_dump()
+                    payload = {**uup_plan.model_dump(), **plan_api_contract_metadata()}
+                    # Optional Layer 3: brief + donts from narrative
+                    payload.update(
+                        await self._maybe_add_layer3_plan_brief_and_donts(
+                            user_id=user_id,
+                            uid=uid,
+                            payload_items=payload.get("items") or [],
+                            payload_day_type=payload.get("day_type"),
+                            narrative=uup.coach_narrative,
+                        )
+                    )
+                    return payload
 
         # Fallback: rule-based prescriber
         plan: DailyPlan = build_daily_plan(inputs)
@@ -107,7 +175,82 @@ class PlanService:
         if uid is not None:
             await self._persist_plan(uid, plan, today_dt)
 
-        return plan.model_dump()
+        payload = {**plan.model_dump(), **plan_api_contract_metadata()}
+        if uid is not None:
+            try:
+                uup = await load_unified_profile(self._db, uid)
+                narrative = uup.coach_narrative if uup is not None else None
+                payload.update(
+                    await self._maybe_add_layer3_plan_brief_and_donts(
+                        user_id=user_id,
+                        uid=uid,
+                        payload_items=payload.get("items") or [],
+                        payload_day_type=payload.get("day_type"),
+                        narrative=narrative,
+                    )
+                )
+            except Exception:
+                # Layer 3 is best-effort; never block plan fetch.
+                pass
+
+        return payload
+
+    async def _maybe_add_layer3_plan_brief_and_donts(
+        self,
+        *,
+        user_id: str,
+        uid: uuid.UUID,
+        payload_items: list[dict],
+        payload_day_type: Optional[str],
+        narrative: Optional[str],
+    ) -> dict[str, Any]:
+        """
+        Best-effort Layer 3: generate plan brief + avoid_items from narrative.
+        If LLM is disabled/unavailable or narrative missing, returns safe defaults.
+        """
+        if self._llm_client is None or not narrative:
+            return {"brief": None, "avoid_items": []}
+
+        try:
+            from coach.input_builder import build_coach_input_packet
+            from coach.prompt_templates import build_layer3_plan_brief_prompt
+
+            packet = await build_coach_input_packet(self._db, uid)
+            sys_prompt, user_prompt = build_layer3_plan_brief_prompt(
+                packet=packet,
+                uup_narrative=narrative,
+                plan_items=payload_items,
+            )
+            raw = self._llm_client.chat(sys_prompt, user_prompt)
+
+            # Parse JSON robustly.
+            cleaned = raw.strip()
+            cleaned = re.sub(r"^```(?:json)?\\n?", "", cleaned)
+            cleaned = re.sub(r"\\n?```$", "", cleaned)
+            m = re.search(r"\\{.*\\}", cleaned, re.DOTALL)
+            if not m:
+                return {"brief": None, "avoid_items": []}
+            obj = json.loads(m.group(0))
+
+            brief = obj.get("brief")
+            avoid_items = obj.get("avoid_items") or []
+
+            # Shape/limit for safety.
+            out_avoid: list[dict[str, Any]] = []
+            for it in avoid_items[:2]:
+                if not isinstance(it, dict):
+                    continue
+                slug_or_label = it.get("slug_or_label")
+                reason = it.get("reason")
+                if not slug_or_label or not reason:
+                    continue
+                out_avoid.append(
+                    {"slug_or_label": str(slug_or_label)[:100], "reason": str(reason)[:300]}
+                )
+
+            return {"brief": str(brief)[:600] if brief is not None else None, "avoid_items": out_avoid}
+        except Exception:
+            return {"brief": None, "avoid_items": []}
 
     async def get_home_plan_status(self, user_id: str) -> dict:
         """
@@ -115,21 +258,11 @@ class PlanService:
         Calendar day uses IST to match get_or_create_today_plan.
         """
         uid = parse_uuid(user_id)
-        empty: dict = {
-            "has_plan": False,
-            "plan_date": None,
-            "anchor_intention": None,
-            "anchor_slug": None,
-            "items_total": 0,
-            "items_completed": 0,
-            "adherence_pct": None,
-            "on_track": None,
-            "day_type": None,
-        }
+        empty = self.empty_home_plan_status()
         if uid is None:
             return empty
 
-        today = datetime.now(_IST).date()
+        today = local_today()
         today_dt = datetime(today.year, today.month, today.day, tzinfo=UTC)
         row = await self._load_today_row(uid, today_dt)
         if row is None:
@@ -181,7 +314,7 @@ class PlanService:
         if uid is None:
             return ""
 
-        today = datetime.now(_IST).date()
+        today = local_today()
         today_dt = datetime(today.year, today.month, today.day, tzinfo=UTC)
         plan_row = await self._load_today_row(uid, today_dt)
         plan_id = plan_row.id if plan_row is not None else uuid.uuid4()
@@ -297,7 +430,6 @@ class PlanService:
         Fills remaining fields with safe defaults when data is unavailable.
         """
         profile = await self._model_svc.get_profile(user_id)
-        fp      = await self._model_svc.get_fingerprint(user_id)
 
         uid = parse_uuid(user_id)
 
@@ -331,28 +463,15 @@ class PlanService:
             )
             habit_labels_72h = [r.event_type for r in he_res.scalars().all()]
 
-        # Archetype + readiness via plan_replanner (consistent with /plan/today)
-        from archetypes.scorer import compute_ns_health_profile
         from coach.plan_replanner import compute_daily_prescription
-        from model.baseline_builder import PersonalFingerprint
-        fp_obj = fp if fp is not None else PersonalFingerprint()
-        ns_profile = compute_ns_health_profile(fp_obj)
+
         prescription = compute_daily_prescription(profile)
-
-        # Map load_score (0–1, higher = more stressed) → readiness (0–100)
-        readiness = round((1.0 - min(prescription.load_score, 1.0)) * 100, 1)
-
-        # Day type from load_score
-        if prescription.load_score < 0.35:
-            day_type = "green"
-        elif prescription.load_score < 0.65:
-            day_type = "yellow"
-        else:
-            day_type = "red"
+        readiness = plan_readiness_from_load_score(prescription.load_score)
+        day_type = plan_day_type_from_load_score(prescription.load_score)
 
         return PrescriberInputs(
             stage=profile.stage,
-            archetype_primary=ns_profile.primary_pattern,
+            archetype_primary=profile.primary_pattern,
             movement_enjoyed=movement_enjoyed,
             decompress_via=decompress_via,
             readiness_score=readiness,
@@ -391,6 +510,7 @@ class PlanService:
             "items":            items,
             "prescriber_notes": row.prescriber_notes or [],
             "adherence_pct":    row.adherence_pct,
+            **plan_api_contract_metadata(),
         }
 
     async def confirm_plan_item(self, user_id: str, tag: str) -> bool:
@@ -405,7 +525,7 @@ class PlanService:
         
         uid = parse_uuid(user_id)
         if not uid: return False
-        today = datetime.now(_IST).date()
+        today = local_today()
         today_dt = datetime(today.year, today.month, today.day, tzinfo=UTC)
         plan_row = await self._load_today_row(uid, today_dt)
         if not plan_row or not plan_row.items_json:
@@ -433,7 +553,7 @@ class PlanService:
         if not uid:
             return False
 
-        today = datetime.now(_IST).date()
+        today = local_today()
         today_dt = datetime(today.year, today.month, today.day, tzinfo=UTC)
         plan_row = await self._load_today_row(uid, today_dt)
         if not plan_row or not plan_row.items_json:

@@ -44,6 +44,7 @@ def _bg(
     is_valid: bool = True,
     context: str = "background",
     acc_mean: Optional[float] = None,
+    hr_bpm: float = 65.0,
 ) -> BackgroundWindowResult:
     return BackgroundWindowResult(
         user_id      = "user-1",
@@ -51,7 +52,7 @@ def _bg(
         window_end   = window_start + timedelta(minutes=5),
         context      = context,
         rmssd_ms     = rmssd_ms,
-        hr_bpm       = 65.0,
+        hr_bpm       = hr_bpm,
         lf_hf        = None,
         confidence   = 0.9,
         acc_mean     = acc_mean,
@@ -71,10 +72,11 @@ def _stream_stressed(
     n: int = 4,
     start: datetime = None,
     rmssd_ms: float = 40.0,
+    hr_bpm: float = 65.0,
 ) -> list[BackgroundWindowResult]:
     """Below-threshold block of windows."""
     start = start or _ts(10)
-    return [_bg(start + timedelta(minutes=i * 5), rmssd_ms=rmssd_ms) for i in range(n)]
+    return [_bg(start + timedelta(minutes=i * 5), rmssd_ms=rmssd_ms, hr_bpm=hr_bpm) for i in range(n)]
 
 
 # ── No stress ─────────────────────────────────────────────────────────────────
@@ -258,6 +260,52 @@ class TestStressDetected:
             personal_floor       = 30.0,
         )
         assert len(results) == 1
+
+
+# ── Phase 2: HR gate + micro-recovery bridge ─────────────────────────────────
+
+class TestPhase2StressDetection:
+
+    def test_hr_gate_blocks_rmssd_drop_without_hr_elevation(self):
+        """Layer 1 breach but HR below resting+8 → no stress event."""
+        # morning 60 → threshold 45; stressed rmssd 40; resting HR 57 → need HR >= 65
+        stressed = _stream_stressed(n=4, rmssd_ms=40.0, hr_bpm=60.0)
+        results = detect_stress_windows(
+            windows=stressed,
+            personal_morning_avg=60.0,
+            personal_floor=30.0,
+            personal_resting_hr=57.0,
+        )
+        assert results == []
+
+    def test_hr_gate_passes_when_hr_elevated(self):
+        stressed = _stream_stressed(n=4, rmssd_ms=40.0, hr_bpm=70.0)
+        results = detect_stress_windows(
+            windows=stressed,
+            personal_morning_avg=60.0,
+            personal_floor=30.0,
+            personal_resting_hr=57.0,
+        )
+        assert len(results) == 1
+
+    def test_micro_recovery_two_false_windows_bridged_to_one_event(self):
+        """Two non-breach windows between stressed blocks → single episode (gap < 3)."""
+        start = _ts(9)
+        block1 = _stream_stressed(n=4, start=start, rmssd_ms=40.0)
+        gap = [
+            _bg(start + timedelta(minutes=20 + i * 5), rmssd_ms=70.0)
+            for i in range(2)
+        ]
+        block2_start = start + timedelta(minutes=30)
+        block2 = _stream_stressed(n=4, start=block2_start, rmssd_ms=40.0)
+        all_w = block1 + gap + block2
+        results = detect_stress_windows(
+            windows=all_w,
+            personal_morning_avg=60.0,
+            personal_floor=30.0,
+        )
+        assert len(results) == 1
+        assert results[0].duration_minutes == pytest.approx(50.0)  # 10 windows × 5 min
 
 
 # ── compute_stress_contributions ──────────────────────────────────────────────

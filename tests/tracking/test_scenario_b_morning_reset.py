@@ -93,7 +93,7 @@ def test_scenario_b_false_when_inter_anchor_has_window():
     mock_db.get = AsyncMock(return_value=user)
 
     res_with_row = MagicMock()
-    res_with_row.scalar_one_or_none.return_value = uuid_mod.uuid4()
+    res_with_row.scalar_one_or_none.return_value = datetime(2026, 2, 4, 20, 0, tzinfo=UTC)
 
     mock_db.execute = AsyncMock(return_value=res_with_row)
 
@@ -157,6 +157,62 @@ def test_scenario_b_true_when_clean_first_touch_after_anchor():
     assert ok is True
     assert d == date(2026, 2, 5)
     assert mock_db.execute.await_count == 2
+
+
+def test_scenario_b_true_when_first_wear_is_shortly_before_anchor():
+    from api.services.tracking_service import TrackingService
+
+    uid = uuid_mod.uuid4()
+    user = MagicMock()
+    user.last_morning_cycle_reset_local_date = None
+    personal = MagicMock()
+    personal.typical_wake_time = "07:00"
+
+    ist = ZoneInfo("Asia/Kolkata")
+    window_start = datetime(2026, 2, 5, 7, 5, tzinfo=ist).astimezone(UTC)
+    pre_anchor_first_wear = datetime(2026, 2, 5, 6, 0, tzinfo=ist).astimezone(UTC)
+
+    mock_db = AsyncMock()
+    mock_db.get = AsyncMock(return_value=user)
+
+    res_pre_anchor = MagicMock()
+    res_pre_anchor.scalar_one_or_none.return_value = pre_anchor_first_wear
+    res_post_anchor_empty = MagicMock()
+    res_post_anchor_empty.scalar_one_or_none.return_value = None
+
+    mock_db.execute = AsyncMock(side_effect=[res_pre_anchor, res_post_anchor_empty])
+
+    svc = TrackingService(mock_db, str(uid), session_factory=None)
+    ok, d = _run(svc._should_perform_scenario_b_forced_reset(window_start, personal))
+    assert ok is True
+    assert d == date(2026, 2, 5)
+
+
+def test_scenario_b_false_when_pre_anchor_wear_started_too_early():
+    from api.services.tracking_service import TrackingService
+
+    uid = uuid_mod.uuid4()
+    user = MagicMock()
+    user.last_morning_cycle_reset_local_date = None
+    personal = MagicMock()
+    personal.typical_wake_time = "07:00"
+
+    ist = ZoneInfo("Asia/Kolkata")
+    window_start = datetime(2026, 2, 5, 7, 5, tzinfo=ist).astimezone(UTC)
+    overnight_first_wear = datetime(2026, 2, 5, 1, 30, tzinfo=ist).astimezone(UTC)
+
+    mock_db = AsyncMock()
+    mock_db.get = AsyncMock(return_value=user)
+
+    res_pre_anchor = MagicMock()
+    res_pre_anchor.scalar_one_or_none.return_value = overnight_first_wear
+    mock_db.execute = AsyncMock(return_value=res_pre_anchor)
+
+    svc = TrackingService(mock_db, str(uid), session_factory=None)
+    ok, d = _run(svc._should_perform_scenario_b_forced_reset(window_start, personal))
+    assert ok is False
+    assert d is None
+    assert mock_db.execute.await_count == 1
 
 
 def test_nap_gate_constants_unchanged():

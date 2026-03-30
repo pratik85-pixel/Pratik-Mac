@@ -15,16 +15,17 @@ from __future__ import annotations
 import logging
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from coach.plan_replanner import compute_daily_prescription
-from api.db.database import get_db
+from api.db.database import get_db, AsyncSessionLocal
 from api.db.schema import CheckIn
 from api.utils import parse_uuid
 from api.services.model_service import ModelService
 from api.services.plan_service import PlanService
+from api.services.tracking_service import TrackingService
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/plan", tags=["plan"])
@@ -41,6 +42,20 @@ async def _model_svc(db: AsyncSession = Depends(get_db)) -> ModelService:
     return ModelService(db=db)
 
 
+async def _tracking_svc_plan(
+    request: Request,
+    user_id: str = Depends(_user_id),
+    db: AsyncSession = Depends(get_db),
+) -> TrackingService:
+    llm_client = getattr(request.app.state, "llm_client", None)
+    return TrackingService(
+        db_session=db,
+        user_id=user_id,
+        session_factory=AsyncSessionLocal,
+        llm_client=llm_client,
+    )
+
+
 # ── Request / response models ──────────────────────────────────────────────────
 
 class CheckInRequest(BaseModel):
@@ -53,26 +68,42 @@ class CheckInRequest(BaseModel):
 
 @router.get("/today")
 async def today_plan(
-    user_id:   str          = Depends(_user_id),
-    model_svc: ModelService = Depends(_model_svc),
-    db:        AsyncSession = Depends(get_db),
+    request: Request,
+    user_id:    str              = Depends(_user_id),
+    model_svc:  ModelService     = Depends(_model_svc),
+    db:         AsyncSession     = Depends(get_db),
+    track_svc:  TrackingService  = Depends(_tracking_svc_plan),
 ) -> dict:
     """
     Return today's plan items for the user.
     Loads from DB if already generated today (IST), otherwise generates and persists.
     """
-    plan_svc = PlanService(db=db, model_service=model_svc)
+    if not await track_svc.has_strict_yesterday_summary():
+        plan_svc = PlanService(
+            db=db, model_service=model_svc, llm_client=getattr(request.app.state, "llm_client", None)
+        )
+        await plan_svc.delete_today_plan_if_exists(user_id)
+        return PlanService.empty_plan_payload()
+    plan_svc = PlanService(
+        db=db, model_service=model_svc, llm_client=getattr(request.app.state, "llm_client", None)
+    )
     return await plan_svc.get_or_create_today_plan(user_id)
 
 
 @router.get("/home-status")
 async def plan_home_status(
-    user_id:   str          = Depends(_user_id),
-    model_svc: ModelService = Depends(_model_svc),
-    db:        AsyncSession = Depends(get_db),
+    request: Request,
+    user_id:    str              = Depends(_user_id),
+    model_svc:  ModelService     = Depends(_model_svc),
+    db:         AsyncSession     = Depends(get_db),
+    track_svc:  TrackingService  = Depends(_tracking_svc_plan),
 ) -> dict:
     """Today's plan headline for Home (intention + adherence + on_track)."""
-    plan_svc = PlanService(db=db, model_service=model_svc)
+    if not await track_svc.has_strict_yesterday_summary():
+        return PlanService.empty_home_plan_status()
+    plan_svc = PlanService(
+        db=db, model_service=model_svc, llm_client=getattr(request.app.state, "llm_client", None)
+    )
     return await plan_svc.get_home_plan_status(user_id)
 
 
@@ -129,16 +160,26 @@ async def check_in(
 
 @router.post("/trigger-today")
 async def trigger_today_plan(
-    user_id:   str          = Depends(_user_id),
-    model_svc: ModelService = Depends(_model_svc),
-    db:        AsyncSession = Depends(get_db),
+    request: Request,
+    user_id:    str              = Depends(_user_id),
+    model_svc:  ModelService     = Depends(_model_svc),
+    db:         AsyncSession     = Depends(get_db),
+    track_svc:  TrackingService  = Depends(_tracking_svc_plan),
 ) -> dict:
     """
     Force-regenerate today's plan for the user.
     Called by the frontend's 'Plan My Day' button.
     Returns the same payload as GET /plan/today.
     """
-    plan_svc = PlanService(db=db, model_service=model_svc)
+    if not await track_svc.has_strict_yesterday_summary():
+        plan_svc = PlanService(
+            db=db, model_service=model_svc, llm_client=getattr(request.app.state, "llm_client", None)
+        )
+        await plan_svc.delete_today_plan_if_exists(user_id)
+        return {"user_id": user_id, "triggered": False, **PlanService.empty_plan_payload()}
+    plan_svc = PlanService(
+        db=db, model_service=model_svc, llm_client=getattr(request.app.state, "llm_client", None)
+    )
     result = await plan_svc.get_or_create_today_plan(user_id, force_regen=True)
     return {"user_id": user_id, "triggered": True, **result}
 

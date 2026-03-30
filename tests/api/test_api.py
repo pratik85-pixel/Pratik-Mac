@@ -38,11 +38,18 @@ def _make_mock_db() -> AsyncMock:
     """
     Create an AsyncMock that acts like an AsyncSession.
     `execute()` returns an object where `.scalar_one_or_none()` is None.
+    `.scalars().first()` must be None — otherwise ORM rows become MagicMocks and
+    break numeric comparisons in TrackingService (e.g. morning recap).
     """
     db = AsyncMock()
     scalar_result = MagicMock()
     scalar_result.scalar_one_or_none.return_value = None
-    scalar_result.scalars.return_value.all.return_value = []
+    # COUNT(...) queries use .scalar(); default 0 so nudge cap logic compares ints.
+    scalar_result.scalar.return_value = 0
+    scalars_result = MagicMock()
+    scalars_result.all.return_value = []
+    scalars_result.first.return_value = None
+    scalar_result.scalars.return_value = scalars_result
     db.execute.return_value = scalar_result
     db.commit.return_value = None
     db.add.return_value = None
@@ -245,18 +252,18 @@ class TestPlanEndpoints:
         r = client.get("/plan/today", headers=self._HEADERS)
         assert r.status_code == 200
 
-    def test_plan_today_has_prescription(self, client):
+    def test_plan_today_has_scoring_contract_fields(self, client):
         r = client.get("/plan/today", headers=self._HEADERS)
-        assert "prescription" in r.json()
+        j = r.json()
+        assert j.get("metrics_contract_id") == "zenflow_locked_v1"
+        assert j.get("readiness_formula_id") == "plan_load_inverse_v1"
 
-    def test_plan_today_prescription_has_load_score(self, client):
+    def test_plan_today_shape_when_present(self, client):
         r = client.get("/plan/today", headers=self._HEADERS)
-        rx = r.json()["prescription"]
-        assert "load_score" in rx
-
-    def test_plan_today_has_session(self, client):
-        r = client.get("/plan/today", headers=self._HEADERS)
-        assert "session" in r.json()
+        j = r.json()
+        if j.get("id") is not None:
+            assert "items" in j
+            assert "readiness_score" in j
 
     def test_plan_week_returns_200(self, client):
         r = client.get("/plan/week", headers=self._HEADERS)

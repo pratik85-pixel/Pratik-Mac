@@ -140,13 +140,15 @@ def _llm_invoke_json(
     and OpenAI-style `llm_client.chat.completions.create(...)`.
     """
     chat_fn = getattr(llm_client, "chat", None)
-    if callable(chat_fn):
-        raw_text = chat_fn(system_prompt, user_prompt)
-        raw_text = re.sub(r"^```[a-z]*\n?", "", raw_text.strip())
-        raw_text = re.sub(r"\n?```$", "", raw_text.strip())
-        return json.loads(raw_text)
-    # OpenAI client path (Phase 5 inline prompts)
-    response = llm_client.chat.completions.create(
+    completions_create = None
+    if chat_fn is not None:
+        completions_create = getattr(getattr(chat_fn, "completions", None), "create", None)
+
+    # Prefer OpenAI-style `.chat.completions.create(...)` when available.
+    # This matters in tests where `llm_client.chat` is a MagicMock (callable)
+    # even though the intended path is `chat.completions.create`.
+    if callable(completions_create):
+        response = llm_client.chat.completions.create(
         model="gpt-4o",
         temperature=0.6,
         max_tokens=300,
@@ -154,11 +156,20 @@ def _llm_invoke_json(
             {"role": "system", "content": system_prompt},
             {"role": "user",   "content": user_prompt},
         ],
-    )
-    raw_text = response.choices[0].message.content or ""
-    raw_text = re.sub(r"^```[a-z]*\n?", "", raw_text.strip())
-    raw_text = re.sub(r"\n?```$", "", raw_text.strip())
-    return json.loads(raw_text)
+        )
+        raw_text = response.choices[0].message.content or ""
+        raw_text = re.sub(r"^```[a-z]*\n?", "", raw_text.strip())
+        raw_text = re.sub(r"\n?```$", "", raw_text.strip())
+        return json.loads(raw_text)
+
+    # Duck-typed `llm_client.chat(system, user) -> str` path.
+    if callable(chat_fn):
+        raw_text = chat_fn(system_prompt, user_prompt)
+        raw_text = re.sub(r"^```[a-z]*\n?", "", raw_text.strip())
+        raw_text = re.sub(r"\n?```$", "", raw_text.strip())
+        return json.loads(raw_text)
+
+    raise TypeError("llm_client does not support chat invocation")
 
 
 def _run_assembled_trigger(
