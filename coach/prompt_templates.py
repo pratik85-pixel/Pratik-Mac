@@ -75,10 +75,12 @@ Output format:
 {CONVERSATION_TOPIC_SCOPE}
 
 Score citation rule (CRITICAL):
-    When citing a number in your JSON response, you MUST use one of:
-        readiness score (0–100), stress score (0–100), or recovery score (0–100).
+    When citing scores, use the values exactly as provided in the packet:
+        stress_load score: 0–10 scale (cite as "X.X/10", e.g. "7.2/10").
+        readiness score: 0–100 scale (cite as "XX/100" or "XX%").
+        recovery score: 0–100 scale (cite as "XX/100" or "XX%").
     Never output raw metric values, HRV percentages vs baselines, arc durations,
-    millisecond values, or any other backend number. Use only the provided scores.
+    millisecond values, or any other backend number.
     If no score is available for a dimension, describe direction ("high", "building",
     "under pressure") without citing a number.
 
@@ -223,7 +225,7 @@ _L3_MORNING_BRIEF_SYSTEM = f"""\
 You are ZenFlow's morning coach.
 You are given:
   1) COACH NARRATIVE (Layer 2 output) as the primary source of truth, and
-  2) a small structured packet with today's/yesterday's 0–100 scores.
+  2) a small structured packet with today's/yesterday's scores.
 
 Rules
 -----
@@ -238,9 +240,10 @@ Rules
 - Never use markdown fences.
 - Do not include any extra keys.
 - Never give medical advice or diagnosis.
-- Never output raw physiological values. You MAY cite only:
-  readiness, stress load, or recovery scores — expressed out of 10 (e.g. "7.2/10") to
-  match what the user sees on screen. The packet provides these already scaled to 0–10.
+- Never output raw physiological values. When citing scores:
+  * stress_load_score is on a 0–10 scale — cite as "X.X/10" (e.g. "7.2/10").
+  * readiness_score, waking_recovery_score, sleep_recovery_score are on a 0–100 scale — cite as "XX/100" or "XX%".
+  The packet provides values already in the correct scale; do NOT divide or multiply.
 
 {CONVERSATION_TOPIC_SCOPE}
 """
@@ -270,22 +273,16 @@ def build_layer3_morning_brief_prompt(
 
     latest_row = packet.daily_trajectory[-1] if packet.daily_trajectory else {}
 
-    def _s10(v: Any) -> Any:
-        """Convert a 0-100 score to 0-10 (one decimal) for user-facing citation."""
-        try:
-            return round(float(v) / 10, 1) if v is not None else None
-        except (TypeError, ValueError):
-            return None
-
     def _row_min(r: Any) -> dict[str, Any]:
         return {
             "date": r.get("date"),
             "day_type": r.get("day_type"),
-            # All scores are expressed out of 10 to match what the user sees in the app.
-            "readiness_score_out_of_10": _s10(r.get("readiness_score")),
-            "waking_recovery_out_of_10": _s10(r.get("waking_recovery_score")),
-            "sleep_recovery_out_of_10":  _s10(r.get("sleep_recovery_score")),
-            "stress_load_out_of_10":     _s10(r.get("stress_load_score")),
+            # readiness and recovery are on a 0–100 scale.
+            "readiness_score": r.get("readiness_score"),
+            "waking_recovery_score": r.get("waking_recovery_score"),
+            "sleep_recovery_score": r.get("sleep_recovery_score"),
+            # stress_load is already expressed on the 0–10 scale the user sees in the app.
+            "stress_load_score": r.get("stress_load_score"),
         }
 
     # Keep narrative length bounded; narrative is already sanitized by our pipeline.
@@ -297,7 +294,10 @@ TODAY_LOCAL_DATE: {packet.today_local_date}
 COACH NARRATIVE (Layer 2):
 {narrative_excerpt}
 
-SCORES PACKET (all scores out of 10 — cite them exactly as shown, e.g. "7.2/10"):
+SCORES PACKET:
+  - stress_load_score: 0–10 scale (cite as shown, e.g. "7.2/10")
+  - readiness_score, waking_recovery_score, sleep_recovery_score: 0–100 scale (cite as shown, e.g. "72/100" or "72%")
+
   YESTERDAY_ROW:
 {json.dumps(_row_min(yesterday_row or {}), ensure_ascii=False, default=str)}
 
@@ -333,7 +333,7 @@ Rules
   If there are no meaningful avoidances, return an empty list — do not fabricate.
 - Never include markdown fences or extra keys.
 - Never give medical advice or diagnosis.
-- Scores should be cited out of 10 if referenced (e.g. "7.2/10").
+- If citing scores: stress_load is 0–10 (cite as "X.X/10"); readiness/recovery are 0–100 (cite as "XX%").
 
 Topic scope guardrail:
 - Allowed topics: health, fitness, wellness, sleep, recovery, emotional wellbeing.
@@ -357,7 +357,7 @@ COACH NARRATIVE (Layer 2):
 TODAY PLAN ITEMS (from /plan/today):
 {json.dumps(plan_items, ensure_ascii=False, default=str)[:5000]}
 
-SCORES (best-effort; only cite 0–100):
+TODAY SCORES (stress_load is 0–10; readiness/recovery are 0–100):
 {json.dumps(packet.daily_trajectory[-1] if packet.daily_trajectory else {}, ensure_ascii=False, default=str)[:1000]}
 
 Generate:
@@ -380,7 +380,7 @@ Rules
   { "message": string }
 - message length <= 60 words.
 - Never give medical advice or diagnosis.
-- Never output raw physiological values; cite only readiness/stress/recovery 0–100 scores if present.
+- Never output raw physiological values. If citing scores: stress_load is 0–10 (cite as "X.X/10"); readiness/recovery are 0–100.
 - Never output markdown fences or any extra keys.
 
 Topic scope guardrail:

@@ -122,7 +122,7 @@ async def week_plan(
         "session_duration_minutes": prescription.session_duration,
         "preferred_window": prescription.session_window,
         "session_intensity": prescription.session_intensity,
-        "load_score":       prescription.load_score,
+        "load_score":       round(prescription.load_score * 10, 1),
     }
 
 

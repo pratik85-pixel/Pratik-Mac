@@ -257,13 +257,23 @@ async def build_coach_input_packet(
                 getattr(r, "ns_capacity_recovery", None),
             )
 
+        raw_stress = getattr(r, "stress_load_score", None)
+        stress_load_0_10: float | None = None
+        if raw_stress is not None:
+            try:
+                stress_load_0_10 = round(float(raw_stress) / 10.0, 1)
+            except (TypeError, ValueError):
+                pass
+
         daily_trajectory.append(
             {
                 "date": r.summary_date.date().isoformat() if getattr(r, "summary_date", None) else None,
+                # readiness and waking/sleep recovery remain on their native 0–100 scale.
                 "readiness_score": readiness,
                 "waking_recovery_score": getattr(r, "waking_recovery_score", None),
                 "sleep_recovery_score": sleep_recovery_score,
-                "stress_load_score": getattr(r, "stress_load_score", None),
+                # stress_load is expressed on the same 0–10 scale the app shows the user.
+                "stress_load_score": stress_load_0_10,
                 "day_type": getattr(r, "day_type", None),
             }
         )

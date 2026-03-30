@@ -59,7 +59,7 @@ class DailyPrescription:
     session_intensity:  str            # "low" | "moderate" | "high"
     session_window:     str            # preferred time band, e.g. "19:00–21:00"
     physical_load:      str            # "reduce" | "maintain" | "can_increase"
-    load_score:         float          # 0.0–1.0 composite pressure
+    load_score:         float          # 0.0–1.0 internal composite pressure (multiply ×10 for user-facing 0–10 display)
     reason_tag:         str            # drives context template, e.g. "alcohol_recovery_compound"
     carry_forward:      bool = False   # missed session that should be carried to tomorrow
     notes:              list[str] = field(default_factory=list)  # optional coach notes
