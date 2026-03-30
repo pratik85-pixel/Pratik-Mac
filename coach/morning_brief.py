@@ -187,7 +187,7 @@ async def _run_morning_brief(
         try:
             packet = await build_coach_input_packet(session, user_id)
             sys_p, user_p = build_layer2_narrative_prompt(packet)
-            raw = llm_client.chat(sys_p, user_p)
+            raw = llm_client.chat(sys_p, user_p, json_mode=False)
             narrative = (raw or "").strip() or None
             # Persist the fresh narrative immediately
             if uup is not None and narrative:

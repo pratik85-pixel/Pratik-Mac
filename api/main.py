@@ -74,14 +74,17 @@ class _SyncLLMClient:
         self._client = OpenAI(api_key=api_key)
         self._model = model
 
-    def chat(self, system: str, user: str) -> str:
+    def chat(self, system: str, user: str, json_mode: bool = True) -> str:
+        kwargs: dict = {}
+        if json_mode:
+            kwargs["response_format"] = {"type": "json_object"}
         resp = self._client.chat.completions.create(
             model=self._model,
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user",   "content": user},
             ],
-            response_format={"type": "json_object"},
+            **kwargs,
         )
         return resp.choices[0].message.content or ""
 

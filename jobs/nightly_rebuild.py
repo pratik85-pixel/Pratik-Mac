@@ -650,7 +650,7 @@ async def _rebuild_one_user(
             sys_prompt, user_prompt = build_layer2_narrative_prompt(packet)
 
             if llm_client is not None:
-                raw = llm_client.chat(sys_prompt, user_prompt)
+                raw = llm_client.chat(sys_prompt, user_prompt, json_mode=False)
                 narrative = (raw or "").strip()
                 if not narrative:
                     narrative = _fallback_layer2_narrative(packet)

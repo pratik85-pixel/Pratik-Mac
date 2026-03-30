@@ -78,7 +78,7 @@ async def force_coach_refresh(
         sys_p, user_p = build_layer2_narrative_prompt(packet)
 
         if llm_client is not None:
-            raw = llm_client.chat(sys_p, user_p)
+            raw = llm_client.chat(sys_p, user_p, json_mode=False)
             narrative = (raw or "").strip()
         else:
             # Offline fallback — import from nightly_rebuild
