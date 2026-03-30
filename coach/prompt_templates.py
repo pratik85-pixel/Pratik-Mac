@@ -239,7 +239,8 @@ Rules
 - Do not include any extra keys.
 - Never give medical advice or diagnosis.
 - Never output raw physiological values. You MAY cite only:
-  readiness score, stress score, or recovery score (all 0–100) if present in the packet.
+  readiness, stress load, or recovery scores — expressed out of 10 (e.g. "7.2/10") to
+  match what the user sees on screen. The packet provides these already scaled to 0–10.
 
 {CONVERSATION_TOPIC_SCOPE}
 """
@@ -269,14 +270,22 @@ def build_layer3_morning_brief_prompt(
 
     latest_row = packet.daily_trajectory[-1] if packet.daily_trajectory else {}
 
+    def _s10(v: Any) -> Any:
+        """Convert a 0-100 score to 0-10 (one decimal) for user-facing citation."""
+        try:
+            return round(float(v) / 10, 1) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
     def _row_min(r: Any) -> dict[str, Any]:
         return {
             "date": r.get("date"),
             "day_type": r.get("day_type"),
-            "readiness_score": r.get("readiness_score"),
-            "waking_recovery_score": r.get("waking_recovery_score") or r.get("waking_recovery_score"),
-            "sleep_recovery_score": r.get("sleep_recovery_score"),
-            "stress_load_score": r.get("stress_load_score"),
+            # All scores are expressed out of 10 to match what the user sees in the app.
+            "readiness_score_out_of_10": _s10(r.get("readiness_score")),
+            "waking_recovery_out_of_10": _s10(r.get("waking_recovery_score")),
+            "sleep_recovery_out_of_10":  _s10(r.get("sleep_recovery_score")),
+            "stress_load_out_of_10":     _s10(r.get("stress_load_score")),
         }
 
     # Keep narrative length bounded; narrative is already sanitized by our pipeline.
@@ -288,11 +297,11 @@ TODAY_LOCAL_DATE: {packet.today_local_date}
 COACH NARRATIVE (Layer 2):
 {narrative_excerpt}
 
-SCORES PACKET (best-effort; only cite 0–100 scores):
+SCORES PACKET (all scores out of 10 — cite them exactly as shown, e.g. "7.2/10"):
   YESTERDAY_ROW:
 {json.dumps(_row_min(yesterday_row or {}), ensure_ascii=False, default=str)}
 
-  LATEST_DAY_ROW:
+  TODAY_ROW:
 {json.dumps(_row_min(latest_row or {}), ensure_ascii=False, default=str)}
 
 Write the morning brief now. Output ONLY valid JSON.
@@ -304,8 +313,8 @@ Write the morning brief now. Output ONLY valid JSON.
 # ── Layer 3 — Plan brief + donts prompt ────────────────────────────────────
 
 _L3_PLAN_BRIEF_SYSTEM = """\
-You are ZenFlow's plan brief writer.
-Use COACH NARRATIVE (Layer 2 output) plus the given plan items as context.
+You are ZenFlow's plan brief writer. Your job is to explain WHY each prescribed
+activity was chosen today and list what the user should avoid.
 
 Rules
 -----
@@ -316,12 +325,18 @@ Rules
       {"slug_or_label": string, "reason": string}  // 0..2 items
     ]
   }
+- "brief" must directly explain WHY the specific plan items were prescribed today,
+  grounded in the narrative (e.g. stress pattern, readiness, recovery need).
+  Do NOT repeat the morning day-state assessment — the brief must add new information
+  about the chosen activities and the physiological reason behind them.
+- "avoid_items" must list 1–2 specific things to avoid today with a physiological reason.
+  If there are no meaningful avoidances, return an empty list — do not fabricate.
 - Never include markdown fences or extra keys.
 - Never give medical advice or diagnosis.
-- Never output raw physiological values; cite only readiness/stress/recovery 0–100 scores if needed.
+- Scores should be cited out of 10 if referenced (e.g. "7.2/10").
 
 Topic scope guardrail:
-- Allowed topics are limited to health/fitness/wellness/sleep/recovery and related emotional wellbeing.
+- Allowed topics: health, fitness, wellness, sleep, recovery, emotional wellbeing.
 - Deflection (exact text):
   "I'm focused on your health and nervous system — let me know if there's something in that space I can help with."
 """

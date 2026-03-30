@@ -139,7 +139,21 @@ class PlanService:
         if uid is not None and not force_regen:
             existing = await self._load_today_row(uid, today_dt)
             if existing is not None:
-                return self._row_to_dict(existing)
+                payload = self._row_to_dict(existing)
+                # Attach cached plan brief + avoid_items from UUP so the
+                # cached plan path returns them without an extra LLM call.
+                try:
+                    uup_cached = await load_unified_profile(self._db, uid)
+                    if uup_cached is not None:
+                        payload["brief"] = uup_cached.plan_brief_text
+                        payload["avoid_items"] = uup_cached.avoid_items_json or []
+                    else:
+                        payload.setdefault("brief", None)
+                        payload.setdefault("avoid_items", [])
+                except Exception:
+                    payload.setdefault("brief", None)
+                    payload.setdefault("avoid_items", [])
+                return payload
 
         # Build inputs from profile + habits
         inputs = await self._build_inputs(user_id, today)
@@ -225,9 +239,9 @@ class PlanService:
 
             # Parse JSON robustly.
             cleaned = raw.strip()
-            cleaned = re.sub(r"^```(?:json)?\\n?", "", cleaned)
-            cleaned = re.sub(r"\\n?```$", "", cleaned)
-            m = re.search(r"\\{.*\\}", cleaned, re.DOTALL)
+            cleaned = re.sub(r"^```(?:json)?\n?", "", cleaned)
+            cleaned = re.sub(r"\n?```$", "", cleaned)
+            m = re.search(r"\{.*\}", cleaned, re.DOTALL)
             if not m:
                 return {"brief": None, "avoid_items": []}
             obj = json.loads(m.group(0))
@@ -248,7 +262,24 @@ class PlanService:
                     {"slug_or_label": str(slug_or_label)[:100], "reason": str(reason)[:300]}
                 )
 
-            return {"brief": str(brief)[:600] if brief is not None else None, "avoid_items": out_avoid}
+            result = {"brief": str(brief)[:600] if brief is not None else None, "avoid_items": out_avoid}
+
+            # Cache brief + avoid_items in UUP so the plan cache path can return them too.
+            try:
+                from sqlalchemy import select as _select
+                import api.db.schema as _db
+                uup_res = await self._db.execute(
+                    _select(_db.UserUnifiedProfile).where(_db.UserUnifiedProfile.user_id == uid)
+                )
+                uup_row = uup_res.scalar_one_or_none()
+                if uup_row is not None:
+                    uup_row.plan_brief_text = result["brief"]
+                    uup_row.avoid_items_json = out_avoid
+                    await self._db.commit()
+            except Exception:
+                pass  # cache write is best-effort
+
+            return result
         except Exception:
             return {"brief": None, "avoid_items": []}
 
