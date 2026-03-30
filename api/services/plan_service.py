@@ -140,16 +140,36 @@ class PlanService:
             existing = await self._load_today_row(uid, today_dt)
             if existing is not None:
                 payload = self._row_to_dict(existing)
-                # Attach cached plan brief + avoid_items from UUP so the
-                # cached plan path returns them without an extra LLM call.
+                # Load cached plan brief + avoid_items from UUP.
                 try:
                     uup_cached = await load_unified_profile(self._db, uid)
-                    if uup_cached is not None:
-                        payload["brief"] = uup_cached.plan_brief_text
-                        payload["avoid_items"] = uup_cached.avoid_items_json or []
+                    cached_brief = uup_cached.plan_brief_text if uup_cached else None
+                    cached_avoid = (uup_cached.avoid_items_json or []) if uup_cached else []
+
+                    if cached_brief is None:
+                        # plan_brief_text was cleared (e.g. morning brief just regenerated).
+                        # Trigger a fresh Layer 3 plan brief from the narrative so the
+                        # plan screen never shows the same text as the home screen brief.
+                        narrative = (
+                            uup_cached.coach_narrative
+                            if uup_cached is not None
+                            else None
+                        )
+                        try:
+                            brief_result = await self._maybe_add_layer3_plan_brief_and_donts(
+                                user_id=user_id,
+                                uid=uid,
+                                payload_items=payload.get("items") or [],
+                                payload_day_type=payload.get("day_type"),
+                                narrative=narrative,
+                            )
+                            payload.update(brief_result)
+                        except Exception:
+                            payload.setdefault("brief", None)
+                            payload.setdefault("avoid_items", [])
                     else:
-                        payload.setdefault("brief", None)
-                        payload.setdefault("avoid_items", [])
+                        payload["brief"] = cached_brief
+                        payload["avoid_items"] = cached_avoid
                 except Exception:
                     payload.setdefault("brief", None)
                     payload.setdefault("avoid_items", [])

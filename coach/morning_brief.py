@@ -229,6 +229,9 @@ async def _run_morning_brief(
     if uup is not None:
         for k, v in fields.items():
             setattr(uup, k, v)
+        # Clear plan brief cache so the next /plan/today call regenerates a
+        # fresh Layer 3 plan brief that doesn't duplicate the morning brief.
+        uup.plan_brief_text = None
     else:
         uup = db.UserUnifiedProfile(
             id=uuid_mod.uuid4(),

@@ -84,6 +84,10 @@ class DailySummaryResponse(BaseModel):
     score_confidence:      Literal["high", "medium", "low"] = "high"
     score_confidence_reasons: list[str] = []
     summary_source:        Literal["live_compute", "persisted_row"] = "persisted_row"
+    # Deterministic plain-English explanation of WHY these specific scores are what they are.
+    # Use this for "Why this score?" UI sections on historical/daily summary screens.
+    # This is NOT the LLM morning brief — it is always date-specific and score-grounded.
+    score_explanation:     Optional[str] = None
 
 
 class WaveformPoint(BaseModel):
@@ -191,6 +195,9 @@ class MorningRecapSummaryBlock(BaseModel):
     score_confidence: Literal["high", "medium", "low"] = "high"
     score_confidence_reasons: list[str] = []
     summary_source: Literal["live_compute", "persisted_row"] = "persisted_row"
+    # Deterministic plain-English explanation of WHY these scores are what they are.
+    # Use this for "Why this score?" sections — NOT the LLM morning brief.
+    score_explanation: Optional[str] = None
 
 
 class MorningRecapResponse(BaseModel):
@@ -226,6 +233,81 @@ def _sleep_recovery_context(summary_date: Optional[date]) -> tuple[Optional[str]
         return None, None
     night_date = (summary_date - timedelta(days=1)).isoformat()
     return night_date, f"For night of {night_date}"
+
+
+# ── Score explanation builder (deterministic — used for "Why this score?") ────
+
+def _build_score_explanation(
+    stress_load_score: Optional[float],   # raw 0–100 from DB
+    waking_recovery_score: Optional[float],  # 0–100
+    sleep_recovery_score: Optional[float],   # 0–100 or None
+    day_type: Optional[str] = None,
+) -> str:
+    """
+    Return a 1–3 sentence plain-English explanation of WHY today's numbers are
+    what they are.  This is deterministic (no LLM) and date-specific.
+
+    stress_load is converted to 0–10 for citation to match the app display.
+    recovery/sleep remain as percentages (0–100).
+    """
+    parts: list[str] = []
+
+    # ── Stress load ─────────────────────────────────────────────────────────
+    if stress_load_score is not None:
+        sl = round(float(stress_load_score) / 10.0, 1)
+        if stress_load_score >= 75:
+            parts.append(
+                f"Stress load was high at {sl}/10 — your nervous system was under "
+                "significant pressure for much of the day."
+            )
+        elif stress_load_score >= 45:
+            parts.append(
+                f"Stress load was moderate at {sl}/10, indicating your system was "
+                "working through a meaningful but manageable amount of stress."
+            )
+        else:
+            parts.append(
+                f"Stress load was low at {sl}/10, reflecting a well-managed day "
+                "for your nervous system."
+            )
+
+    # ── Waking recovery ─────────────────────────────────────────────────────
+    if waking_recovery_score is not None:
+        wr = round(float(waking_recovery_score))
+        if wr < 20:
+            parts.append(
+                f"Waking recovery was low at {wr}% — your system hadn't had enough "
+                "restorative windows during active hours to rebuild capacity."
+            )
+        elif wr < 50:
+            parts.append(
+                f"Waking recovery was still rebuilding at {wr}%, meaning your "
+                "system had some restoration but not a full recharge."
+            )
+        else:
+            parts.append(
+                f"Waking recovery was solid at {wr}%, showing your system was "
+                "stabilising well across the day."
+            )
+
+    # ── Sleep recovery ───────────────────────────────────────────────────────
+    if sleep_recovery_score is None:
+        parts.append(
+            "Sleep recovery data isn't available for this day — "
+            "the band may not have been worn during sleep."
+        )
+    elif sleep_recovery_score < 20:
+        parts.append(
+            f"Sleep recovery was low at {round(float(sleep_recovery_score))}%, "
+            "suggesting limited overnight HRV restoration."
+        )
+    elif sleep_recovery_score >= 60:
+        parts.append(
+            f"Sleep recovery was strong at {round(float(sleep_recovery_score))}%, "
+            "indicating good overnight restoration."
+        )
+
+    return "  ".join(parts) if parts else "Score data is limited for this day."
 
 
 # ── Daily summary builder (Phase 1 contract metadata — scores unchanged) ─────
@@ -266,11 +348,12 @@ def _build_summary_response(
             )
 
     meta = _pipeline_meta(row, summary_source)
+    waking_rec = getattr(row, 'waking_recovery_score', None)
     return DailySummaryResponse(
         summary_date          = row.summary_date.date().isoformat() if row.summary_date else "",
         stress_load_score     = row.stress_load_score,
-        recovery_score        = getattr(row, 'waking_recovery_score', None),
-        waking_recovery_score = getattr(row, 'waking_recovery_score', None),
+        recovery_score        = waking_rec,
+        waking_recovery_score = waking_rec,
         sleep_recovery_score  = sleep_recovery_score,
         sleep_recovery_night_date = sleep_night_date,
         sleep_recovery_subtext = sleep_subtext,
@@ -285,6 +368,12 @@ def _build_summary_response(
         ns_capacity_used      = getattr(row, 'ns_capacity_used', None),
         rmssd_morning_avg     = personal.rmssd_morning_avg if personal else None,
         rmssd_ceiling         = personal.rmssd_ceiling if personal else None,
+        score_explanation     = _build_score_explanation(
+            stress_load_score=row.stress_load_score,
+            waking_recovery_score=waking_rec,
+            sleep_recovery_score=sleep_recovery_score,
+            day_type=row.day_type,
+        ),
         **meta,
     )
 
@@ -572,6 +661,12 @@ async def get_morning_recap(
         sleep_night_date, sleep_subtext = _sleep_recovery_context(recap_date)
         summary.sleep_recovery_night_date = sleep_night_date
         summary.sleep_recovery_subtext = sleep_subtext
+        summary.score_explanation = _build_score_explanation(
+            stress_load_score=summary.stress_load_score,
+            waking_recovery_score=summary.waking_recovery_score,
+            sleep_recovery_score=summary.sleep_recovery_score,
+            day_type=summary.day_type,
+        )
     return MorningRecapResponse(
         for_date=raw["for_date"],
         should_show=raw["should_show"],
