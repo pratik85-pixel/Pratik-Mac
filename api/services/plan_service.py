@@ -26,7 +26,7 @@ import json
 import re
 import uuid
 from datetime import date, datetime, UTC
-from typing import Optional
+from typing import Any, Optional
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -140,21 +140,24 @@ class PlanService:
             existing = await self._load_today_row(uid, today_dt)
             if existing is not None:
                 payload = self._row_to_dict(existing)
-                # Load cached plan brief + avoid_items from UUP.
+                # Read plan brief + avoid_items directly from the DB row so we
+                # access plan_brief_text which is NOT on the UnifiedProfile dataclass.
                 try:
-                    uup_cached = await load_unified_profile(self._db, uid)
-                    cached_brief = uup_cached.plan_brief_text if uup_cached else None
-                    cached_avoid = (uup_cached.avoid_items_json or []) if uup_cached else []
+                    import api.db.schema as _db_schema
+                    uup_row_res = await self._db.execute(
+                        select(_db_schema.UserUnifiedProfile).where(
+                            _db_schema.UserUnifiedProfile.user_id == uid
+                        )
+                    )
+                    uup_row = uup_row_res.scalar_one_or_none()
+                    cached_brief = uup_row.plan_brief_text if uup_row else None
+                    cached_avoid = (uup_row.avoid_items_json or []) if uup_row else []
+                    narrative = uup_row.coach_narrative if uup_row else None
 
                     if cached_brief is None:
-                        # plan_brief_text was cleared (e.g. morning brief just regenerated).
-                        # Trigger a fresh Layer 3 plan brief from the narrative so the
-                        # plan screen never shows the same text as the home screen brief.
-                        narrative = (
-                            uup_cached.coach_narrative
-                            if uup_cached is not None
-                            else None
-                        )
+                        # plan_brief_text cleared (morning brief just regenerated).
+                        # Trigger a fresh Layer 3 call so plan screen always shows
+                        # activity-specific content, not the home-screen morning brief.
                         try:
                             brief_result = await self._maybe_add_layer3_plan_brief_and_donts(
                                 user_id=user_id,
@@ -164,13 +167,15 @@ class PlanService:
                                 narrative=narrative,
                             )
                             payload.update(brief_result)
-                        except Exception:
+                        except Exception as _e:
+                            logger.warning("plan brief regen failed (cached path): %s", _e)
                             payload.setdefault("brief", None)
                             payload.setdefault("avoid_items", [])
                     else:
                         payload["brief"] = cached_brief
                         payload["avoid_items"] = cached_avoid
-                except Exception:
+                except Exception as _e:
+                    logger.warning("plan brief load failed: %s", _e)
                     payload.setdefault("brief", None)
                     payload.setdefault("avoid_items", [])
                 return payload
@@ -296,8 +301,8 @@ class PlanService:
                     uup_row.plan_brief_text = result["brief"]
                     uup_row.avoid_items_json = out_avoid
                     await self._db.commit()
-            except Exception:
-                pass  # cache write is best-effort
+            except Exception as _cache_err:
+                logger.warning("plan brief UUP cache write failed: %s", _cache_err)
 
             return result
         except Exception:
