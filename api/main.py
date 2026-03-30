@@ -39,6 +39,7 @@ from api.routers import (
     profile,
     band_sessions,
     notifications,
+    admin,
 )
 from api.services.session_service import SessionService
 from api.services.coach_service import CoachService
@@ -182,6 +183,7 @@ def create_app() -> FastAPI:
     app.include_router(profile.router)
     app.include_router(band_sessions.router)
     app.include_router(notifications.router)
+    app.include_router(admin.router)
 
     # ── Health check ──────────────────────────────────────────────────────────
     @app.get("/health", tags=["meta"])
