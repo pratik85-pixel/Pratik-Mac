@@ -46,24 +46,30 @@ class TestValidateTag:
         ok, err = validate_tag("yoga", "recovery")
         assert ok is True
 
-    def test_unknown_slug_invalid(self):
-        ok, err = validate_tag("invalid_slug", "stress")
-        assert ok is False
-        assert "Unknown" in err
-
-    def test_recovery_slug_on_stress_window_invalid(self):
-        ok, err = validate_tag("yoga", "stress")
-        assert ok is False
-        assert "stress" in err.lower()
-
-    def test_stress_slug_on_recovery_window_invalid(self):
-        ok, err = validate_tag("running", "recovery")
-        assert ok is False
-
-    def test_mixed_slug_on_stress_window_valid(self):
-        # walking is "mixed" — valid on stress windows (mixed activities can appear as stress)
-        ok, err = validate_tag("walking", "stress")
+    def test_any_non_empty_slug_is_valid(self):
+        ok, err = validate_tag("work / calls", "stress")
         assert ok is True
+        assert err == ""
+
+    def test_any_tag_allowed_on_stress(self):
+        ok, err = validate_tag("yoga", "stress")
+        assert ok is True
+        assert err == ""
+
+    def test_any_tag_allowed_on_recovery(self):
+        ok, err = validate_tag("running", "recovery")
+        assert ok is True
+        assert err == ""
+
+    def test_empty_slug_invalid(self):
+        ok, err = validate_tag("   ", "stress")
+        assert ok is False
+        assert err != ""
+
+    def test_invalid_window_type_invalid(self):
+        ok, err = validate_tag("workout", "invalid_type")
+        assert ok is False
+        assert "Unsupported" in err
 
 
 # ── Apply user tag ────────────────────────────────────────────────────────────
@@ -76,17 +82,17 @@ class TestApplyUserTag:
         assert result.tag_applied == "running"
         assert result.tag_source == "user_confirmed"
 
-    def test_invalid_slug_fails(self):
+    def test_any_non_empty_slug_succeeds(self):
         window = _window("w1", "stress")
         result = apply_user_tag(window, "does_not_exist")
-        assert result.success is False
-        assert result.tag_applied is None
-        assert result.error is not None
+        assert result.success is True
+        assert result.tag_applied == "does_not_exist"
+        assert result.error is None
 
-    def test_incompatible_tag_fails(self):
+    def test_any_slug_allowed_on_any_window_type(self):
         window = _window("w1", "recovery")
         result = apply_user_tag(window, "running")
-        assert result.success is False
+        assert result.success is True
 
 
 # ── Auto-tag pass ─────────────────────────────────────────────────────────────
