@@ -248,25 +248,20 @@ def compute_daily_summary(
         float(sleep_ceiling) if sleep_ceiling is not None else float(personal_ceiling)
     )
     log_sleep_range_for_display: float = 0.0
-    # When rmssd_sleep_avg is available (band worn overnight + calibrated), compute
-    # sleep recovery relative to sleep_avg → sleep_ceiling (fallback: waking ceiling).
-    # Without it, fall back to stored RecoveryWindow.recovery_area values (old behaviour).
-    if rmssd_sleep_avg is not None:
-        actual_recovery_area_sleep = _compute_recovery_area_sleep_raw(
-            windows=background_windows,
-            rmssd_sleep_avg=rmssd_sleep_avg,
-            rmssd_sleep_ceiling=sleep_cap_for_log,
-            window_duration=cfg.BACKGROUND_WINDOW_MINUTES,
-        )
-        log_sleep_range_for_display = math.log(
-            max(1.0, sleep_cap_for_log / max(0.001, rmssd_sleep_avg))
-        )
-    else:
-        # Fallback: use stored RecoveryWindow values (pre-v2 behaviour, no regression)
-        actual_recovery_area_sleep = sum(
-            rw.recovery_area for rw in recovery_windows if rw.context == "sleep"
-        )
-        log_sleep_range_for_display = log_recovery_range
+    # Sleep recovery (v2): always computed in log-space vs sleep_avg → sleep_ceiling.
+    # Population-tier sleep baselines are seeded into PersonalModel on day 0; calibration
+    # overwrites them once sufficient overnight data exists. No legacy area fallbacks.
+    if rmssd_sleep_avg is None:
+        rmssd_sleep_avg = personal_morning_avg
+    actual_recovery_area_sleep = _compute_recovery_area_sleep_raw(
+        windows=background_windows,
+        rmssd_sleep_avg=rmssd_sleep_avg,
+        rmssd_sleep_ceiling=sleep_cap_for_log,
+        window_duration=cfg.BACKGROUND_WINDOW_MINUTES,
+    )
+    log_sleep_range_for_display = math.log(
+        max(1.0, sleep_cap_for_log / max(0.001, rmssd_sleep_avg))
+    )
     total_recovery_area = actual_recovery_area_waking + actual_recovery_area_sleep
 
     # ── Raw percentages (unbounded — do NOT clamp before net_balance) ────────

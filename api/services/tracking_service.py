@@ -364,6 +364,27 @@ def _seed_from_onboarding(onboarding: "Optional[dict]") -> "tuple[float, float, 
     return tier["floor"], tier["ceiling"], tier["morning"]
 
 
+def _seed_sleep_from_onboarding(onboarding: "Optional[dict]") -> "tuple[float, float]":
+    """
+    Return (sleep_avg_ms, sleep_ceiling_ms) population-tier defaults.
+
+    Design contract:
+    - Day 0 uses population defaults (tiered by onboarding).
+    - Calibration overwrites with user-specific sleep baselines once enough overnight data exists.
+    """
+    if onboarding is None:
+        freq = "1-3x/week"
+    else:
+        freq = onboarding.get("exercise_frequency", "1-3x/week")
+
+    # Fixed population defaults per tier (tuned for typical adult RMSSD distributions).
+    if freq == "rarely":
+        return 32.0, 52.0
+    if freq == "4+/week":
+        return 60.0, 88.0
+    return 44.0, 66.0
+
+
 async def _load_background_since(
     db_session: AsyncSession,
     user_id: str,
@@ -460,12 +481,16 @@ async def _bootstrap_personal_model(
         )
         onboarding_json = user_result.scalar_one_or_none()
         seed_floor, seed_ceiling, seed_morning = _seed_from_onboarding(onboarding_json)
+        seed_sleep_avg, seed_sleep_ceiling = _seed_sleep_from_onboarding(onboarding_json)
+        seed_sleep_ceiling = min(seed_sleep_ceiling, CONFIG.tracking.RMSSD_POPULATION_CEILING)
 
         personal = db.PersonalModel(
             user_id                      = user_id,
             rmssd_floor                  = seed_floor,
             rmssd_ceiling                = seed_ceiling,
             rmssd_morning_avg            = seed_morning,
+            rmssd_sleep_avg              = seed_sleep_avg,
+            rmssd_sleep_ceiling          = seed_sleep_ceiling,
             capacity_version             = 0,
             prf_status                   = "PRF_UNKNOWN",
             typical_wake_time            = "07:00",
@@ -485,6 +510,25 @@ async def _bootstrap_personal_model(
                 "Seeded PersonalModel for user %s (floor=%.1f ceiling=%.1f morning=%.1f)",
                 user_id, seed_floor, seed_ceiling, seed_morning,
             )
+
+    # If row exists but sleep baselines are missing (legacy users), seed once from population tier.
+    # Calibration will overwrite these when overnight data becomes available.
+    if personal is not None and (personal.rmssd_sleep_avg is None or personal.rmssd_sleep_ceiling is None):
+        user_result = await db_session.execute(
+            select(db.User.onboarding).where(db.User.id == user_id)
+        )
+        onboarding_json = user_result.scalar_one_or_none()
+        seed_sleep_avg, seed_sleep_ceiling = _seed_sleep_from_onboarding(onboarding_json)
+        seed_sleep_ceiling = min(seed_sleep_ceiling, CONFIG.tracking.RMSSD_POPULATION_CEILING)
+        changed = False
+        if personal.rmssd_sleep_avg is None:
+            personal.rmssd_sleep_avg = seed_sleep_avg
+            changed = True
+        if personal.rmssd_sleep_ceiling is None:
+            personal.rmssd_sleep_ceiling = seed_sleep_ceiling
+            changed = True
+        if changed:
+            await db_session.flush()
 
     return personal
 
@@ -585,6 +629,9 @@ async def _run_calibration_batch(
         rmssd_sleep_ceiling_clean = None
     snap.sleep_windows_count  = len(sleep_wins)
     snap.rmssd_sleep_avg_clean = round(rmssd_sleep_avg_clean, 1) if rmssd_sleep_avg_clean is not None else None
+    snap.rmssd_sleep_ceiling_clean = (
+        round(rmssd_sleep_ceiling_clean, 1) if rmssd_sleep_ceiling_clean is not None else None
+    )
 
     # Resting HR for Phase 2 stress corroboration (median over clean background windows)
     clean_bg_hr = [
@@ -2046,22 +2093,9 @@ class TrackingService:
         should_show = row is not None and ack_d != recap_for_date
         summary: Optional[dict] = None
         if row is not None:
-            sleep_recovery_score: Optional[float] = None
-            try:
-                cap = float(row.ns_capacity_recovery) if row.ns_capacity_recovery is not None else None
-                raw_area = float(row.raw_recovery_area_sleep) if row.raw_recovery_area_sleep is not None else None
-            except (TypeError, ValueError):
-                cap, raw_area = None, None
-            if (
-                row.sleep_ts is not None
-                and cap is not None
-                and cap > 0
-                and raw_area is not None
-            ):
-                sleep_recovery_score = round(
-                    max(0.0, min(100.0, (raw_area / cap) * 100.0)),
-                    1,
-                )
+            # Sleep recovery is persisted as a display score on the daily summary row
+            # (computed via the v2 log-space formula in tracking/daily_summarizer).
+            sleep_recovery_score: Optional[float] = getattr(row, "sleep_recovery_score", None)
             summary = {
                 "stress_load_score": row.stress_load_score,
                 "recovery_score": getattr(row, "waking_recovery_score", None),

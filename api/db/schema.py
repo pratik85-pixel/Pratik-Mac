@@ -291,6 +291,7 @@ class CalibrationSnapshot(Base):
 
     # --- Sleep scoring v2 audit ---
     rmssd_sleep_avg_clean = Column(Float, nullable=True)    # sleep median from this day's windows
+    rmssd_sleep_ceiling_clean = Column(Float, nullable=True)  # sleep P90 from this day's windows
     sleep_windows_count   = Column(Integer, nullable=True)  # how many sleep windows were available
 
     __table_args__ = (
