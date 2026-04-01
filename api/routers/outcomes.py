@@ -7,9 +7,10 @@ Outcomes HTTP routes.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Header
+from fastapi import APIRouter, Depends
 
 from api.services.outcome_service import OutcomeService
+from api.auth import UserIdDep
 
 MOCK_WEEKLY = [
     {"stress": 40.0, "recovery": 60.0, "readiness": 50.0},
@@ -34,7 +35,7 @@ router = APIRouter(
 
 
 @router.get("/report-card")
-async def get_report_card(x_user_id: str = Header(...)) -> dict:
+async def get_report_card(user_id: UserIdDep) -> dict:
     """Empty report card when there is no persisted session history."""
     return {
         "sessions_done": 0,
@@ -44,14 +45,14 @@ async def get_report_card(x_user_id: str = Header(...)) -> dict:
 
 @router.get("/weekly")
 async def get_weekly_outcomes(
-    x_user_id: str = Header(...),
+    user_id: UserIdDep,
     service: OutcomeService = Depends(get_outcome_service),
 ):
     return _weekly_payload(service)
 
 
 @router.post("/recompute")
-async def recompute_outcomes(x_user_id: str = Header(...)) -> dict:
+async def recompute_outcomes(user_id: UserIdDep) -> dict:
     return {"status": "ok", "recomputed": True}
 
 
@@ -65,7 +66,7 @@ router_v1 = APIRouter(
 
 @router_v1.get("/weekly")
 async def get_weekly_v1(
-    x_user_id: str = Header(...),
+    user_id: UserIdDep,
     service: OutcomeService = Depends(get_outcome_service),
 ):
     return _weekly_payload(service)
@@ -73,7 +74,7 @@ async def get_weekly_v1(
 
 @router_v1.get("/longitudinal")
 async def get_longitudinal(
-    x_user_id: str = Header(...),
+    user_id: UserIdDep,
     service: OutcomeService = Depends(get_outcome_service),
 ):
     mock_recent = [{"stress": 30.0, "recovery": 70.0, "readiness": 60.0}]

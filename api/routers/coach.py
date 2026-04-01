@@ -14,8 +14,9 @@ from __future__ import annotations
 
 import logging
 import uuid
+import asyncio
 from datetime import datetime
-from typing import Annotated, Optional
+from typing import Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from pydantic import BaseModel, Field
@@ -30,8 +31,9 @@ from api.services.coach_service import CoachService
 from api.services.conversation_service import ConversationService
 from api.services.tracking_service import TrackingService
 from api.utils import parse_uuid
-from tracking.cycle_boundaries import local_today, product_calendar_timezone
+from tracking.cycle_boundaries import product_calendar_timezone
 from api.rate_limiter import conversation_limiter
+from api.auth import UserIdDep
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/coach", tags=["coach"])
@@ -50,11 +52,6 @@ def _user_uuid_for_coach(user_id: str) -> uuid.UUID:
 
 # ── Dependencies ───────────────────────────────────────────────────────────────
 
-async def _user_id(x_user_id: Annotated[str, Header()]) -> str:
-    if not x_user_id:
-        raise HTTPException(status_code=401, detail="X-User-Id header required")
-    return x_user_id
-
 async def _model_svc(db: AsyncSession = Depends(get_db)) -> ModelService:
     return ModelService(db=db)
 
@@ -67,7 +64,7 @@ def _conv_svc(request: Request) -> ConversationService:
 
 async def _tracking_svc_coach(
     request: Request,
-    user_id: str = Depends(_user_id),
+    user_id: UserIdDep,
     db: AsyncSession = Depends(get_db),
 ) -> TrackingService:
     llm_client = getattr(request.app.state, "llm_client", None)
@@ -175,8 +172,10 @@ async def _gated_nudge_decision(
     fp = await model_svc.get_fingerprint(user_id) or _empty_fp()
     profile = await model_svc.get_profile(user_id)
     latest = assembled.daily_trajectory[-1]
-    output = coach_svc.nudge(
-        fp, profile,
+    output = await asyncio.to_thread(
+        coach_svc.nudge,
+        fp,
+        profile,
         stress_score=latest.get("stress_load"),
         recovery_score=latest.get("waking_recovery"),
     )
@@ -196,7 +195,7 @@ async def _gated_nudge_decision(
 @router.get("/post-session")
 async def post_session_brief(
     request:    Request,
-    user_id:    str          = Depends(_user_id),
+    user_id:    UserIdDep,
     session_id: str          = Query(..., description="Completed session row ID"),
     model_svc:  ModelService = Depends(_model_svc),
     coach_svc:  CoachService = Depends(_coach_svc),
@@ -207,7 +206,7 @@ async def post_session_brief(
     """
     # Retrieve cached outcome from session_service (held after end_session)
     svc = request.app.state.session_service
-    outcome: Optional[SessionOutcome] = svc.get_cached_outcome(session_id)
+    outcome: Optional[SessionOutcome] = svc.get_cached_outcome(session_id, user_id=user_id)
     if outcome is None:
         raise HTTPException(status_code=404, detail="session outcome not found")
 
@@ -215,8 +214,11 @@ async def post_session_brief(
     profile = await model_svc.get_profile(user_id)
     user    = await model_svc.get_user(user_id)
 
-    output = coach_svc.post_session(
-        fp, profile, outcome,
+    output = await asyncio.to_thread(
+        coach_svc.post_session,
+        fp,
+        profile,
+        outcome,
         user_name=user.name if user else "there",
     )
 
@@ -225,7 +227,7 @@ async def post_session_brief(
 
 @router.get("/nudge")
 async def nudge(
-    user_id:   str          = Depends(_user_id),
+    user_id:   UserIdDep,
     model_svc: ModelService = Depends(_model_svc),
     coach_svc: CoachService = Depends(_coach_svc),
     db:        AsyncSession = Depends(get_db),
@@ -250,7 +252,7 @@ async def nudge(
 @router.post("/conversation", response_model=CoachReply)
 async def conversation_turn(
     body:      ConversationTurnRequest,
-    user_id:   str                  = Depends(_user_id),
+    user_id:   UserIdDep,
     conv_svc:  ConversationService  = Depends(_conv_svc),
     model_svc: ModelService         = Depends(_model_svc),
     db:        AsyncSession         = Depends(get_db),
@@ -298,7 +300,7 @@ async def conversation_turn(
 
 @router.get("/conversation/history")
 async def conversation_history(
-    user_id: str          = Depends(_user_id),
+    user_id: UserIdDep,
     limit:   int          = Query(default=50, le=200),
     db:      AsyncSession = Depends(get_db),
 ) -> dict:
@@ -328,7 +330,7 @@ async def conversation_history(
 @router.delete("/conversation/{conversation_id}")
 async def close_conversation(
     conversation_id: str,
-    user_id:  str                 = Depends(_user_id),
+    user_id:  UserIdDep,
     conv_svc: ConversationService = Depends(_conv_svc),
     db:       AsyncSession        = Depends(get_db),
 ) -> dict:
@@ -340,7 +342,7 @@ async def close_conversation(
 @router.get("/morning-brief", response_model=MorningBriefResponse)
 async def get_morning_brief(
     request: Request,
-    user_id: str          = Depends(_user_id),
+    user_id: UserIdDep,
     db:      AsyncSession = Depends(get_db),
     track_svc: TrackingService = Depends(_tracking_svc_coach),
 ) -> MorningBriefResponse:
@@ -356,11 +358,11 @@ async def get_morning_brief(
 
     uid = _user_uuid_for_coach(user_id)
 
-    today_ist = local_today()
+    cycle_ist = await track_svc.get_current_cycle_local_date()
 
     recap = await track_svc.get_morning_recap()
     if not recap.get("summary"):
-        await clear_morning_bundle_uup(db, uid, today_ist)
+        await clear_morning_bundle_uup(db, uid, cycle_ist)
         return MorningBriefResponse(
             day_state=None,
             day_confidence=None,
@@ -370,7 +372,7 @@ async def get_morning_brief(
             summary=None,
             action=None,
             message=None,
-            generated_for=today_ist.isoformat(),
+            generated_for=cycle_ist.isoformat(),
             is_stale=False,
             plan=[],
             avoid_items=[],
@@ -382,10 +384,10 @@ async def get_morning_brief(
     uup = result.scalar_one_or_none()
 
     generated_for = uup.morning_brief_generated_for if uup else None
-    is_stale = (generated_for is None or generated_for < today_ist)
+    is_stale = (generated_for is None or generated_for < cycle_ist)
     brief_empty_for_today = bool(
         uup
-        and generated_for == today_ist
+        and generated_for == cycle_ist
         and not any(
             [
                 uup.morning_brief_day_state,
@@ -398,7 +400,7 @@ async def get_morning_brief(
     )
 
     if is_stale or brief_empty_for_today:
-        # Lazy refresh path: backfill today's brief when ingest-time trigger
+        # Lazy refresh path: backfill this cycle's brief when ingest-time trigger
         # was missed (e.g., no qualifying reset event yet).
         llm_client = getattr(request.app.state, "llm_client", None)
         await generate_morning_brief(AsyncSessionLocal, uid, llm_client)
@@ -408,7 +410,7 @@ async def get_morning_brief(
         )
         uup = result.scalar_one_or_none()
         generated_for = uup.morning_brief_generated_for if uup else None
-        is_stale = (generated_for is None or generated_for < today_ist)
+        is_stale = (generated_for is None or generated_for < cycle_ist)
 
     plan = uup.suggested_plan_json or [] if uup else []
     avoid = uup.avoid_items_json or [] if uup else []
@@ -435,7 +437,7 @@ async def get_morning_brief(
 
 @router.get("/nudge-check", response_model=NudgeCheckResponse)
 async def nudge_check(
-    user_id:   str          = Depends(_user_id),
+    user_id:   UserIdDep,
     model_svc: ModelService = Depends(_model_svc),
     coach_svc: CoachService = Depends(_coach_svc),
     db:        AsyncSession = Depends(get_db),
@@ -460,7 +462,7 @@ async def nudge_check(
 
 @router.get("/evening-checkin", response_model=EveningCheckinResponse)
 async def evening_checkin(
-    user_id:   str          = Depends(_user_id),
+    user_id:   UserIdDep,
     coach_svc: CoachService = Depends(_coach_svc),
     db:        AsyncSession = Depends(get_db),
 ) -> EveningCheckinResponse:
@@ -473,7 +475,7 @@ async def evening_checkin(
     uid = _user_uuid_for_coach(user_id)
 
     assembled = await assemble_for_user(db, uid)
-    output    = coach_svc.evening_checkin(assembled)
+    output = await asyncio.to_thread(coach_svc.evening_checkin, assembled)
     return EveningCheckinResponse(
         day_summary      = output.get("day_summary",      ""),
         tonight_priority = output.get("tonight_priority", ""),
@@ -483,7 +485,7 @@ async def evening_checkin(
 
 @router.get("/night-closure", response_model=NightClosureResponse)
 async def night_closure(
-    user_id:   str          = Depends(_user_id),
+    user_id:   UserIdDep,
     coach_svc: CoachService = Depends(_coach_svc),
     db:        AsyncSession = Depends(get_db),
 ) -> NightClosureResponse:
@@ -505,7 +507,7 @@ async def night_closure(
         raise HTTPException(status_code=409, detail="too_early")
 
     assembled = await assemble_for_user(db, uid)
-    output    = coach_svc.night_closure(assembled)
+    output = await asyncio.to_thread(coach_svc.night_closure, assembled)
 
     tomorrow_seed     = output.get("tomorrow_seed", "")
     updated_narrative = output.get("updated_narrative", "")

@@ -227,7 +227,6 @@ def _build_local_conversation_turn(
             f"{rx.session_type.replace('_', ' ')} in the {rx.session_window} window. "
             f"{closing}"
         ),
-        "plan_delta": None,
         "follow_up_question": None,
     }
 

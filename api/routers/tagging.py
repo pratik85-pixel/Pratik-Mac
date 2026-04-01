@@ -13,13 +13,14 @@ POST /tagging/rebuild-patterns  — force full pattern model rebuild (debug/admi
 from __future__ import annotations
 
 import logging
-from typing import Annotated, Optional
+from typing import Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.db.database import get_db
+from api.auth import UserIdDep
 from api.services.tagging_service import TaggingService
 from api.services.model_service import ModelService
 
@@ -28,11 +29,6 @@ router = APIRouter(prefix="/tagging", tags=["tagging"])
 
 
 # ── Dependencies ──────────────────────────────────────────────────────────────
-
-async def _user_id(x_user_id: Annotated[str, Header()]) -> str:
-    if not x_user_id:
-        raise HTTPException(status_code=401, detail="X-User-Id header required")
-    return x_user_id
 
 
 async def _tagging_svc(db: AsyncSession = Depends(get_db)) -> TaggingService:
@@ -55,7 +51,7 @@ class TagWindowRequest(BaseModel):
 
 @router.get("/tags")
 async def get_tag_history(
-    user_id:     str            = Depends(_user_id),
+    user_id:     UserIdDep,
     tagging_svc: TaggingService = Depends(_tagging_svc),
     limit: int  = Query(default=20, ge=1, le=100),
 ) -> dict:
@@ -76,7 +72,7 @@ async def get_tag_history(
 @router.post("/tag")
 async def tag_window(
     body:        TagWindowRequest,
-    user_id:     str            = Depends(_user_id),
+    user_id:     UserIdDep,
     tagging_svc: TaggingService = Depends(_tagging_svc),
 ) -> dict:
     """
@@ -111,7 +107,7 @@ async def tag_window(
 
 @router.get("/patterns")
 async def get_patterns(
-    user_id:     str            = Depends(_user_id),
+    user_id:     UserIdDep,
     tagging_svc: TaggingService = Depends(_tagging_svc),
 ) -> dict:
     """
@@ -141,7 +137,7 @@ async def get_patterns(
 
 @router.get("/nudge")
 async def get_nudge_queue(
-    user_id:     str            = Depends(_user_id),
+    user_id:     UserIdDep,
     tagging_svc: TaggingService = Depends(_tagging_svc),
     max_items: int = Query(default=3, ge=1, le=10),
 ) -> dict:
@@ -171,7 +167,7 @@ async def get_nudge_queue(
 
 @router.post("/rebuild-patterns")
 async def rebuild_patterns(
-    user_id:     str            = Depends(_user_id),
+    user_id:     UserIdDep,
     tagging_svc: TaggingService = Depends(_tagging_svc),
 ) -> dict:
     """

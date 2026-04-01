@@ -184,7 +184,7 @@ def _safety_payload(trigger_type: str, handoff_message: str) -> dict:
 
     # All trigger types have at least summary + follow_up_question or reply
     if trigger_type == "conversation_turn":
-        return {"reply": msg, "plan_delta": None, "follow_up_question": None}
+        return {"reply": msg, "follow_up_question": None}
     return {
         "summary":           msg,
         "action":            "",

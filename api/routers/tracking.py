@@ -19,13 +19,14 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, date, datetime, timedelta
-from typing import Annotated, Literal, Optional
+from typing import Literal, Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.db.database import get_db, AsyncSessionLocal
+from api.auth import UserIdDep
 from api.services.tracking_service import TrackingService
 from api.rate_limiter import ingest_limiter
 from tracking.cycle_boundaries import local_today
@@ -37,15 +38,9 @@ router = APIRouter(prefix="/tracking", tags=["tracking"])
 
 # ── Dependencies ───────────────────────────────────────────────────────────────
 
-async def _user_id(x_user_id: Annotated[str, Header()]) -> str:
-    if not x_user_id:
-        raise HTTPException(status_code=401, detail="X-User-Id header required")
-    return x_user_id
-
-
 async def _tracking_svc(
     request: Request,
-    user_id: str = Depends(_user_id),
+    user_id: UserIdDep,
     db: AsyncSession = Depends(get_db),
 ) -> TrackingService:
     llm_client = getattr(request.app.state, "llm_client", None)
@@ -67,6 +62,9 @@ class DailySummaryResponse(BaseModel):
     sleep_recovery_score:  Optional[float] = None
     sleep_recovery_night_date: Optional[str] = None   # YYYY-MM-DD (previous night)
     sleep_recovery_subtext: Optional[str] = None      # UI hint for date context
+    # Composite readiness (0–100): prior day's metrics; None until yesterday exists.
+    readiness_score:       Optional[float] = None
+    readiness_unavailable_reason: Optional[str] = None
     net_balance:           Optional[float] = None
     day_type:              Optional[str]
     calibration_days:      int
@@ -330,6 +328,8 @@ def _build_summary_response(
     personal=None,
     *,
     summary_source: Literal["live_compute", "persisted_row"] = "persisted_row",
+    use_readiness_override: bool = False,
+    readiness_score_override: Optional[float] = None,
 ) -> DailySummaryResponse:
     summary_local_date = row.summary_date.date() if getattr(row, "summary_date", None) else None
     sleep_night_date, sleep_subtext = _sleep_recovery_context(summary_local_date)
@@ -349,6 +349,15 @@ def _build_summary_response(
 
     meta = _pipeline_meta(row, summary_source)
     waking_rec = getattr(row, 'waking_recovery_score', None)
+    if use_readiness_override:
+        readiness = readiness_score_override
+    else:
+        readiness = getattr(row, "readiness_score", None)
+    readiness_reason = (
+        None
+        if readiness is not None
+        else "No readiness data available — yesterday's scores needed"
+    )
     return DailySummaryResponse(
         summary_date          = row.summary_date.date().isoformat() if row.summary_date else "",
         stress_load_score     = row.stress_load_score,
@@ -357,6 +366,8 @@ def _build_summary_response(
         sleep_recovery_score  = sleep_recovery_score,
         sleep_recovery_night_date = sleep_night_date,
         sleep_recovery_subtext = sleep_subtext,
+        readiness_score       = readiness,
+        readiness_unavailable_reason = readiness_reason,
         net_balance           = getattr(row, 'net_balance', None),
         day_type              = row.day_type,
         calibration_days      = row.calibration_days or 0,
@@ -406,7 +417,14 @@ async def get_today_summary(
     # 1. Live computation (always preferred for today — avoids stale midnight rows)
     live = await svc.compute_live_summary(today)
     if live is not None:
-        return _build_summary_response(live, personal, summary_source="live_compute")
+        r_ready = await svc.resolve_readiness_for_calendar_date(today)
+        return _build_summary_response(
+            live,
+            personal,
+            summary_source="live_compute",
+            use_readiness_override=True,
+            readiness_score_override=r_ready,
+        )
 
     # 2. Fallback: persisted summary (finalized row or manually written)
     row = await svc.get_daily_summary(today)
@@ -431,6 +449,15 @@ async def get_summary_by_date(
         src = "live_compute"
     if row is None:
         raise HTTPException(status_code=404, detail=f"No summary found for {date_str}.")
+    if src == "live_compute":
+        r_ready = await svc.resolve_readiness_for_calendar_date(target)
+        return _build_summary_response(
+            row,
+            personal,
+            summary_source=src,
+            use_readiness_override=True,
+            readiness_score_override=r_ready,
+        )
     return _build_summary_response(row, personal, summary_source=src)
 
 
@@ -534,7 +561,7 @@ class IngestResponse(BaseModel):
 @router.post("/ingest", response_model=IngestResponse)
 async def ingest_beats(
     body:    IngestRequest,
-    user_id: str           = Depends(_user_id),
+    user_id: UserIdDep,
     svc:     TrackingService = Depends(_tracking_svc),
 ) -> IngestResponse:
     """
@@ -738,10 +765,7 @@ async def get_history(
     ]
 
     # Keep History in lockstep with the morning-reset cycle (not midnight rollover).
-    # Derive effective "today" from the same recap day anchor used by Home recap.
-    recap = await svc.get_morning_recap()
-    recap_for_date = _parse_date(recap["for_date"])
-    cycle_today_local = recap_for_date + timedelta(days=1)
+    cycle_today_local = await svc.get_current_cycle_local_date()
 
     # Overlay live summary for the active cycle day.
     # Stored rows can lag behind the latest open-session recomputation.

@@ -42,22 +42,33 @@ def test_utc_bounds_span_real_ist_midnight():
 
 
 @pytest.mark.parametrize(
-    ("load", "readiness", "day"),
+    ("readiness", "day"),
     [
-        (0.0, 100.0, "green"),
-        (0.34, 66.0, "green"),
-        (0.35, 65.0, "yellow"),
-        (0.64, 36.0, "yellow"),
-        (0.65, 35.0, "red"),
-        (1.0, 0.0, "red"),
-        (1.5, 0.0, "red"),
+        (90.0, "green"),
+        (76.0, "green"),
+        (75.0, "yellow"),
+        (60.0, "yellow"),
+        (50.0, "yellow"),
+        (49.0, "relaxed"),
+        (25.0, "relaxed"),
+        (24.9, "red"),
+        (24.0, "red"),
+        (0.0, "red"),
     ],
 )
-def test_plan_readiness_contract_mapping(load: float, readiness: float, day: str) -> None:
-    from tracking.plan_readiness_contract import (
-        plan_day_type_from_load_score,
-        plan_readiness_from_load_score,
-    )
+def test_day_type_from_readiness_mapping(readiness: float, day: str) -> None:
+    from tracking.plan_readiness_contract import day_type_from_readiness
 
-    assert plan_readiness_from_load_score(load) == readiness
-    assert plan_day_type_from_load_score(load) == day
+    assert day_type_from_readiness(readiness) == day
+
+
+def test_compute_composite_readiness_formula() -> None:
+    from tracking.plan_readiness_contract import compute_composite_readiness
+
+    # v2: 0.45*sleep + 0.30*waking + 0.25*(10-stress)*10
+    # 0.45*70 + 0.30*80 + 0.25*5*10 = 31.5 + 24 + 12.5 = 68.0
+    r = compute_composite_readiness(80.0, 70.0, 5.0)
+    assert r == 68.0
+
+    assert compute_composite_readiness(100.0, 100.0, 0.0) == 100.0
+    assert compute_composite_readiness(0.0, 0.0, 10.0) == 0.0

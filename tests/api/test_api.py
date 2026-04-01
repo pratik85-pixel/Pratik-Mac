@@ -256,7 +256,7 @@ class TestPlanEndpoints:
         r = client.get("/plan/today", headers=self._HEADERS)
         j = r.json()
         assert j.get("metrics_contract_id") == "zenflow_locked_v1"
-        assert j.get("readiness_formula_id") == "plan_load_inverse_v1"
+        assert j.get("readiness_formula_id") == "composite_readiness_v2"
 
     def test_plan_today_shape_when_present(self, client):
         r = client.get("/plan/today", headers=self._HEADERS)

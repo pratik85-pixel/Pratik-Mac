@@ -8,7 +8,7 @@ morning-brief prompt template to produce the day assessment.
 
 Flow
 ----
-1. Skip if brief is already fresh for today_ist.
+1. Skip if brief is already fresh for the active cycle (cycle_ist).
 2. If coach_narrative is missing or stale AND llm_client is available,
    trigger a Layer 2 narrative regen inline before proceeding.
 3. Run Layer 3 morning-brief prompt against narrative + CoachInputPacket.
@@ -26,7 +26,7 @@ pipeline's live session.
 LLM output schema
 -----------------
 {
-  "day_state":      "green" | "yellow" | "red",
+  "day_state":      "green" | "yellow" | "relaxed" | "red",
   "day_confidence": "high"  | "medium" | "low",
   "brief_text":     str,   -- 2–3 line plain English summary
   "evidence":       str,   -- key data signals that drove the assessment
@@ -36,6 +36,7 @@ LLM output schema
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -60,12 +61,12 @@ _OFFLINE_BRIEF = {
 async def clear_morning_bundle_uup(
     session,
     user_id: uuid_mod.UUID,
-    today_ist: date,
+    cycle_ist: date,
 ) -> None:
     """
     Persist an empty morning brief + clear UUP plan snippets when there is no
     strict DailyStressSummary row for the recap day (band not worn / no valid day).
-    Sets morning_brief_generated_for=today_ist so GET /coach/morning-brief is not stale.
+    Sets morning_brief_generated_for=cycle_ist (active morning-reset cycle date).
     """
     from sqlalchemy import select
     import api.db.schema as db
@@ -84,7 +85,7 @@ async def clear_morning_bundle_uup(
             and uup.morning_brief_one_action is None
         )
         empty_plan = not (uup.suggested_plan_json or uup.avoid_items_json)
-        if empty_brief and empty_plan and uup.morning_brief_generated_for == today_ist:
+        if empty_brief and empty_plan and uup.morning_brief_generated_for == cycle_ist:
             return
     if uup is None:
         uup = db.UserUnifiedProfile(
@@ -95,7 +96,7 @@ async def clear_morning_bundle_uup(
             morning_brief_day_confidence=None,
             morning_brief_evidence=None,
             morning_brief_one_action=None,
-            morning_brief_generated_for=today_ist,
+            morning_brief_generated_for=cycle_ist,
             morning_brief_generated_at=now_utc,
             suggested_plan_json=[],
             avoid_items_json=[],
@@ -108,7 +109,7 @@ async def clear_morning_bundle_uup(
         uup.morning_brief_day_confidence = None
         uup.morning_brief_evidence = None
         uup.morning_brief_one_action = None
-        uup.morning_brief_generated_for = today_ist
+        uup.morning_brief_generated_for = cycle_ist
         uup.morning_brief_generated_at = now_utc
         uup.suggested_plan_json = []
         uup.avoid_items_json = []
@@ -144,14 +145,12 @@ async def _run_morning_brief(
     from sqlalchemy import select
     import api.db.schema as db
     from api.services.tracking_service import TrackingService
-    from tracking.cycle_boundaries import local_today
-
-    today_ist = local_today()
 
     svc = TrackingService(session, str(user_id), session_factory=None, llm_client=None)
+    cycle_ist = await svc.get_current_cycle_local_date()
     recap = await svc.get_morning_recap()
     if not recap.get("summary"):
-        await clear_morning_bundle_uup(session, user_id, today_ist)
+        await clear_morning_bundle_uup(session, user_id, cycle_ist)
         log.info("morning_brief skipped — no strict yesterday summary user=%s", user_id)
         return
 
@@ -161,8 +160,8 @@ async def _run_morning_brief(
     )
     uup = uup_res.scalar_one_or_none()
 
-    # Skip if brief is already fresh for today
-    if uup and uup.morning_brief_generated_for == today_ist:
+    # Skip if brief is already fresh for this cycle
+    if uup and uup.morning_brief_generated_for == cycle_ist:
         already_populated = any([
             uup.morning_brief_day_state,
             uup.morning_brief_day_confidence,
@@ -180,19 +179,22 @@ async def _run_morning_brief(
     # Determine if narrative is today's
     narrative: Optional[str] = getattr(uup, "coach_narrative", None) if uup else None
     narrative_date = getattr(uup, "coach_narrative_date", None) if uup else None
-    narrative_is_fresh = (narrative_date == today_ist) if narrative_date is not None else False
+    narrative_is_fresh = (narrative_date == cycle_ist) if narrative_date is not None else False
 
     # Step 1: If narrative is missing or stale and LLM is available — regen Layer 2 inline
     if (not narrative or not narrative_is_fresh) and llm_client is not None:
         try:
             packet = await build_coach_input_packet(session, user_id)
             sys_p, user_p = build_layer2_narrative_prompt(packet)
-            raw = llm_client.chat(sys_p, user_p, json_mode=False)
+            raw = await asyncio.wait_for(
+                asyncio.to_thread(llm_client.chat, sys_p, user_p, False),
+                timeout=30.0,
+            )
             narrative = (raw or "").strip() or None
             # Persist the fresh narrative immediately
             if uup is not None and narrative:
                 uup.coach_narrative = narrative
-                uup.coach_narrative_date = today_ist
+                uup.coach_narrative_date = cycle_ist
                 await session.commit()
                 log.info("morning_brief: Layer 2 narrative regenerated inline user=%s", user_id)
         except Exception:
@@ -200,11 +202,16 @@ async def _run_morning_brief(
 
     # Step 2: Run Layer 3 morning-brief prompt against narrative
     result: Optional[dict] = None
+    sys_prompt: Optional[str] = None
+    user_prompt: Optional[str] = None
     if llm_client is not None and narrative:
         try:
             packet = await build_coach_input_packet(session, user_id)
             sys_prompt, user_prompt = build_layer3_morning_brief_prompt(packet, narrative)
-            raw = llm_client.chat(sys_prompt, user_prompt)
+            raw = await asyncio.wait_for(
+                asyncio.to_thread(llm_client.chat, sys_prompt, user_prompt, True),
+                timeout=30.0,
+            )
             result = _parse_brief_json(raw)
         except Exception:
             log.exception("morning_brief: Layer 3 LLM failed user=%s", user_id)
@@ -214,6 +221,16 @@ async def _run_morning_brief(
         result = _OFFLINE_BRIEF.copy()
         log.info("morning_brief: using offline fallback user=%s", user_id)
 
+    expected_day_state = _expected_day_state_from_recap_summary(recap.get("summary"))
+    result = _retry_and_enforce_day_state_parity(
+        result=result,
+        expected_day_state=expected_day_state,
+        llm_client=llm_client,
+        sys_prompt=sys_prompt,
+        user_prompt=user_prompt,
+        user_id=user_id,
+    )
+
     # Persist
     now_utc = datetime.now(UTC)
     fields = {
@@ -222,7 +239,7 @@ async def _run_morning_brief(
         "morning_brief_day_confidence": result["day_confidence"],
         "morning_brief_evidence":       result["evidence"],
         "morning_brief_one_action":     result["one_action"],
-        "morning_brief_generated_for":  today_ist,
+        "morning_brief_generated_for":  cycle_ist,
         "morning_brief_generated_at":   now_utc,
     }
 
@@ -279,7 +296,7 @@ def _parse_brief_json(raw: str) -> Optional[dict]:
             log.warning("morning_brief: missing key %s in LLM output", key)
             return None
 
-    if obj["day_state"] not in ("green", "yellow", "red"):
+    if obj["day_state"] not in ("green", "yellow", "relaxed", "red"):
         obj["day_state"] = "yellow"
     if obj["day_confidence"] not in ("high", "medium", "low"):
         obj["day_confidence"] = "medium"
@@ -291,5 +308,85 @@ def _parse_brief_json(raw: str) -> Optional[dict]:
         "evidence":       str(obj["evidence"])[:500],
         "one_action":     str(obj["one_action"])[:200],
     }
+
+
+def _expected_day_state_from_recap_summary(summary: Optional[dict]) -> Optional[str]:
+    """
+    Deterministic day-state from strict yesterday recap values.
+    Returns None when required inputs are unavailable.
+    """
+    if not isinstance(summary, dict):
+        return None
+    try:
+        stress_raw = summary.get("stress_load_score")
+        waking = summary.get("waking_recovery_score")
+        sleep = summary.get("sleep_recovery_score")
+        if stress_raw is None:
+            return None
+        from tracking.plan_readiness_contract import compute_composite_readiness, day_type_from_readiness
+
+        readiness = compute_composite_readiness(
+            waking_recovery=float(waking) if waking is not None else None,
+            sleep_recovery=float(sleep) if sleep is not None else None,
+            stress_load_0_10=float(stress_raw) / 10.0,
+        )
+        if readiness is None:
+            return None
+        return str(day_type_from_readiness(readiness))
+    except Exception:
+        return None
+
+
+def _retry_and_enforce_day_state_parity(
+    *,
+    result: dict,
+    expected_day_state: Optional[str],
+    llm_client: Optional[Any],
+    sys_prompt: Optional[str],
+    user_prompt: Optional[str],
+    user_id: uuid_mod.UUID,
+) -> dict:
+    """
+    Enforce parity between LLM day_state and deterministic readiness day_type.
+    Retry exactly once before auto-correcting.
+    """
+    if expected_day_state is None:
+        return result
+
+    current = str(result.get("day_state") or "").strip().lower()
+    if current == expected_day_state:
+        return result
+
+    retried = False
+    if llm_client is not None and sys_prompt and user_prompt:
+        retried = True
+        correction = (
+            "\n\nCORRECTION_CONSTRAINT:\n"
+            f"- day_state MUST be exactly \"{expected_day_state}\".\n"
+            "- day_state is derived from YESTERDAY_ROW only.\n"
+            "- Return valid JSON with the same schema keys."
+        )
+        try:
+            raw_retry = llm_client.chat(sys_prompt, user_prompt + correction)
+            retry_result = _parse_brief_json(raw_retry)
+            if retry_result is not None:
+                result = retry_result
+        except Exception:
+            log.exception("morning_brief: parity retry failed user=%s", user_id)
+
+    current_after_retry = str(result.get("day_state") or "").strip().lower()
+    if current_after_retry != expected_day_state:
+        log.warning(
+            "morning_brief day_state mismatch user=%s expected=%s got=%s retried=%s; auto-correcting",
+            user_id,
+            expected_day_state,
+            current_after_retry or "none",
+            retried,
+        )
+        corrected = dict(result)
+        corrected["day_state"] = expected_day_state
+        return corrected
+
+    return result
 
 

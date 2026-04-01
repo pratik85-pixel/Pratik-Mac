@@ -4,7 +4,7 @@ tests/coach/test_coach.py
 Comprehensive test suite for the coach layer.
 
 Coverage:
-    - plan_replanner: load_score computation, prescription output, compound tags
+    - plan_replanner: readiness-based prescription, compound tags
     - tone_selector: all four tones, priority order
     - context_builder: no raw floats in outputs, string conversions
     - milestone_detector: all 5 detection rules
@@ -28,7 +28,6 @@ from coach.plan_replanner import (
     compute_daily_prescription,
     DailyPrescription,
     HabitSignal,
-    _compute_load_score,
 )
 from coach.tone_selector import (
     select_tone,
@@ -121,7 +120,7 @@ def make_prescription(**kwargs) -> DailyPrescription:
         session_intensity = "moderate",
         session_window    = "19:00–21:00",
         physical_load     = "maintain",
-        load_score        = 0.15,
+        readiness_score   = 82.0,
         reason_tag        = "baseline",
         carry_forward     = False,
         notes             = [],
@@ -144,7 +143,8 @@ class TestPlanReplanner:
 
         rx = compute_daily_prescription(
             profile                = profile,
-            morning_rmssd_vs_floor = -0.18,   # below floor → adds below_floor component
+            readiness_score        = 20.0,
+            morning_rmssd_vs_floor = -0.18,
             morning_rmssd_vs_avg   = -0.20,
             consecutive_low_reads  = 1,
             habit_signals          = signals,
@@ -157,9 +157,8 @@ class TestPlanReplanner:
         )
 
     def test_high_load_score_produces_rest(self):
-        """load_score ≥ 0.65 must always produce rest."""
+        """Very low composite readiness must produce rest."""
         profile = make_profile()
-        # Use heavy alcohol + multiple below-floor + consecutive lows
         signals = [
             HabitSignal("alcohol", "heavy", 6.0, "manual"),
             HabitSignal("late_night", "heavy", 7.0, "manual"),
@@ -167,7 +166,8 @@ class TestPlanReplanner:
 
         rx = compute_daily_prescription(
             profile                = profile,
-            morning_rmssd_vs_floor = -0.35,   # 35% below floor
+            readiness_score        = 20.0,
+            morning_rmssd_vs_floor = -0.35,
             morning_rmssd_vs_avg   = -0.40,
             consecutive_low_reads  = 3,
             habit_signals          = signals,
@@ -176,18 +176,19 @@ class TestPlanReplanner:
         )
 
         assert rx.session_type == "rest", (
-            f"Expected rest for high load_score, got {rx.session_type} (load={rx.load_score:.2f})"
+            f"Expected rest for low readiness, got {rx.session_type} (rs={rx.readiness_score:.2f})"
         )
-        assert rx.load_score >= 0.65
+        assert rx.readiness_score < 25
 
     def test_low_load_score_produces_stage_plan(self):
-        """load_score < 0.20 with positive capacity should produce full session."""
+        """High readiness (green day) should produce full session."""
         profile = make_profile(stage=3)
         signals = [HabitSignal("positive_state", "light", 2.0, "conversation")]
 
         rx = compute_daily_prescription(
             profile                = profile,
-            morning_rmssd_vs_floor = 0.15,    # above floor
+            readiness_score        = 88.0,
+            morning_rmssd_vs_floor = 0.15,
             morning_rmssd_vs_avg   = 0.10,
             consecutive_low_reads  = 0,
             habit_signals          = signals,
@@ -197,7 +198,7 @@ class TestPlanReplanner:
 
         assert rx.session_type == "full"
         assert rx.physical_load in ("maintain", "can_increase")
-        assert rx.load_score < 0.20
+        assert rx.readiness_score >= 75
 
     def test_compound_tag_takes_priority(self):
         """When both alcohol and low-reads are present, compound tag should fire."""
@@ -227,6 +228,7 @@ class TestPlanReplanner:
 
         rx = compute_daily_prescription(
             profile                = profile,
+            readiness_score        = 18.0,
             morning_rmssd_vs_floor = -0.18,
             morning_rmssd_vs_avg   = -0.15,
             consecutive_low_reads  = 3,
@@ -244,6 +246,7 @@ class TestPlanReplanner:
 
         rx = compute_daily_prescription(
             profile                = profile,
+            readiness_score        = 80.0,
             morning_rmssd_vs_floor = 0.10,
             morning_rmssd_vs_avg   = 0.05,
             consecutive_low_reads  = 0,
@@ -256,13 +259,14 @@ class TestPlanReplanner:
             f"Window format unexpected: {rx.session_window}"
         )
 
-    def test_load_score_bounded(self):
-        """load_score must always be 0.0–1.0."""
+    def test_readiness_score_bounded(self):
+        """readiness_score on output must always be 0–100."""
         profile = make_profile()
 
         for n_lows in range(5):
             rx = compute_daily_prescription(
                 profile                = profile,
+                readiness_score        = 12.0 + n_lows * 5,
                 morning_rmssd_vs_floor = -0.40,
                 morning_rmssd_vs_avg   = -0.40,
                 consecutive_low_reads  = n_lows,
@@ -270,7 +274,7 @@ class TestPlanReplanner:
                 preferred_window_hour  = 19,
                 sessions_this_week     = 5,
             )
-            assert 0.0 <= rx.load_score <= 1.0
+            assert 0.0 <= rx.readiness_score <= 100.0
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -701,7 +705,6 @@ class TestSchemaValidator:
     def test_conversation_turn_schema(self):
         output = {
             "reply":              "Noted — keeping the session light today makes sense given what you described. One short breathing session will do.",
-            "plan_delta":         None,
             "follow_up_question": None,
         }
         valid, cleaned, errors = validate_output(output, "conversation_turn")

@@ -160,9 +160,22 @@ class TaggingService:
                 error="Invalid window_id UUID.",
             )
 
+        uid = parse_uuid(user_id)
+        if uid is None:
+            return TagResult(
+                success=False,
+                window_id=window_id,
+                tag_applied=None,
+                tag_source="user_confirmed",
+                error="Invalid user_id UUID.",
+            )
+
         if window_type == "stress":
             result = await self._db.execute(
-                select(StressWindow).where(StressWindow.id == w_uuid)
+                select(StressWindow).where(
+                    StressWindow.id == w_uuid,
+                    StressWindow.user_id == uid,
+                )
             )
             row: Optional[StressWindow] = result.scalar_one_or_none()
             if row is None:
@@ -181,7 +194,10 @@ class TaggingService:
                 row.nudge_responded = True
         else:  # recovery
             r_result = await self._db.execute(
-                select(RecoveryWindow).where(RecoveryWindow.id == w_uuid)
+                select(RecoveryWindow).where(
+                    RecoveryWindow.id == w_uuid,
+                    RecoveryWindow.user_id == uid,
+                )
             )
             rec_row: Optional[RecoveryWindow] = r_result.scalar_one_or_none()
             if rec_row is None:
@@ -219,7 +235,8 @@ class TaggingService:
             user_id, window_id, window_type, slug, tag_result.success,
         )
 
-        # Ensure we commit the row tag update before calling plan service
+        # Ensure row tag update is committed before calling plan service.
+        # (Commit already performed on success above; this is a safety no-op when there was no change.)
         await self._db.commit()
         # Wire intraday plan adherence
         try:

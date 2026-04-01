@@ -22,12 +22,13 @@ Design
 from __future__ import annotations
 
 import logging
+from time import perf_counter
 from dataclasses import asdict, replace
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any, Optional, Sequence
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -41,6 +42,7 @@ from tracking.cycle_boundaries import (
     utc_instant_bounds_for_local_calendar_date,
 )
 from tracking.locked_metrics_contract import contract_metadata_for_row
+from tracking.plan_readiness_contract import compute_composite_readiness
 from tracking.cohort_insight import build_cohort_insight
 from tracking.stress_state import (
     StressStateResult,
@@ -52,6 +54,7 @@ from tracking.wake_detector import WakeSleepBoundary, ContextTransition, detect_
 import numpy as np
 
 from api.db import schema as db
+from api.services.morning_bundle_orchestrator import MorningBundleOrchestrator
 from api.utils import parse_uuid
 from config import CONFIG
 
@@ -657,6 +660,7 @@ class TrackingService:
         self._uid             = user_id
         self._session_factory = session_factory
         self._llm_client      = llm_client
+        self._morning_bundle  = MorningBundleOrchestrator(session_factory, llm_client)
 
     async def _resolve_reset_anchor_utc(
         self,
@@ -858,44 +862,7 @@ class TrackingService:
 
     def _schedule_morning_bundle(self) -> None:
         """Morning brief + fresh daily plan (Scenario A and B)."""
-        if self._session_factory is None:
-            return
-
-        import asyncio
-        import uuid as uuid_mod
-
-        from coach.morning_brief import generate_morning_brief
-
-        uid = uuid_mod.UUID(str(self._uid))
-
-        async def _runner() -> None:
-            try:
-                async with self._session_factory() as session:
-                    from api.services.model_service import ModelService
-                    from api.services.plan_service import PlanService
-
-                    track_svc = TrackingService(
-                        session,
-                        str(self._uid),
-                        session_factory=self._session_factory,
-                        llm_client=self._llm_client,
-                    )
-                    model_svc = ModelService(session)
-                    plan_svc = PlanService(session, model_svc)
-                    if await track_svc.has_strict_yesterday_summary():
-                        await plan_svc.get_or_create_today_plan(str(self._uid), force_regen=True)
-                    else:
-                        await plan_svc.delete_today_plan_if_exists(str(self._uid))
-            except Exception as exc:
-                logger.warning(
-                    "Morning bundle: plan regen failed user=%s: %s",
-                    self._uid,
-                    exc,
-                    exc_info=True,
-                )
-            await generate_morning_brief(self._session_factory, uid, self._llm_client)
-
-        asyncio.create_task(_runner())
+        self._morning_bundle.schedule(str(self._uid))
 
     # ── Ingest ─────────────────────────────────────────────────────────────────
 
@@ -925,6 +892,8 @@ class TrackingService:
 
         Returns the BackgroundWindowResult for the caller (e.g. live UI push).
         """
+        ingest_started = perf_counter()
+
         # Auto-create the user row if it doesn't exist yet (avoids FK violation
         # on background_windows when the user has never called /user/register).
         await self._db.execute(
@@ -953,6 +922,7 @@ class TrackingService:
 
         # Recompute stress + recovery windows spanning the full open band session
         band_session = await self._get_open_band_session()
+        recompute_started = perf_counter()
         if band_session is not None:
             session_end = min(datetime.now(UTC), window_end + timedelta(minutes=5))
             await self._recompute_day_windows(band_session.started_at, session_end)
@@ -960,17 +930,33 @@ class TrackingService:
             day_start = window_start.replace(hour=0, minute=0, second=0, microsecond=0)
             day_end   = day_start + timedelta(days=1)
             await self._recompute_day_windows(day_start, day_end)
+        logger.info(
+            "perf tracking_recompute user=%s duration_ms=%.2f",
+            self._uid,
+            (perf_counter() - recompute_started) * 1000.0,
+        )
 
         await self._db.commit()
 
         # Materialise live score after every successful ingest so the DB always
         # has a current row — UI reads from DB rather than computing on-the-fly.
         try:
+            materialise_started = perf_counter()
             await self._materialise_daily_score()
+            logger.info(
+                "perf tracking_materialise_score user=%s duration_ms=%.2f",
+                self._uid,
+                (perf_counter() - materialise_started) * 1000.0,
+            )
         except Exception as _mat_exc:
             logger.warning("Score materialisation failed user=%s: %s", self._uid, _mat_exc)
 
         logger.debug("Ingested background window %s–%s valid=%s", window_start, window_end, result.is_valid)
+        logger.info(
+            "perf tracking_ingest_total user=%s duration_ms=%.2f",
+            self._uid,
+            (perf_counter() - ingest_started) * 1000.0,
+        )
         return result
 
     # ── Band session helpers ───────────────────────────────────────────────────
@@ -1406,6 +1392,27 @@ class TrackingService:
             ))
         return out
 
+    async def _assign_readiness_for_row(self, row: db.DailyStressSummary) -> None:
+        """
+        Set ``readiness_score`` from the **previous** calendar day's stress,
+        waking recovery, and sleep recovery (composite formula).
+        """
+        if row.summary_date is None:
+            return
+        prev_date = (row.summary_date - timedelta(days=1)).date()
+        prev = await self._load_day_summary(prev_date)
+        if prev is None:
+            row.readiness_score = None
+            return
+        stress_raw = prev.stress_load_score
+        if stress_raw is None:
+            row.readiness_score = None
+            return
+        stress_10 = float(stress_raw) / 10.0
+        w = prev.waking_recovery_score
+        s = getattr(prev, "sleep_recovery_score", None)
+        row.readiness_score = compute_composite_readiness(w, s, stress_10)
+
     async def _materialise_daily_score(self) -> None:
         """Upsert a DailyStressSummary row for today using the live computation.
 
@@ -1471,11 +1478,14 @@ class TrackingService:
         row.is_estimated              = live.is_estimated
         row.is_partial_data           = True  # live rows are always partial
         row.waking_recovery_score     = live.waking_recovery_score
+        row.sleep_recovery_score      = live.sleep_recovery_score
         row.net_balance               = live.net_balance
         row.ns_capacity_used          = live.ns_capacity_used
         row.stress_pct_raw            = live.stress_pct_raw
         row.recovery_pct_raw          = live.recovery_pct_raw
         row.ns_capacity_recovery      = live.ns_capacity_recovery_used
+
+        await self._assign_readiness_for_row(row)
 
         await self._db.commit()
         logger.debug("Materialised daily score user=%s date=%s net=%.1f",
@@ -1563,8 +1573,12 @@ class TrackingService:
             if tag and source and str(source).startswith("user"):
                 tagged_stress_by_key[_win_key(row.started_at, row.ended_at)] = (str(tag), source)
                 prior_stress_tagged.append((row.started_at, row.ended_at, str(tag), source))
-        for row in existing_s:
-            await self._db.delete(row)
+        await self._db.execute(
+            delete(db.StressWindow)
+            .where(db.StressWindow.user_id == self._uid)
+            .where(db.StressWindow.started_at >= day_start)
+            .where(db.StressWindow.started_at < day_end)
+        )
 
         existing_r = await _load_existing_recovery_windows(self._db, self._uid, day_start, day_end)
         tagged_recovery_by_key: dict[tuple[datetime, datetime], tuple[str, str | None]] = {}
@@ -1575,8 +1589,12 @@ class TrackingService:
             if tag and source and str(source).startswith("user"):
                 tagged_recovery_by_key[_win_key(row.started_at, row.ended_at)] = (str(tag), source)
                 prior_recovery_tagged.append((row.started_at, row.ended_at, str(tag), source))
-        for row in existing_r:
-            await self._db.delete(row)
+        await self._db.execute(
+            delete(db.RecoveryWindow)
+            .where(db.RecoveryWindow.user_id == self._uid)
+            .where(db.RecoveryWindow.started_at >= day_start)
+            .where(db.RecoveryWindow.started_at < day_end)
+        )
 
         for sw in raw_stress:
             key = _win_key(sw.started_at, sw.ended_at)
@@ -1724,6 +1742,26 @@ class TrackingService:
     ) -> Optional[db.DailyStressSummary]:
         return await self._load_day_summary(target_date)
 
+    async def resolve_readiness_for_calendar_date(self, target: date) -> Optional[float]:
+        """
+        Readiness shown for calendar day ``target``: stored on that day's summary row
+        (written at materialise from prior day), or computed on the fly from the
+        prior day's metrics (same as plan_service). Used when the API returns a
+        live ``DailySummaryResult`` that has no ``readiness_score`` field.
+        """
+        t_row = await self._load_day_summary(target)
+        if t_row is not None and t_row.readiness_score is not None:
+            return float(t_row.readiness_score)
+        y = target - timedelta(days=1)
+        y_row = await self._load_day_summary(y)
+        if y_row is None or y_row.stress_load_score is None:
+            return None
+        return compute_composite_readiness(
+            y_row.waking_recovery_score,
+            getattr(y_row, "sleep_recovery_score", None),
+            float(y_row.stress_load_score) / 10.0,
+        )
+
     async def get_personal_model(self) -> Optional[db.PersonalModel]:
         """Return the user's PersonalModel row (or None if it doesn't exist yet)."""
         return await _load_personal_model(self._db, self._uid)
@@ -1830,17 +1868,48 @@ class TrackingService:
         )
         return result.scalars().first()
 
+    async def get_current_cycle_local_date(self) -> date:
+        """
+        Local date label for the active morning-reset cycle (Scenario A/B).
+
+        After a reset, matches ``users.last_morning_cycle_reset_local_date`` and
+        stays stable across IST midnight until the next reset. If the user has
+        never had a qualifying reset, falls back to calendar ``local_today()``.
+        """
+        uid = parse_uuid(self._uid)
+        if uid is None:
+            return local_today()
+        user_row = await self._db.get(db.User, uid)
+        if user_row is None or user_row.last_morning_cycle_reset_local_date is None:
+            return local_today()
+        return user_row.last_morning_cycle_reset_local_date
+
     async def resolve_strict_recap_anchor(self) -> tuple[date, datetime, datetime]:
         """
-        IST calendar "yesterday" for morning recap + UTC [start, end) bounds.
+        Completed-cycle day for morning recap + UTC [start, end) bounds.
 
-        DailyStressSummary rows are keyed to the IST calendar date of the wear
-        session (see _materialise_daily_score). The recap card asks for that same
-        IST yesterday — not ``last_morning_cycle_reset_local_date - 1 day``, which
-        incorrectly shifted the lookup two days back whenever the last reset was
-        yesterday but today's reset had not yet updated the user row.
+        Recap follows morning-reset semantics with stale-reset protection:
+        - If today's reset has fired (last_reset >= local_today), show prior
+          completed cycle: ``last_reset - 1 day``.
+        - If reset has not fired yet today and last_reset == yesterday, show
+          ``last_reset`` itself.
+        - If last_reset is older than yesterday (stale), fallback to calendar
+          yesterday to avoid pinning recap to an old day.
+        - If no reset exists yet, fallback to IST calendar yesterday.
         """
         recap_for_date = recap_yesterday_local_date()
+        today_local = local_today()
+        uid = parse_uuid(self._uid)
+        if uid is not None:
+            user_row = await self._db.get(db.User, uid)
+            if user_row is not None and user_row.last_morning_cycle_reset_local_date is not None:
+                rd = user_row.last_morning_cycle_reset_local_date
+                if rd >= today_local:
+                    recap_for_date = rd - timedelta(days=1)
+                elif rd == (today_local - timedelta(days=1)):
+                    recap_for_date = rd
+                else:
+                    recap_for_date = recap_yesterday_local_date()
         start_ts, end_ts = utc_instant_bounds_for_local_calendar_date(recap_for_date)
         return recap_for_date, start_ts, end_ts
 
@@ -1855,7 +1924,7 @@ class TrackingService:
         return await self._load_day_summary_by_utc_bounds(start_ts, end_ts)
 
     async def has_strict_yesterday_summary(self) -> bool:
-        """True iff a DB row exists for the strict recap IST day."""
+        """True iff a DB row exists for the strict recap day (cycle-anchored when reset exists)."""
         row = await self.load_strict_recap_daily_row()
         return row is not None
 

@@ -70,9 +70,10 @@ log = logging.getLogger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-# Readiness score thresholds
-GREEN_THRESHOLD:  float = 70.0
-YELLOW_THRESHOLD: float = 45.0
+# Composite readiness thresholds (0–100) — aligned with plan_readiness_contract
+GREEN_THRESHOLD:  float = 75.0
+YELLOW_THRESHOLD: float = 50.0
+RELAXED_THRESHOLD: float = 25.0
 
 # Flexibility → history window (days)
 FLEXIBILITY_WINDOW: dict[str, int] = {
@@ -83,9 +84,10 @@ FLEXIBILITY_WINDOW: dict[str, int] = {
 
 # ZenFlow session durations per day type (minutes)
 SESSION_DURATION: dict[str, int] = {
-    "green":  20,
-    "yellow": 10,
-    "red":    5,
+    "green":    20,
+    "yellow":   10,
+    "relaxed":  8,
+    "red":      5,
 }
 
 # Adherence floor — deprioritise category below this over 7 days
@@ -114,7 +116,7 @@ class DailyPlan(BaseModel):
     into natural language coaching messages.
     """
     plan_date:     str           # ISO date string "YYYY-MM-DD"
-    day_type:      str           # "green" | "yellow" | "red"
+    day_type:      str           # "green" | "yellow" | "relaxed" | "red"
     readiness:     float
     stage:         int
     must_do:       list[PlanItem]
@@ -238,7 +240,7 @@ def build_daily_plan(inputs: PrescriberInputs) -> DailyPlan:
         rec = _select_movement(inputs, low_adherence_categories, notes)
         if rec:
             recommended.append(rec)
-    elif day_type in ("yellow", "red"):
+    elif day_type in ("yellow", "relaxed", "red"):
         # Light movement or social/passive recovery
         rec = _select_light_recovery(inputs, day_type, low_adherence_categories, notes)
         if rec:
@@ -280,11 +282,13 @@ def build_daily_plan(inputs: PrescriberInputs) -> DailyPlan:
 # ── Selection helpers ─────────────────────────────────────────────────────────
 
 def _resolve_day_type(readiness: float, declared_day_type: str) -> str:
-    """Resolve day_type from readiness score, defaulting to declared type."""
-    if readiness >= GREEN_THRESHOLD:
+    """Resolve day_type from composite readiness score (4 tiers)."""
+    if readiness > GREEN_THRESHOLD:
         return "green"
     if readiness >= YELLOW_THRESHOLD:
         return "yellow"
+    if readiness >= RELAXED_THRESHOLD:
+        return "relaxed"
     return "red"
 
 

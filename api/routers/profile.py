@@ -26,6 +26,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.db.database import get_db
+from api.auth import UserIdDep
 from api.db.schema import User
 from api.utils import parse_uuid
 from api.services.profile_service import (
@@ -82,12 +83,19 @@ async def _resolve_user(x_user_id: str = Header(...)) -> uuid.UUID:
     return uid
 
 
+async def _resolve_user_uuid(user_id: UserIdDep) -> uuid.UUID:
+    uid = parse_uuid(user_id)
+    if uid is None:
+        raise HTTPException(422, "Invalid X-User-Id")
+    return uid
+
+
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @router.get("/unified", response_class=JSONResponse)
 async def get_unified_profile(
     db: AsyncSession = Depends(get_db),
-    user_id: uuid.UUID = Depends(_resolve_user),
+    user_id: uuid.UUID = Depends(_resolve_user_uuid),
 ):
     """
     Return the current persisted UnifiedProfile for this user.
@@ -103,7 +111,7 @@ async def get_unified_profile(
 async def trigger_rebuild(
     body: RebuildRequest,
     db: AsyncSession = Depends(get_db),
-    user_id: uuid.UUID = Depends(_resolve_user),
+    user_id: uuid.UUID = Depends(_resolve_user_uuid),
     request: Request = None,
 ):
     """
@@ -144,7 +152,7 @@ async def trigger_rebuild(
 async def get_facts(
     min_confidence: float = 0.3,
     db: AsyncSession = Depends(get_db),
-    user_id: uuid.UUID = Depends(_resolve_user),
+    user_id: uuid.UUID = Depends(_resolve_user_uuid),
 ):
     """Return durable facts for this user sorted by confidence."""
     facts = await load_facts(db, user_id, min_confidence=min_confidence)
@@ -167,7 +175,7 @@ async def get_facts(
 async def log_user_fact(
     body: FactRequest,
     db: AsyncSession = Depends(get_db),
-    user_id: uuid.UUID = Depends(_resolve_user),
+    user_id: uuid.UUID = Depends(_resolve_user_uuid),
 ):
     """Manually log a durable fact about the user."""
     if body.category not in _VALID_CATEGORIES:
@@ -187,7 +195,7 @@ async def log_user_fact(
 @router.get("/engagement", response_class=JSONResponse)
 async def get_engagement_snapshot(
     db: AsyncSession = Depends(get_db),
-    user_id: uuid.UUID = Depends(_resolve_user),
+    user_id: uuid.UUID = Depends(_resolve_user_uuid),
 ):
     """
     Return live engagement metrics computed from DB.

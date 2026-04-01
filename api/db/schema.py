@@ -109,7 +109,9 @@ class Session(Base):
 class Metric(Base):
     """
     One row per computed metric value.
-    Kept as a log — personal model reads from this to build distributions.
+    Legacy table retained for backward compatibility.
+    New scoring and coaching paths should use DailyStressSummary / BackgroundWindow
+    and avoid introducing fresh writes to this table.
     """
     __tablename__ = "metrics"
 
@@ -808,8 +810,8 @@ class DailyStressSummary(Base):
     Finalized at day close (sleep detection or midnight fallback).
     Updated intraday with running stress/recovery totals.
 
-    readiness_score is None until the morning read of the NEXT day arrives —
-    it requires today's morning RMSSD to calibrate the prior score.
+    readiness_score: composite 0–100 for THIS calendar morning, computed from the
+    prior day's stress / waking / sleep display scores (see plan_readiness_contract).
     """
     __tablename__ = "daily_stress_summaries"
 
@@ -830,14 +832,14 @@ class DailyStressSummary(Base):
     stress_load_score  = Column(Float, nullable=True)
     # DEPRECATED: never written, kept NULL. Waking recovery replaces this.
     recovery_score     = Column(Float, nullable=True)
-    # DEPRECATED: never written, kept NULL. Net balance replaces readiness.
-    readiness_score    = Column(Float, nullable=True)
+    readiness_score    = Column(Float, nullable=True)   # composite 0–100 (prior-day metrics)
 
-    # "green" | "yellow" | "red" — sourced from MorningRead.day_type at day close
+    # "green" | "yellow" | "relaxed" | "red" — coach/plan tier from readiness
     day_type     = Column(String(10), nullable=True)
 
     # Credit-card model scores (Phase 10)
     waking_recovery_score = Column(Float, nullable=True)   # display only, clamped 0-100
+    sleep_recovery_score  = Column(Float, nullable=True)   # display only, clamped 0-100
     net_balance           = Column(Float, nullable=True)   # raw: recovery% - stress% + opening_balance
 
     # Continuous balance thread — carries across day boundaries

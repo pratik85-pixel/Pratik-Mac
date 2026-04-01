@@ -112,7 +112,12 @@ class ModelService:
     async def get_profile(self, user_id: str) -> NSHealthProfile:
         """Return the NSHealthProfile computed from the current fingerprint."""
         fp = await self.get_fingerprint(user_id) or PersonalFingerprint()
-        return compute_ns_health_profile(fp)
+        return self.get_profile_from_fingerprint(fp)
+
+    @staticmethod
+    def get_profile_from_fingerprint(fp: Optional[PersonalFingerprint]) -> NSHealthProfile:
+        """Compute a profile from an already-loaded fingerprint (no DB read)."""
+        return compute_ns_health_profile(fp or PersonalFingerprint())
 
     async def update_fingerprint_from_outcome(
         self,

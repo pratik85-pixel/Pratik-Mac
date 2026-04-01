@@ -56,7 +56,7 @@ def _make_prescription() -> DailyPrescription:
         session_window="19:00–21:00",
         physical_load="hold",
         reason_tag="stable",
-        load_score=0.5,
+        readiness_score=50.0,
     )
 
 
@@ -122,17 +122,17 @@ class TestBuildPhysioSection:
         section = _build_physio_section(ctx)
         assert "TODAY'S PHYSIO" in section
 
-    def test_stress_score_formatted_as_per_100(self):
+    def test_stress_score_formatted_on_0_10_scale(self):
         ctx = _make_ctx(stress_score=55)
         section = _build_physio_section(ctx)
-        assert "55/100" in section
+        assert "5.5/10" in section
         assert "stress load" in section
 
     def test_recovery_score_formatted_as_per_100(self):
         ctx = _make_ctx(recovery_score=80)
         section = _build_physio_section(ctx)
         assert "80/100" in section
-        assert "recovery" in section
+        assert "waking recovery" in section
 
     def test_positive_net_balance_shows_plus_sign(self):
         ctx = _make_ctx(net_balance=4.2)
@@ -164,7 +164,7 @@ class TestBuildPhysioSection:
         items = [{"slug_or_label": "hard_session", "reason": "residual fatigue signal from last 48h"}]
         ctx = _make_ctx(stress_score=60, avoid_items=items)
         section = _build_physio_section(ctx)
-        assert "Avoid today" in section
+        assert "Ease off today" in section
         assert "residual fatigue" in section
 
     def test_avoid_items_uses_reason_over_slug(self):
@@ -195,12 +195,12 @@ class TestBuildPhysioSection:
     def test_avoid_items_absent_when_list_empty(self):
         ctx = _make_ctx(stress_score=60, avoid_items=[])
         section = _build_physio_section(ctx)
-        assert "Avoid today" not in section
+        assert "Ease off today" not in section
 
     def test_all_three_scores_present(self):
         ctx = _make_ctx(stress_score=70, recovery_score=55, net_balance=-1.8)
         section = _build_physio_section(ctx)
-        assert "70/100" in section
+        assert "7.0/10" in section
         assert "55/100" in section
         assert "-1.8" in section
 
@@ -294,11 +294,11 @@ class TestConversationTurnPrompt:
     def test_avoid_items_in_prompt_when_data_present(self):
         items = [{"slug_or_label": "intense_session", "reason": "recovery debt building"}]
         prompt = self._prompt(stress_score=70, avoid_items=items)
-        assert "Avoid today" in prompt
+        assert "Ease off today" in prompt
         assert "recovery debt" in prompt
 
     def test_no_raw_metric_values_in_physio_block(self):
-        """Scores must appear as /100 values only — no raw RMSSD, ms, or % vs baseline."""
+        """Stress on /10 and recovery on /100 — no raw RMSSD, ms, or % vs baseline."""
         ctx = _make_ctx(stress_score=72, recovery_score=61, net_balance=1.5)
         tone_desc = TONE_DESCRIPTIONS.get(ctx.tone, "")
         prompt = _build_conversation_turn(ctx, tone_desc)
@@ -310,4 +310,4 @@ class TestConversationTurnPrompt:
         prompt = self._prompt()
         assert "TRIGGER" in prompt
         assert "USER JUST SAID" in prompt
-        assert "Output this JSON" in prompt
+        assert "OUTPUT JSON only" in prompt

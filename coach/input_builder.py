@@ -14,8 +14,8 @@ Contract
 
 from __future__ import annotations
 
+import asyncio
 import math
-import re
 import uuid as uuid_mod
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -25,27 +25,12 @@ from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import api.db.schema as db
+from coach.text_sanitizer import sanitize_text
 from tracking.cycle_boundaries import local_today, product_calendar_timezone
-from tracking.plan_readiness_contract import (
-    plan_day_type_from_load_score,
-    plan_readiness_from_load_score,
-)
-
-
-_UNSAFE = re.compile(r"[<>{}`|#\\]", re.UNICODE)
 
 
 def _sanitize_text(text: Optional[str], *, max_len: int = 200) -> str:
-    """
-    Remove prompt-injection characters and truncate.
-
-    This mirrors the protection philosophy in `coach/data_assembler.py`, but is
-    scoped for Layer 1 input packet construction.
-    """
-    cleaned = _UNSAFE.sub("", (text or "")).strip()
-    if not cleaned:
-        return ""
-    return cleaned[:max_len]
+    return sanitize_text(text, max_len=max_len)
 
 
 def _pct_str(delta_frac: float, *, reference: str) -> str:
@@ -63,22 +48,6 @@ def _pct_str(delta_frac: float, *, reference: str) -> str:
     sign = "-" if delta_frac < 0 else "+"
     above_below = "below" if delta_frac < 0 else "above"
     return f"{sign}{abs_pct:.0f}% {above_below} {reference}"
-
-
-def _readiness_from_net_balance(net_balance: Optional[float]) -> Optional[float]:
-    """
-    Backward-compatible readiness mapping used across the codebase.
-
-    Maps unbounded `net_balance` to a clamped 0..100 readiness score.
-    """
-    if net_balance is None:
-        return None
-    try:
-        v = ((float(net_balance) + 30.0) / 60.0) * 100.0
-        v = max(0.0, min(100.0, v))
-        return round(v, 1)
-    except Exception:
-        return None
 
 
 def _compute_sleep_recovery_score_from_raw(
@@ -180,21 +149,13 @@ async def build_coach_input_packet(
     today_midnight_utc = datetime(today.year, today.month, today.day, tzinfo=UTC)
 
     # ── Personal model + UUP traits ─────────────────────────────────────────
-    pm_row = (
-        await session.execute(select(db.PersonalModel).where(db.PersonalModel.user_id == user_id))
-    ).scalar_one_or_none()
-    uup_row = (
-        await session.execute(select(db.UserUnifiedProfile).where(db.UserUnifiedProfile.user_id == user_id))
-    ).scalar_one_or_none()
-    psych_row = (
-        await session.execute(select(db.UserPsychProfile).where(db.UserPsychProfile.user_id == user_id))
-    ).scalar_one_or_none()
-    habits_row = (
-        await session.execute(select(db.UserHabits).where(db.UserHabits.user_id == user_id))
-    ).scalar_one_or_none()
-    tag_model_row = (
-        await session.execute(select(db.TagPatternModel).where(db.TagPatternModel.user_id == user_id))
-    ).scalar_one_or_none()
+    pm_row, uup_row, psych_row, habits_row, tag_model_row = await asyncio.gather(
+        session.scalar(select(db.PersonalModel).where(db.PersonalModel.user_id == user_id)),
+        session.scalar(select(db.UserUnifiedProfile).where(db.UserUnifiedProfile.user_id == user_id)),
+        session.scalar(select(db.UserPsychProfile).where(db.UserPsychProfile.user_id == user_id)),
+        session.scalar(select(db.UserHabits).where(db.UserHabits.user_id == user_id)),
+        session.scalar(select(db.TagPatternModel).where(db.TagPatternModel.user_id == user_id)),
+    )
 
     personal_model = {
         "rmssd_floor": getattr(pm_row, "rmssd_floor", None),
@@ -246,10 +207,6 @@ async def build_coach_input_packet(
 
     daily_trajectory: list[dict[str, Any]] = []
     for r in daily_rows:
-        readiness = r.readiness_score
-        if readiness is None:
-            readiness = _readiness_from_net_balance(r.net_balance)
-
         sleep_recovery_score = getattr(r, "sleep_recovery_score", None)
         if sleep_recovery_score is None:
             sleep_recovery_score = _compute_sleep_recovery_score_from_raw(
@@ -268,8 +225,8 @@ async def build_coach_input_packet(
         daily_trajectory.append(
             {
                 "date": r.summary_date.date().isoformat() if getattr(r, "summary_date", None) else None,
-                # readiness and waking/sleep recovery remain on their native 0–100 scale.
-                "readiness_score": readiness,
+                # Composite readiness 0–100 (from prior day metrics); waking/sleep 0–100.
+                "readiness_score": getattr(r, "readiness_score", None),
                 "waking_recovery_score": getattr(r, "waking_recovery_score", None),
                 "sleep_recovery_score": sleep_recovery_score,
                 # stress_load is expressed on the same 0–10 scale the app shows the user.

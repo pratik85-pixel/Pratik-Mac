@@ -28,8 +28,8 @@ word characters, spaces, and safe punctuation are allowed through.
 
 from __future__ import annotations
 
-import re
 import uuid as uuid_mod
+import asyncio
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Optional
@@ -38,6 +38,7 @@ from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import api.db.schema as db
+from coach.text_sanitizer import sanitize_text
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -61,17 +62,9 @@ _RECOVERY_BANDS: list[tuple[float, str]] = [
     (0.0,  "poor"),
 ]
 
-# ── Sanitizer ─────────────────────────────────────────────────────────────────
-
-# Allow: Unicode word chars, whitespace, and safe punctuation.
-# Block: angle brackets, backticks, curly braces, hash, pipe — all common injection vectors.
-_UNSAFE = re.compile(r"[<>{}`|#\\]", re.UNICODE)
-
-
 def _sanitize(text: str, max_len: int = 200) -> str:
     """Strip prompt-injection characters and truncate to max_len."""
-    cleaned = _UNSAFE.sub("", text or "")
-    return cleaned[:max_len].strip()
+    return sanitize_text(text, max_len=max_len)
 
 
 # ── Output dataclass ──────────────────────────────────────────────────────────
@@ -131,14 +124,16 @@ async def assemble_for_user(
     """
     now = datetime.now(UTC)
 
-    pm     = await _fetch_personal_model(session, user_id)
-    traj   = await _fetch_daily_trajectory(session, user_id, now)
-    sw     = await _fetch_stress_windows(session, user_id, now)
-    rw     = await _fetch_recovery_windows(session, user_id, now)
-    bins   = await _fetch_background_bins(session, user_id, now, pm)
-    habits = await _fetch_habit_events(session, user_id, now)
-    facts  = await _fetch_user_facts(session, user_id)
-    narr   = await _fetch_coach_narrative(session, user_id)
+    pm, traj, sw, rw, habits, facts, narr = await asyncio.gather(
+        _fetch_personal_model(session, user_id),
+        _fetch_daily_trajectory(session, user_id, now),
+        _fetch_stress_windows(session, user_id, now),
+        _fetch_recovery_windows(session, user_id, now),
+        _fetch_habit_events(session, user_id, now),
+        _fetch_user_facts(session, user_id),
+        _fetch_coach_narrative(session, user_id),
+    )
+    bins = await _fetch_background_bins(session, user_id, now, pm)
 
     # Population labels derived from most recent available trajectory entry
     latest             = traj[-1] if traj else {}
@@ -211,11 +206,12 @@ async def _fetch_daily_trajectory(
         if hasattr(sd, "date"):
             sd = sd.date()
         out.append({
-            "date":            str(sd),
-            "stress_load":     _round(row.stress_load_score),
-            "waking_recovery": _round(row.waking_recovery_score),
-            "net_balance":     _round(row.net_balance),
-            "day_type":        row.day_type,
+            "date":             str(sd),
+            "stress_load":      _round(row.stress_load_score),
+            "waking_recovery":  _round(row.waking_recovery_score),
+            "net_balance":      _round(row.net_balance),
+            "day_type":         row.day_type,
+            "readiness_score":  _round(getattr(row, "readiness_score", None)),
         })
     return out
 
@@ -400,7 +396,8 @@ async def _fetch_coach_narrative(
     narrative = result.scalar_one_or_none()
     if not narrative:
         return None
-    return narrative[:800]
+    # Match Layer 3 coach prompts: inject enough narrative for personalization.
+    return narrative[:8000]
 
 
 # ── Population label helpers ──────────────────────────────────────────────────

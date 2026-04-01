@@ -16,11 +16,12 @@ import logging
 from datetime import date
 from typing import Annotated, List, Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import select, desc, func, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from api.auth import UserIdDep
 from api.db.database import get_db
 from api.db import schema as db
 from api.utils import parse_uuid
@@ -30,11 +31,6 @@ router = APIRouter(prefix="/band-sessions", tags=["band-sessions"])
 
 
 # ── Auth dependency ────────────────────────────────────────────────────────────
-
-async def _user_id(x_user_id: Annotated[str, Header()]) -> str:
-    if not x_user_id:
-        raise HTTPException(status_code=401, detail="X-User-Id header required")
-    return x_user_id
 
 
 # ── Response models ────────────────────────────────────────────────────────────
@@ -228,7 +224,7 @@ async def _get_session_or_404(
 
 @router.get("/history", response_model=list[BandSessionSummary])
 async def get_band_session_history(
-    user_id: str          = Depends(_user_id),
+    user_id: UserIdDep,
     db_sess: AsyncSession = Depends(get_db),
     limit:   int          = 20,
 ) -> list[BandSessionSummary]:
@@ -253,7 +249,7 @@ async def get_band_session_history(
 
 @router.get("/current", response_model=Optional[BandSessionSummary])
 async def get_current_band_session(
-    user_id: str          = Depends(_user_id),
+    user_id: UserIdDep,
     db_sess: AsyncSession = Depends(get_db),
 ) -> Optional[BandSessionSummary]:
     """Return the currently open band wear session, or null if band is not worn."""
@@ -275,7 +271,7 @@ async def get_current_band_session(
 @router.get("/{session_id}/metrics", response_model=BandSessionMetrics)
 async def get_band_session_metrics(
     session_id: str,
-    user_id:    str          = Depends(_user_id),
+    user_id:    UserIdDep,
     db_sess:    AsyncSession = Depends(get_db),
 ) -> BandSessionMetrics:
     """
@@ -402,7 +398,7 @@ async def get_band_session_metrics(
 @router.get("/{session_id}/plan", response_model=BandSessionPlan)
 async def get_band_session_plan(
     session_id: str,
-    user_id:    str          = Depends(_user_id),
+    user_id:    UserIdDep,
     db_sess:    AsyncSession = Depends(get_db),
 ) -> BandSessionPlan:
     """
@@ -471,7 +467,7 @@ async def get_band_session_plan(
 @router.get("/{session_id}", response_model=BandSessionDetail)
 async def get_band_session_detail(
     session_id: str,
-    user_id:    str          = Depends(_user_id),
+    user_id:    UserIdDep,
     db_sess:    AsyncSession = Depends(get_db),
 ) -> BandSessionDetail:
     """Return summary detail fields for a single band wear session."""

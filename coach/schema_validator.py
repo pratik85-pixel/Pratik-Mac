@@ -55,7 +55,7 @@ _WORD_LIMITS: dict[str, tuple[int, int]] = {
     "summary":     (20, 45),
     "observation": (10, 35),
     "action":      (10, 28),
-    "reply":       (15, 60),
+    # conversation_turn "reply" — no fixed cap (human-like length)
     "reinforcement": (10, 35),
     "week_narrative": (30, 80),
 }

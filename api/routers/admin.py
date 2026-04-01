@@ -20,20 +20,33 @@ USE: testing / QA only. Not exposed in production docs.
 from __future__ import annotations
 
 import logging
+import asyncio
+import secrets
 import uuid as uuid_mod
 from datetime import date
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.db.database import get_db
 from api.db import schema as db
+from api.config import get_settings
 from api.utils import parse_uuid
 
 log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/admin", tags=["admin"])
+_cfg = get_settings()
+
+
+async def _require_admin_api_key(x_admin_key: str = Header(default="")) -> None:
+    if not _cfg.ENABLE_ADMIN_ENDPOINTS:
+        raise HTTPException(status_code=404, detail="not found")
+    if not _cfg.ADMIN_API_KEY:
+        raise HTTPException(status_code=503, detail="admin endpoint disabled")
+    if not secrets.compare_digest(x_admin_key or "", _cfg.ADMIN_API_KEY or ""):
+        raise HTTPException(status_code=403, detail="forbidden")
 
 
 @router.post("/force-coach-refresh/{user_id}", status_code=200)
@@ -41,6 +54,7 @@ async def force_coach_refresh(
     user_id: str,
     request: Request,
     session: AsyncSession = Depends(get_db),
+    _: None = Depends(_require_admin_api_key),
 ) -> dict:
     """
     Force a full Layer 2 → Layer 3 pipeline refresh for one user.
@@ -48,7 +62,7 @@ async def force_coach_refresh(
     """
     uid = parse_uuid(user_id)
     if uid is None:
-        raise HTTPException(422, f"Invalid user_id: {user_id!r}")
+        raise HTTPException(422, "Invalid user_id")
 
     llm_client = getattr(getattr(request, "app", None), "state", None)
     if llm_client is not None:
@@ -78,7 +92,10 @@ async def force_coach_refresh(
         sys_p, user_p = build_layer2_narrative_prompt(packet)
 
         if llm_client is not None:
-            raw = llm_client.chat(sys_p, user_p, json_mode=False)
+            raw = await asyncio.wait_for(
+                asyncio.to_thread(llm_client.chat, sys_p, user_p, False),
+                timeout=30.0,
+            )
             narrative = (raw or "").strip()
         else:
             # Offline fallback — import from nightly_rebuild
@@ -106,9 +123,9 @@ async def force_coach_refresh(
 
         result["steps"]["layer2_narrative"] = "ok"
         result["narrative_preview"] = narrative[:300] + "…" if len(narrative) > 300 else narrative
-    except Exception as exc:
+    except Exception:
         log.exception("force_coach_refresh: layer2 failed user=%s", user_id)
-        result["steps"]["layer2_narrative"] = f"error: {exc}"
+        result["steps"]["layer2_narrative"] = "error"
 
     # ── Step 2: Layer 3 — morning brief ─────────────────────────────────────
     try:
@@ -117,9 +134,9 @@ async def force_coach_refresh(
 
         await _run_morning_brief(session, uid, llm_client)
         result["steps"]["morning_brief"] = "ok"
-    except Exception as exc:
+    except Exception:
         log.exception("force_coach_refresh: morning_brief failed user=%s", user_id)
-        result["steps"]["morning_brief"] = f"error: {exc}"
+        result["steps"]["morning_brief"] = "error"
 
     # ── Step 3: Plan + brief + avoid_items ───────────────────────────────────
     try:
@@ -134,9 +151,9 @@ async def force_coach_refresh(
         result["plan_day_type"] = plan_dict.get("day_type")
         result["plan_brief"] = plan_dict.get("brief")
         result["avoid_items"] = plan_dict.get("avoid_items", [])
-    except Exception as exc:
+    except Exception:
         log.exception("force_coach_refresh: plan failed user=%s", user_id)
-        result["steps"]["plan"] = f"error: {exc}"
+        result["steps"]["plan"] = "error"
 
     return result
 

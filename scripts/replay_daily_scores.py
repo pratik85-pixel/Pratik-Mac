@@ -21,10 +21,13 @@ import asyncio
 import argparse
 import logging
 import sys
+from pathlib import Path
 from datetime import datetime, timezone, timedelta, date
 
 # Make sure project root is on the path.
-sys.path.insert(0, "/Users/pratikbarman/Desktop/Zenflow_backend")
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
@@ -133,6 +136,7 @@ async def replay(user_filter: list[str] | None = None, dry_run: bool = False) ->
                 row.is_estimated              = live.is_estimated
                 row.is_partial_data           = True
                 row.waking_recovery_score     = live.waking_recovery_score
+                row.sleep_recovery_score      = live.sleep_recovery_score
                 row.net_balance               = live.net_balance
                 row.opening_balance           = live.opening_balance
                 row.opening_recovery          = live.opening_recovery
@@ -142,6 +146,8 @@ async def replay(user_filter: list[str] | None = None, dry_run: bool = False) ->
                 row.stress_pct_raw            = live.stress_pct_raw
                 row.recovery_pct_raw          = live.recovery_pct_raw
                 row.ns_capacity_recovery      = live.ns_capacity_recovery_used
+
+                await svc._assign_readiness_for_row(row)
 
                 await session.commit()
                 logger.info("Replayed   user=%s date=%s net=%.1f",

@@ -154,6 +154,9 @@ class CoachContext:
     # Formatted as a flat list of strings for prompt injection.
     user_facts:       list[str]     = field(default_factory=list)
 
+    # Facts extracted from the current user message only (same turn; may not be in DB yet).
+    newly_extracted_facts: list[str] = field(default_factory=list)
+
     # Engagement tier from UUP — used by coach to calibrate push vs gentle.
     engagement_tier:  Optional[str] = field(default=None)  # "high"|"medium"|"low"|"at_risk"|"churned"
 
@@ -192,6 +195,7 @@ def build_coach_context(
     user_facts:      Optional[list[str]] = None,
     engagement_tier: Optional[str] = None,
     avoid_items:     Optional[list[dict]] = None,
+    newly_extracted_facts: Optional[list[str]] = None,
 ) -> CoachContext:
     """
     Assemble a complete CoachContext for the given trigger.
@@ -322,6 +326,7 @@ def build_coach_context(
         user_facts             = user_facts or [],
         engagement_tier        = engagement_tier,
         avoid_items            = avoid_items or [],
+        newly_extracted_facts  = newly_extracted_facts or [],
     )
 
 

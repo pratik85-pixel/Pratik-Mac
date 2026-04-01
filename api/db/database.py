@@ -22,8 +22,10 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
+from sqlalchemy import event
 
 from api.config import get_settings
+from api.observability.request_metrics import incr_db_query_count
 
 _cfg = get_settings()
 
@@ -40,9 +42,13 @@ def _get_engine():
             _cfg.DATABASE_URL,
             echo=_cfg.DEBUG,
             pool_pre_ping=True,
-            pool_size=5,
-            max_overflow=10,
+            pool_size=_cfg.DB_POOL_SIZE,
+            max_overflow=_cfg.DB_MAX_OVERFLOW,
         )
+        @event.listens_for(_engine.sync_engine, "before_cursor_execute")
+        def _count_db_queries(*_args, **_kwargs) -> None:
+            incr_db_query_count()
+
         _AsyncSessionLocal = async_sessionmaker(
             bind=_engine,
             class_=AsyncSession,

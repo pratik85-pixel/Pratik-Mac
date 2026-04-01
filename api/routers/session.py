@@ -6,15 +6,14 @@ Session lifecycle endpoints.
 POST /session/start    — create a session, register with SessionService
 POST /session/end      — end a session, compute outcome, persist via OutcomeService
 GET  /session/{id}/live    — poll current live metrics
-GET  /session/{id}/result  — retrieve stored outcome
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Annotated, Optional
+from typing import Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy import select, func as sqlfunc, desc
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -36,10 +35,7 @@ router = APIRouter(prefix="/session", tags=["session"])
 
 # ── Dependencies ───────────────────────────────────────────────────────────────
 
-async def _user_id(x_user_id: Annotated[str, Header()]) -> str:
-    if not x_user_id:
-        raise HTTPException(status_code=401, detail="X-User-Id header required")
-    return x_user_id
+from api.auth import UserIdDep
 
 def _session_svc(request: Request) -> SessionService:
     return request.app.state.session_service
@@ -95,7 +91,7 @@ class LiveMetricsResponse(BaseModel):
 @router.post("/start", response_model=StartSessionResponse)
 async def start_session(
     body:      StartSessionRequest,
-    user_id:   str              = Depends(_user_id),
+    user_id:   UserIdDep,
     model_svc: ModelService     = Depends(_model_svc),
     svc:       SessionService   = Depends(_session_svc),
     db:        AsyncSession     = Depends(get_db),
@@ -133,12 +129,16 @@ async def start_session(
         )
         total_sessions = count_res.scalar_one() or 0
 
+    load_val = body.load_score if body.load_score is not None else 0.0
+    # Legacy API: 0–1 pressure → map to 0–100 readiness (inverse).
+    readiness_from_load = (1.0 - min(float(load_val), 1.0)) * 100.0
+
     practice = prescribe_session(
         stage               = stage,
         prf_status          = prf_status_from_db,
         stored_prf_bpm      = prf_bpm_from_db,
         session_type        = body.session_type,
-        load_score          = body.load_score if body.load_score is not None else 0.0,
+        readiness_score     = readiness_from_load,
         attention_anchor    = body.attention_anchor,
         total_sessions_completed = total_sessions,
         duration_minutes    = body.duration_minutes,
@@ -162,15 +162,22 @@ async def start_session(
 async def end_session(
     session_id:   str,
     body:         EndSessionRequest,
-    user_id:      str             = Depends(_user_id),
+    user_id:      UserIdDep,
     svc:          SessionService  = Depends(_session_svc),
     outcome_svc:  OutcomeService  = Depends(_outcome_svc),
 ) -> dict:
     """
     End the session, compute SessionOutcome, persist to DB, return summary.
     """
+    owner = svc.get_active_session_owner(session_id)
+    if owner is None:
+        raise HTTPException(status_code=404, detail="session not found or no data recorded")
+    if owner != user_id:
+        raise HTTPException(status_code=403, detail="session does not belong to this user")
+
     outcome: Optional[SessionOutcome] = svc.end_session(
         session_id,
+        user_id=user_id,
         morning_rmssd_ms     = body.morning_rmssd_ms,
         personal_floor_rmssd = body.personal_floor_rmssd,
     )
@@ -202,11 +209,17 @@ async def end_session(
 @router.get("/{session_id}/live", response_model=LiveMetricsResponse)
 async def get_live_metrics(
     session_id: str,
-    user_id:    str           = Depends(_user_id),
+    user_id:    UserIdDep,
     svc:        SessionService = Depends(_session_svc),
 ) -> LiveMetricsResponse:
     """Poll current live metrics for an active session (WebSocket alternative)."""
-    metrics: Optional[LiveMetrics] = svc.get_live_metrics(session_id)
+    owner = svc.get_active_session_owner(session_id)
+    if owner is None:
+        raise HTTPException(status_code=404, detail="session not found or no data yet")
+    if owner != user_id:
+        raise HTTPException(status_code=403, detail="session does not belong to this user")
+
+    metrics: Optional[LiveMetrics] = svc.get_live_metrics(session_id, user_id=user_id)
     if metrics is None:
         raise HTTPException(status_code=404, detail="session not found or no data yet")
     return LiveMetricsResponse(**metrics.__dict__)
@@ -227,7 +240,7 @@ class SessionHistoryItem(BaseModel):
 
 @router.get("/current")
 async def get_current_session(
-    user_id: str            = Depends(_user_id),
+    user_id: UserIdDep,
     db:      AsyncSession   = Depends(get_db),
 ) -> dict:
     """
@@ -269,7 +282,7 @@ async def get_current_session(
 
 @router.get("/history", response_model=list[SessionHistoryItem])
 async def get_session_history(
-    user_id: str          = Depends(_user_id),
+    user_id: UserIdDep,
     db:      AsyncSession = Depends(get_db),
     limit:   int          = 20,
 ) -> list[SessionHistoryItem]:

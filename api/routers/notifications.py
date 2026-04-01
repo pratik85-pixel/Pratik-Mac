@@ -12,24 +12,19 @@ POST /v1/notifications/dismiss
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Annotated, Any, Optional
+from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import api.db.schema as db_schema
+from api.auth import UserIdDep
 from api.db.database import get_db
 from api.services.notification_policy_service import NotificationPolicyService
 from api.utils import parse_uuid
 
 router = APIRouter(prefix="/v1/notifications", tags=["notifications"])
-
-
-async def _user_id(x_user_id: Annotated[str, Header()]) -> str:
-    if not x_user_id:
-        raise HTTPException(status_code=401, detail="X-User-Id header required")
-    return x_user_id
 
 
 class NotificationActionRequest(BaseModel):
@@ -58,10 +53,10 @@ class DeviceTokenRequest(BaseModel):
 @router.get("/feed")
 async def get_feed(
     request: Request,
+    user_id: UserIdDep,
     limit: int = Query(default=20, ge=1, le=100),
     cursor: Optional[str] = Query(default=None),
     since: Optional[datetime] = Query(default=None),
-    user_id: str = Depends(_user_id),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     svc = NotificationPolicyService(
@@ -75,7 +70,7 @@ async def get_feed(
 @router.post("/action")
 async def post_action(
     body: NotificationActionRequest,
-    user_id: str = Depends(_user_id),
+    user_id: UserIdDep,
     db: AsyncSession = Depends(get_db),
     idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
 ) -> dict:
@@ -106,7 +101,7 @@ async def post_action(
 @router.post("/checkin")
 async def post_checkin(
     body: NotificationCheckinRequest,
-    user_id: str = Depends(_user_id),
+    user_id: UserIdDep,
     db: AsyncSession = Depends(get_db),
     idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
 ) -> dict:
@@ -140,7 +135,7 @@ async def post_checkin(
 @router.post("/dismiss")
 async def dismiss_notification(
     body: NotificationDismissRequest,
-    user_id: str = Depends(_user_id),
+    user_id: UserIdDep,
     db: AsyncSession = Depends(get_db),
     idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
 ) -> dict:
@@ -169,7 +164,7 @@ async def dismiss_notification(
 @router.post("/device-token")
 async def register_device_token(
     body: DeviceTokenRequest,
-    user_id: str = Depends(_user_id),
+    user_id: UserIdDep,
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     uid = parse_uuid(user_id)

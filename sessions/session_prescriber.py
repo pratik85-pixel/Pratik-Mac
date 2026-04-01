@@ -37,8 +37,9 @@ PRF_CONFIRMED = "confirmed"
 # How many sessions at Stage 0 use ring_entrainment before switching to prf_discovery
 _ENTRAINMENT_SESSION_COUNT = 2
 
-# Load score above which box_breathing overrides the base prescription
-_HIGH_STRESS_LOAD_THRESHOLD = 0.65
+# Composite readiness below which box_breathing overrides (inverse of old load_score)
+_LOW_READINESS_THRESHOLD = 35.0   # ~ old load_score >= 0.65
+_MODERATE_READINESS_THRESHOLD = 60.0  # ~ old load_score >= 0.40
 
 # Default starting BPM for step-down when current BPM unknown
 _DEFAULT_STEP_DOWN_START_BPM = 12.0
@@ -54,7 +55,7 @@ def prescribe_session(
     prf_status: str,
     *,
     session_type: str               = "full",
-    load_score: float               = 0.0,
+    readiness_score: float          = 100.0,
     total_sessions_completed: int   = 0,
     stored_prf_bpm: Optional[float] = None,
     detected_current_bpm: Optional[float] = None,
@@ -73,9 +74,8 @@ def prescribe_session(
     session_type : str
         Load label from DailyPrescription. "rest" short-circuits to a
         5-minute resonance hold (or entrainment if no PRF).
-    load_score : float
-        0.0–1.0 composite stress/pressure score.
-        ≥ 0.65 overrides to box_breathing (Stage 1+).
+    readiness_score : float
+        0–100 composite (higher = more capacity). Below ~35 triggers box_breathing (Stage 1+).
     total_sessions_completed : int
         All-time sessions completed. Used to gate ring_entrainment vs prf_discovery.
     stored_prf_bpm : float | None
@@ -96,7 +96,7 @@ def prescribe_session(
         return _make_rest_session(stage, stored_prf_bpm, duration_minutes)
 
     # ── High acute stress override — box_breathing ────────────────────────────
-    if load_score >= _HIGH_STRESS_LOAD_THRESHOLD and stage >= 1:
+    if readiness_score < _LOW_READINESS_THRESHOLD and stage >= 1:
         return _make_box_session(stage, duration_minutes)
 
     # ── Stage 0: entrainment → PRF discovery ──────────────────────────────────
@@ -133,7 +133,7 @@ def prescribe_session(
 
     # ── Stage 4–5: silent meditation (fallback to resonance under load) ───────
     if stage >= 4:
-        if load_score >= 0.40:
+        if readiness_score < _MODERATE_READINESS_THRESHOLD:
             # Any meaningful load → resonance hold, not silent meditation
             return _make_resonance_session(stored_prf_bpm, stage, duration_minutes)
         return _make_silent_meditation_session(stage, stored_prf_bpm, duration_minutes)

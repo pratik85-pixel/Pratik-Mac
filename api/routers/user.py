@@ -16,11 +16,12 @@ import uuid
 import logging
 from typing import Annotated, Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from api.auth import UserIdDep
 from api.db.database import get_db
 from api.db.schema import User, UserHabits
 from api.services.model_service import ModelService
@@ -31,11 +32,6 @@ router = APIRouter(prefix="/user", tags=["user"])
 
 
 # ── Dependencies ───────────────────────────────────────────────────────────────
-
-async def _user_id(x_user_id: Annotated[str, Header()]) -> str:
-    if not x_user_id:
-        raise HTTPException(status_code=401, detail="X-User-Id header required")
-    return x_user_id
 
 async def _model_svc(db: AsyncSession = Depends(get_db)) -> ModelService:
     return ModelService(db=db)
@@ -61,7 +57,7 @@ class HabitsUpdate(BaseModel):
 
 @router.get("/profile")
 async def get_profile(
-    user_id:   str          = Depends(_user_id),
+    user_id:   UserIdDep,
     model_svc: ModelService = Depends(_model_svc),
 ) -> dict:
     """Return user identity, training level, and current archetype."""
@@ -83,7 +79,7 @@ async def get_profile(
 
 @router.get("/fingerprint")
 async def get_fingerprint(
-    user_id:   str          = Depends(_user_id),
+    user_id:   UserIdDep,
     model_svc: ModelService = Depends(_model_svc),
 ) -> dict:
     """Return the current physiological fingerprint summary (safe for display)."""
@@ -107,7 +103,7 @@ async def get_fingerprint(
 
 @router.get("/archetype")
 async def get_archetype(
-    user_id:   str          = Depends(_user_id),
+    user_id:   UserIdDep,
     model_svc: ModelService = Depends(_model_svc),
 ) -> dict:
     """
@@ -130,7 +126,7 @@ async def get_archetype(
 
 @router.get("/habits")
 async def get_habits(
-    user_id: str          = Depends(_user_id),
+    user_id: UserIdDep,
     db:      AsyncSession = Depends(get_db),
 ) -> dict:
     """Return the stored lifestyle habits profile."""
@@ -160,7 +156,7 @@ async def get_habits(
 @router.put("/habits")
 async def update_habits(
     body:    HabitsUpdate,
-    user_id: str          = Depends(_user_id),
+    user_id: UserIdDep,
     db:      AsyncSession = Depends(get_db),
 ) -> dict:
     """Replace or initialise the habits profile. Creates the user row if missing."""

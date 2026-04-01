@@ -13,13 +13,12 @@ POST /plan/trigger-today — force-regenerate today's plan
 from __future__ import annotations
 
 import logging
-from typing import Annotated
-
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from coach.plan_replanner import compute_daily_prescription
+from api.auth import UserIdDep
 from api.db.database import get_db, AsyncSessionLocal
 from api.db.schema import CheckIn
 from api.utils import parse_uuid
@@ -33,18 +32,13 @@ router = APIRouter(prefix="/plan", tags=["plan"])
 
 # ── Dependencies ───────────────────────────────────────────────────────────────
 
-async def _user_id(x_user_id: Annotated[str, Header()]) -> str:
-    if not x_user_id:
-        raise HTTPException(status_code=401, detail="X-User-Id header required")
-    return x_user_id
-
 async def _model_svc(db: AsyncSession = Depends(get_db)) -> ModelService:
     return ModelService(db=db)
 
 
 async def _tracking_svc_plan(
     request: Request,
-    user_id: str = Depends(_user_id),
+    user_id: UserIdDep,
     db: AsyncSession = Depends(get_db),
 ) -> TrackingService:
     llm_client = getattr(request.app.state, "llm_client", None)
@@ -69,7 +63,7 @@ class CheckInRequest(BaseModel):
 @router.get("/today")
 async def today_plan(
     request: Request,
-    user_id:    str              = Depends(_user_id),
+    user_id:    UserIdDep,
     model_svc:  ModelService     = Depends(_model_svc),
     db:         AsyncSession     = Depends(get_db),
     track_svc:  TrackingService  = Depends(_tracking_svc_plan),
@@ -93,7 +87,7 @@ async def today_plan(
 @router.get("/home-status")
 async def plan_home_status(
     request: Request,
-    user_id:    str              = Depends(_user_id),
+    user_id:    UserIdDep,
     model_svc:  ModelService     = Depends(_model_svc),
     db:         AsyncSession     = Depends(get_db),
     track_svc:  TrackingService  = Depends(_tracking_svc_plan),
@@ -109,7 +103,7 @@ async def plan_home_status(
 
 @router.get("/week")
 async def week_plan(
-    user_id:   str          = Depends(_user_id),
+    user_id:   UserIdDep,
     model_svc: ModelService = Depends(_model_svc),
 ) -> dict:
     """Return the weekly session target and schedule summary."""
@@ -122,14 +116,14 @@ async def week_plan(
         "session_duration_minutes": prescription.session_duration,
         "preferred_window": prescription.session_window,
         "session_intensity": prescription.session_intensity,
-        "load_score":       round(prescription.load_score * 10, 1),
+        "readiness_score":  round(prescription.readiness_score, 1),
     }
 
 
 @router.post("/check-in")
 async def check_in(
     body:    CheckInRequest,
-    user_id: str          = Depends(_user_id),
+    user_id: UserIdDep,
     db:      AsyncSession = Depends(get_db),
 ) -> dict:
     """
@@ -161,7 +155,7 @@ async def check_in(
 @router.post("/trigger-today")
 async def trigger_today_plan(
     request: Request,
-    user_id:    str              = Depends(_user_id),
+    user_id:    UserIdDep,
     model_svc:  ModelService     = Depends(_model_svc),
     db:         AsyncSession     = Depends(get_db),
     track_svc:  TrackingService  = Depends(_tracking_svc_plan),
@@ -187,7 +181,7 @@ async def trigger_today_plan(
 @router.patch("/items/{slug}/complete")
 async def complete_plan_item(
     slug:      str,
-    user_id:   str          = Depends(_user_id),
+    user_id:   UserIdDep,
     model_svc: ModelService = Depends(_model_svc),
     db:        AsyncSession = Depends(get_db),
 ) -> dict:

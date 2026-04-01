@@ -82,7 +82,7 @@ class SessionService:
 
     def __init__(self) -> None:
         self._sessions: dict[str, LiveSession] = {}
-        self._outcomes: dict[str, SessionOutcome] = {}   # outcome cache post-end
+        self._outcomes: dict[str, tuple[str, SessionOutcome]] = {}   # (owner_user_id, outcome) cache post-end
         self._window_beats = _cfg.MIN_BEATS_PER_WINDOW
         self._window_s     = _cfg.WINDOW_SECONDS
         self._hop_s        = _cfg.WINDOW_SECONDS - _cfg.WINDOW_OVERLAP_SECONDS
@@ -105,9 +105,17 @@ class SessionService:
     def end_session(
         self,
         session_id: str,
+        user_id: Optional[str] = None,
         morning_rmssd_ms: Optional[float] = None,
         personal_floor_rmssd: Optional[float] = None,
     ) -> Optional[SessionOutcome]:
+        owner = self.get_active_session_owner(session_id)
+        if owner is None:
+            return None
+        if user_id is not None and owner != user_id:
+            logger.warning("session_end_forbidden session=%s owner=%s caller=%s", session_id, owner, user_id)
+            return None
+
         live = self._sessions.pop(session_id, None)
         if live is None:
             return None
@@ -149,7 +157,7 @@ class SessionService:
             len(live.coherence_windows), int(duration_s / 60),
         )
         # Cache for post-session coach retrieval (coach router calls get_cached_outcome)
-        self._outcomes[session_id] = outcome
+        self._outcomes[session_id] = (live.user_id, outcome)
         return outcome
 
     # ── Real-time PPI ingestion ────────────────────────────────────────────────
@@ -159,6 +167,7 @@ class SessionService:
         session_id:   str,
         ppi_ms:       list[float],
         timestamps_s: list[float],
+        user_id: Optional[str] = None,
     ) -> Optional[LiveMetrics]:
         """
         Accept a batch of raw PPI values and their timestamps.
@@ -168,6 +177,9 @@ class SessionService:
         """
         live = self._sessions.get(session_id)
         if live is None:
+            return None
+        if user_id is not None and live.user_id != user_id:
+            logger.warning("ingest_ppi_forbidden session=%s owner=%s caller=%s", session_id, live.user_id, user_id)
             return None
 
         live.ppi_ms.extend(ppi_ms)
@@ -230,16 +242,32 @@ class SessionService:
         )
         return live.last_metrics
 
-    def get_live_metrics(self, session_id: str) -> Optional[LiveMetrics]:
+    def get_live_metrics(self, session_id: str, user_id: Optional[str] = None) -> Optional[LiveMetrics]:
         live = self._sessions.get(session_id)
-        return live.last_metrics if live else None
+        if live is None:
+            return None
+        if user_id is not None and live.user_id != user_id:
+            logger.warning("get_live_metrics_forbidden session=%s owner=%s caller=%s", session_id, live.user_id, user_id)
+            return None
+        return live.last_metrics
 
     def is_active(self, session_id: str) -> bool:
         return session_id in self._sessions
 
+    def get_active_session_owner(self, session_id: str) -> Optional[str]:
+        live = self._sessions.get(session_id)
+        return live.user_id if live else None
+
     def active_count(self) -> int:
         return len(self._sessions)
 
-    def get_cached_outcome(self, session_id: str) -> Optional[SessionOutcome]:
+    def get_cached_outcome(self, session_id: str, *, user_id: Optional[str] = None) -> Optional[SessionOutcome]:
         """Return the cached SessionOutcome after end_session() is called."""
-        return self._outcomes.get(session_id)
+        item = self._outcomes.get(session_id)
+        if item is None:
+            return None
+        owner, outcome = item
+        if user_id is not None and owner != user_id:
+            logger.warning("get_cached_outcome_forbidden session=%s owner=%s caller=%s", session_id, owner, user_id)
+            return None
+        return outcome

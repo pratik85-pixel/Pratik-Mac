@@ -32,6 +32,8 @@ class Settings(BaseSettings):
     DATABASE_SYNC_URL: str = (
         "postgresql+psycopg2://zenflow:zenflow@localhost:5432/zenflow_dev"
     )
+    DB_POOL_SIZE: int = 10
+    DB_MAX_OVERFLOW: int = 20
 
     @field_validator("DATABASE_URL", mode="before")
     @classmethod
@@ -79,6 +81,12 @@ class Settings(BaseSettings):
     # ── Feature flags ──────────────────────────────────────────────────────────
     ENABLE_WEBSOCKET: bool = True
     ENABLE_CONVERSATION: bool = True
+    ENABLE_ADMIN_ENDPOINTS: bool = False
+    ADMIN_API_KEY: str = ""
+    ENABLE_JWT_AUTH: bool = False
+    JWT_ISSUER: str = ""
+    JWT_AUDIENCE: str = ""
+    JWT_JWKS_URL: str = ""
 
     # ── Live-session processing windows ───────────────────────────────────────
     WINDOW_SECONDS: int = 60          # coherence analysis window duration

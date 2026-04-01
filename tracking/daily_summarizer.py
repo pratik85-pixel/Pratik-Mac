@@ -18,8 +18,10 @@ Formulas ("Credit Card" model):
         This eliminates the structural scoring cap caused by the baseline not
         being at the midpoint of floor and ceiling.
 
-        cap_stress   = ln(morning_avg / floor)   × 960   min  (downward log-range × waking day)
-        cap_recovery = ln(ceiling / morning_avg) × 1440  min  (upward  log-range × full day)
+        cap_stress   = ln(morning_avg / floor)   × 960   min  (waking stress budget)
+        cap_recovery = ln(ceiling / morning_avg) × 1440  min  (legacy net_balance recovery leg only)
+
+        Sleep recovery display uses ln(sleep_ceiling / sleep_avg) × 480 — same log structure as waking.
 
         personal_floor and personal_ceiling are FROZEN calibration snapshots.
 
@@ -132,7 +134,7 @@ class DailySummaryResult:
     is_partial_data:      bool = False          # True if >2h gap in background stream
 
     # ── Sleep scoring v2: recovery denominator ────────────────────
-    ns_capacity_recovery_used:    float = 0.0   # denominator used for recovery score (range × 1440)
+    ns_capacity_recovery_used:    float = 0.0   # legacy net_balance recovery denominator (range × 1440)
 
     # ── Top contributors (FK stubs — filled by DB layer) ──────────
     top_stress_window_id:    Optional[str] = None
@@ -156,7 +158,7 @@ def compute_daily_summary(
     capacity_floor_used: Optional[float] = None,
     opening_balance: float = 0.0,              # carry-forward from previous closing_balance
     rmssd_sleep_avg: Optional[float] = None,   # personal median sleep RMSSD (from calibration)
-    sleep_ceiling: Optional[float] = None,     # reserved for Change 3 gate (out-of-bounds)
+    sleep_ceiling: Optional[float] = None,     # rmssd_sleep_ceiling (P90); falls back to personal_ceiling
 ) -> DailySummaryResult:
     """
     Compute the full daily summary.
@@ -241,21 +243,30 @@ def compute_daily_summary(
         personal_floor=personal_floor,
     )
 
-    # ── Sleep recovery area ────────────────────────────────────────────────────
+    # ── Sleep recovery area (log-space, consistent with stress + waking) ─────
+    sleep_cap_for_log = (
+        float(sleep_ceiling) if sleep_ceiling is not None else float(personal_ceiling)
+    )
+    log_sleep_range_for_display: float = 0.0
     # When rmssd_sleep_avg is available (band worn overnight + calibrated), compute
-    # sleep recovery relative to the user's personal sleep baseline.
+    # sleep recovery relative to sleep_avg → sleep_ceiling (fallback: waking ceiling).
     # Without it, fall back to stored RecoveryWindow.recovery_area values (old behaviour).
     if rmssd_sleep_avg is not None:
         actual_recovery_area_sleep = _compute_recovery_area_sleep_raw(
             windows=background_windows,
             rmssd_sleep_avg=rmssd_sleep_avg,
+            rmssd_sleep_ceiling=sleep_cap_for_log,
             window_duration=cfg.BACKGROUND_WINDOW_MINUTES,
+        )
+        log_sleep_range_for_display = math.log(
+            max(1.0, sleep_cap_for_log / max(0.001, rmssd_sleep_avg))
         )
     else:
         # Fallback: use stored RecoveryWindow values (pre-v2 behaviour, no regression)
         actual_recovery_area_sleep = sum(
             rw.recovery_area for rw in recovery_windows if rw.context == "sleep"
         )
+        log_sleep_range_for_display = log_recovery_range
     total_recovery_area = actual_recovery_area_waking + actual_recovery_area_sleep
 
     # ── Raw percentages (unbounded — do NOT clamp before net_balance) ────────
@@ -269,11 +280,11 @@ def compute_daily_summary(
 
     # ── Display scores (clamped 0–100 for UI rendering only) ─────────────────
     # Separate denominators per score type now that each is a standalone metric:
-    #   waking_recovery_score → denominator = log_range × 960  (16-hr waking day)
-    #   sleep_recovery_score  → denominator = log_range × 480  (8-hr sleep period)
+    #   waking_recovery_score → ln(ceiling/morning_avg) × 960
+    #   sleep_recovery_score  → ln(sleep_ceiling/sleep_avg) × 480
     # net_balance uses ns_capacity_recovery (1440) unchanged for backward compat.
     ns_capacity_waking_display = log_recovery_range * cfg.DAILY_CAPACITY_WAKING_MINUTES   # 960
-    ns_capacity_sleep_display  = log_recovery_range * cfg.DAILY_CAPACITY_SLEEP_MINUTES     # 480
+    ns_capacity_sleep_display = log_sleep_range_for_display * cfg.DAILY_CAPACITY_SLEEP_MINUTES  # 480
     stress_load: Optional[float] = None
     waking_recovery_score: Optional[float] = None
     sleep_recovery_score: Optional[float] = None
@@ -440,28 +451,26 @@ def _compute_suppression_area(
 def _compute_recovery_area_sleep_raw(
     windows: list[BackgroundWindowResult],
     rmssd_sleep_avg: float,
+    rmssd_sleep_ceiling: float,
     window_duration: int,
 ) -> float:
     """
-    Compute sleep recovery area using the user's personal sleep RMSSD baseline.
+    Compute sleep recovery area using log-space (consistent with waking recovery).
 
-    Only counts windows where context == "sleep". No wake_ts/sleep_ts time gate
-    is applied — sleep windows are already correctly contextualised by the tagging
-    pipeline before reaching this function.
+    Only counts windows where context == "sleep".
 
-    credit_area = Σ max(0, rmssd_ms - rmssd_sleep_avg) × window_duration
-    for all valid sleep windows above the personal sleep baseline.
-
-    A night where RMSSD sits at the user's typical sleep level contributes zero
-    credit — credit is only earned when sleep quality exceeds the baseline.
-    A poor night where RMSSD falls below baseline contributes zero here (the
-    deficit shows in reduced total_recovery_area → lower recovery_pct_raw).
+    credit_area = Σ max(0, ln(rmssd_eff / rmssd_sleep_avg)) × window_duration
+    where rmssd_eff = min(rmssd_ms, rmssd_sleep_ceiling).
     """
     total = 0.0
     for w in windows:
         if not w.is_valid or w.context != "sleep" or w.rmssd_ms is None:
             continue
-        total += max(0.0, w.rmssd_ms - rmssd_sleep_avg) * window_duration
+        eff = min(float(w.rmssd_ms), float(rmssd_sleep_ceiling))
+        if eff <= 0 or rmssd_sleep_avg <= 0:
+            continue
+        ratio = eff / rmssd_sleep_avg
+        total += max(0.0, math.log(ratio)) * window_duration
     return total
 
 

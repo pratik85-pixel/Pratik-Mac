@@ -1,8 +1,11 @@
 """
-Phase 3B — Plan prescriber readiness (explicit contract).
+Phase 3B — Composite readiness + plan day typing (explicit contract).
 
-This is **not** the same as intraday ``net_balance`` / locked display metrics.
-It is the coach.plan_replanner load_score mapped to 0–100 for DailyPlan.
+Composite readiness is computed from yesterday's display metrics (waking recovery,
+sleep recovery, stress load) and stored on ``DailyStressSummary.readiness_score``.
+
+Plan prescriber and DailyPlan use this 0–100 score directly — not an internal
+``load_score`` mapping.
 
 Tracking summaries may expose ``net_balance`` / waking recovery etc. under
 ``METRICS_CONTRACT_ID``; plan rows expose ``readiness_formula_id`` below.
@@ -10,27 +13,51 @@ Tracking summaries may expose ``net_balance`` / waking recovery etc. under
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Literal, Optional
 
 from tracking.locked_metrics_contract import METRICS_CONTRACT_ID
 
-# Bump only if the mapping from load_score → readiness or day_type thresholds change.
-PLAN_READINESS_FORMULA_ID = "plan_load_inverse_v1"
+# Bump when weights, thresholds, or composite formula change.
+PLAN_READINESS_FORMULA_ID = "composite_readiness_v2"
 
-PlanDayType = Literal["green", "yellow", "red"]
-
-
-def plan_readiness_from_load_score(load_score: float) -> float:
-    """Map plan_replanner load_score (0–1, higher = more pressured) to 0–100 readiness."""
-    return round((1.0 - min(float(load_score), 1.0)) * 100, 1)
+PlanDayType = Literal["green", "yellow", "relaxed", "red"]
 
 
-def plan_day_type_from_load_score(load_score: float) -> PlanDayType:
-    ls = float(load_score)
-    if ls < 0.35:
+def compute_composite_readiness(
+    waking_recovery: Optional[float],
+    sleep_recovery: Optional[float],
+    stress_load_0_10: Optional[float],
+) -> Optional[float]:
+    """
+    Combine yesterday's three display scores into a 0–100 readiness for today.
+
+    stress_load_0_10: stress on the same 0–10 scale shown in the app
+    (DailyStressSummary.stress_load_score is stored 0–100 → divide by 10).
+
+    v2 weights (sleep-first): 0.45×sleep + 0.30×waking + 0.25×(10−stress)×10.
+    Natural range [0, 100] when inputs are in range; clamped defensively.
+    """
+    if waking_recovery is None or stress_load_0_10 is None:
+        return None
+    try:
+        w = float(waking_recovery)
+        s = float(sleep_recovery) if sleep_recovery is not None else 0.0
+        stress = max(0.0, min(10.0, float(stress_load_0_10)))
+        raw = 0.45 * s + 0.30 * w + 0.25 * (10.0 - stress) * 10.0
+        return round(max(0.0, min(100.0, raw)), 1)
+    except (TypeError, ValueError):
+        return None
+
+
+def day_type_from_readiness(readiness: float) -> PlanDayType:
+    """Map composite readiness (0–100) to plan / coach day label (4 tiers)."""
+    r = float(readiness)
+    if r > 75:
         return "green"
-    if ls < 0.65:
+    if r >= 50:
         return "yellow"
+    if r >= 25:
+        return "relaxed"
     return "red"
 
 

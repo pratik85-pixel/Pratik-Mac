@@ -52,6 +52,7 @@ async def stream_endpoint(websocket: WebSocket) -> None:
     svc: SessionService = _get_session_service(websocket)
 
     session_id: Optional[str] = None
+    user_id: Optional[str] = None
     handshake_done = False
 
     try:
@@ -71,16 +72,24 @@ async def stream_endpoint(websocket: WebSocket) -> None:
                     continue
 
                 session_id = msg.get("session_id")
-                if not session_id or not svc.is_active(session_id):
+                user_id = msg.get("user_id")
+                if not session_id or not user_id or not svc.is_active(session_id):
                     await websocket.send_json({
                         "type":   "error",
-                        "detail": "unknown session_id — call POST /session/start first",
+                        "detail": "valid user_id + session_id required",
+                    })
+                    continue
+                owner = svc.get_active_session_owner(session_id)
+                if owner != user_id:
+                    await websocket.send_json({
+                        "type": "error",
+                        "detail": "session does not belong to this user",
                     })
                     continue
 
                 handshake_done = True
                 await websocket.send_json({"type": "ack", "session_id": session_id})
-                logger.info("ws_handshake session=%s", session_id)
+                logger.info("ws_handshake session=%s user=%s", session_id, user_id)
                 continue
 
             # ── PPI batch ─────────────────────────────────────────────────────
@@ -99,7 +108,13 @@ async def stream_endpoint(websocket: WebSocket) -> None:
                     })
                     continue
 
-                metrics = svc.ingest_ppi(session_id, ppi_ms, timestamps_s)
+                metrics = await asyncio.to_thread(
+                    svc.ingest_ppi,
+                    session_id,
+                    ppi_ms,
+                    timestamps_s,
+                    user_id,
+                )
                 if metrics is None:
                     await websocket.send_json({"type": "error", "detail": "session not found"})
                     continue

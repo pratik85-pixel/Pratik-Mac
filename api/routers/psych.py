@@ -12,12 +12,13 @@ POST /psych/rebuild            — trigger full profile recompute
 from __future__ import annotations
 
 import logging
-from typing import Annotated, Optional
+from typing import Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from api.auth import UserIdDep
 from api.db.database import get_db
 from api.utils import parse_uuid
 from api.services.psych_service import (
@@ -33,12 +34,6 @@ router = APIRouter(prefix="/psych", tags=["psych"])
 
 
 # ── Dependencies ───────────────────────────────────────────────────────────────
-
-async def _user_id(x_user_id: Annotated[str, Header()]) -> str:
-    if not x_user_id:
-        raise HTTPException(status_code=401, detail="X-User-Id header required")
-    return x_user_id
-
 
 # ── Request / response models ──────────────────────────────────────────────────
 
@@ -114,7 +109,7 @@ class RebuildResponse(BaseModel):
 
 @router.get("/profile", response_model=PsychProfileResponse)
 async def get_psych_profile(
-    user_id: str = Depends(_user_id),
+    user_id: UserIdDep,
     db: AsyncSession = Depends(get_db),
 ) -> PsychProfileResponse:
     """
@@ -161,7 +156,7 @@ async def get_psych_profile(
 @router.post("/mood", response_model=MoodLogResponse, status_code=201)
 async def post_mood_log(
     body: MoodLogRequest,
-    user_id: str = Depends(_user_id),
+    user_id: UserIdDep,
     db: AsyncSession = Depends(get_db),
 ) -> MoodLogResponse:
     """
@@ -192,7 +187,7 @@ async def post_mood_log(
 @router.post("/anxiety", response_model=AnxietyEventResponse, status_code=201)
 async def post_anxiety_event(
     body: AnxietyEventRequest,
-    user_id: str = Depends(_user_id),
+    user_id: UserIdDep,
     db: AsyncSession = Depends(get_db),
 ) -> AnxietyEventResponse:
     """
@@ -225,7 +220,7 @@ async def post_anxiety_event(
 
 @router.post("/rebuild", response_model=RebuildResponse)
 async def post_rebuild_profile(
-    user_id: str = Depends(_user_id),
+    user_id: UserIdDep,
     db: AsyncSession = Depends(get_db),
 ) -> RebuildResponse:
     """

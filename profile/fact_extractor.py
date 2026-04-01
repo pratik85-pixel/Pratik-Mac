@@ -98,6 +98,18 @@ _PREFERENCE_PATTERNS: list[tuple[str, str, re.Pattern, str, str]] = [
     ("likes_running", "positive",
      re.compile(r"\b(?:love|enjoy|like)\s+running\b", re.I),
      "activity.running", "like"),
+    ("likes_reading", "positive",
+     re.compile(r"\b(?:love|enjoy|like)\s+(?:reading|books?)\b", re.I),
+     "activity.reading", "like"),
+    ("likes_yoga", "positive",
+     re.compile(r"\b(?:love|enjoy|like)\s+(?:yoga|pilates)\b", re.I),
+     "activity.yoga", "like"),
+    ("likes_swimming", "positive",
+     re.compile(r"\b(?:love|enjoy|like)\s+swimming\b", re.I),
+     "activity.swimming", "like"),
+    ("likes_cycling", "positive",
+     re.compile(r"\b(?:love|enjoy|like)\s+(?:cycling|biking)\b", re.I),
+     "activity.cycling", "like"),
     ("bad_knees", "negative",
      re.compile(r"\bbad\s+(?:knee|knees)\b", re.I),
      "health.knees", "injury"),
@@ -283,6 +295,46 @@ def extract_facts(message: str) -> list[ExtractedFact]:
             if is_confirmation:
                 f.confidence = 0.9
             facts.append(f)
+
+    # Broad preference catch-alls (only if no preference hit above — avoids duplicating "I enjoy reading")
+    if not any(f.category == "preference" for f in facts):
+        _gen_like = re.compile(
+            r"\bI\s+(?:really\s+)?(?:enjoy|love)\s+([a-z][a-zA-Z\s]{2,40}?)(?:[.,]|$|\s+when|\s+but)\b",
+            re.I,
+        )
+        m = _gen_like.search(message)
+        if m:
+            thing = m.group(1).strip()[:80]
+            if len(thing) >= 2:
+                facts.append(
+                    ExtractedFact(
+                        category="preference",
+                        fact_text=f"enjoys {thing}",
+                        fact_key="activity.general_like",
+                        fact_value=thing,
+                        polarity="positive",
+                        confidence=0.45,
+                    )
+                )
+        else:
+            _gen_dislike = re.compile(
+                r"\b(?:don'?t\s+like|not\s+a\s+fan\s+of|hate)\s+([a-z][a-zA-Z\s]{2,50}?)(?:[.,]|$|\s+because)\b",
+                re.I,
+            )
+            m2 = _gen_dislike.search(message)
+            if m2:
+                thing2 = m2.group(1).strip()[:80]
+                if len(thing2) >= 2:
+                    facts.append(
+                        ExtractedFact(
+                            category="preference",
+                            fact_text=f"doesn't prefer {thing2}",
+                            fact_key="activity.general_dislike",
+                            fact_value=thing2,
+                            polarity="negative",
+                            confidence=0.45,
+                        )
+                    )
 
     return facts
 

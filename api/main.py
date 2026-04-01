@@ -18,6 +18,7 @@ Run locally:
 from __future__ import annotations
 
 import logging
+from time import perf_counter
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
@@ -44,6 +45,7 @@ from api.routers import (
 from api.services.session_service import SessionService
 from api.services.coach_service import CoachService
 from api.services.conversation_service import ConversationService
+from api.observability.request_metrics import get_db_query_count, reset_request_metrics
 
 try:
     from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -171,6 +173,22 @@ def create_app() -> FastAPI:
         allow_headers     = ["*"],
     )
 
+    @app.middleware("http")
+    async def _request_timing_middleware(request: Request, call_next):
+        reset_request_metrics()
+        started = perf_counter()
+        response = await call_next(request)
+        duration_ms = (perf_counter() - started) * 1000.0
+        logger.info(
+            "request_timing method=%s path=%s status=%s duration_ms=%.2f db_queries=%d",
+            request.method,
+            request.url.path,
+            response.status_code,
+            duration_ms,
+            get_db_query_count(),
+        )
+        return response
+
     # ── Routers ───────────────────────────────────────────────────────────────
     if _cfg.ENABLE_WEBSOCKET:
         app.include_router(stream.router)
@@ -186,7 +204,8 @@ def create_app() -> FastAPI:
     app.include_router(profile.router)
     app.include_router(band_sessions.router)
     app.include_router(notifications.router)
-    app.include_router(admin.router)
+    if _cfg.ENABLE_ADMIN_ENDPOINTS:
+        app.include_router(admin.router)
 
     # ── Health check ──────────────────────────────────────────────────────────
     @app.get("/health", tags=["meta"])

@@ -34,7 +34,10 @@ from typing import Optional
 
 from coach.memory_store import MemoryStore, ConversationState
 from coach.safety_filter import screen_text
-from coach.conversation_extractor import extract_signals_from_message
+from coach.conversation_extractor import (
+    ExtractionResult,
+    extract_signals_from_message,
+)
 
 
 # ── Conversation constants ────────────────────────────────────────────────────
@@ -105,6 +108,10 @@ class ConversationManager:
         """Close the session and return the final state for archiving."""
         return self._store.close_session(conversation_id)
 
+    def peek_session(self, conversation_id: str) -> Optional[ConversationState]:
+        """Return current session state without mutating (for pre-turn extraction)."""
+        return self._store.get(conversation_id)
+
     # ── Turn processing ───────────────────────────────────────────────────────
 
     def process_turn(
@@ -112,7 +119,13 @@ class ConversationManager:
         conversation_id: str,
         user_message: str,
         build_context_fn,
+        *,
+        pre_extraction: Optional[ExtractionResult] = None,
     ) -> TurnResult:
+        """
+        build_context_fn(last_user_said, conversation_summary, extracted_signals,
+                         newly_extracted_facts=None) -> CoachContext
+        """
         """
         Process a single user message and return the coach reply.
 
@@ -162,10 +175,14 @@ class ConversationManager:
             )
 
         # 2. Extract signals + facts (non-blocking — runs before LLM call)
-        extraction = extract_signals_from_message(
-            user_message,
-            existing_signals=state.accumulated_signals,
-        )
+        # Caller may pass pre_extraction (e.g. after DB persistence) to avoid duplicate work.
+        if pre_extraction is not None:
+            extraction = pre_extraction
+        else:
+            extraction = extract_signals_from_message(
+                user_message,
+                existing_signals=state.accumulated_signals,
+            )
         for label in extraction.signal_labels:
             self._store.add_signal(conversation_id, label)
         if extraction.extracted_facts:
@@ -185,10 +202,12 @@ class ConversationManager:
             )
 
         # 3. Build context (caller-provided — has access to full profile + fingerprint)
+        new_fact_texts = [f.fact_text for f in (extraction.extracted_facts or [])]
         ctx = build_context_fn(
-            last_user_said       = user_message,
-            conversation_summary = state.rolling_summary or None,
-            extracted_signals    = state.accumulated_signals,
+            last_user_said         = user_message,
+            conversation_summary   = state.rolling_summary or None,
+            extracted_signals      = state.accumulated_signals,
+            newly_extracted_facts  = new_fact_texts,
         )
 
         # 4. Generate response
@@ -242,6 +261,9 @@ class ConversationManager:
 
 # ── Close condition logic ─────────────────────────────────────────────────────
 
+_MIN_TURNS_BEFORE_LLM_CLOSE = 2  # always allow at least this many turns
+
+
 def _should_keep_open(
     state: ConversationState,
     user_message: str,
@@ -252,13 +274,13 @@ def _should_keep_open(
     if state.turn_index >= MAX_TURNS:
         return False
 
-    # LLM chose to close
-    if follow_up is None:
-        return False
-
-    # User dismissed
+    # User dismissed — always respected
     user_lower = user_message.lower().strip().rstrip("!.?")
     if user_lower in _CLOSE_KEYWORDS:
+        return False
+
+    # LLM chose to close — only honour after min turns so turn 1 never auto-closes.
+    if follow_up is None and state.turn_index >= _MIN_TURNS_BEFORE_LLM_CLOSE:
         return False
 
     return True

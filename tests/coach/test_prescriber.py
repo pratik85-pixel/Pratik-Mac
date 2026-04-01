@@ -15,6 +15,7 @@ from coach.prescriber import (
     _resolve_day_type,
     GREEN_THRESHOLD,
     YELLOW_THRESHOLD,
+    RELAXED_THRESHOLD,
     SESSION_DURATION,
 )
 
@@ -42,16 +43,20 @@ def _inputs(**overrides) -> PrescriberInputs:
 
 class TestResolveDayType:
     def test_green(self):
-        assert _resolve_day_type(75.0, "yellow") == "green"
+        assert _resolve_day_type(76.0, "yellow") == "green"
 
     def test_yellow(self):
         assert _resolve_day_type(55.0, "green") == "yellow"
 
-    def test_red(self):
-        assert _resolve_day_type(30.0, "green") == "red"
+    def test_relaxed(self):
+        assert _resolve_day_type(30.0, "green") == "relaxed"
 
-    def test_at_green_threshold_is_green(self):
-        assert _resolve_day_type(GREEN_THRESHOLD, "yellow") == "green"
+    def test_red(self):
+        assert _resolve_day_type(20.0, "green") == "red"
+
+    def test_at_green_threshold_is_yellow(self):
+        # Strict: only > GREEN_THRESHOLD is green
+        assert _resolve_day_type(GREEN_THRESHOLD, "yellow") == "yellow"
 
     def test_just_below_green_is_yellow(self):
         assert _resolve_day_type(GREEN_THRESHOLD - 0.1, "green") == "yellow"
@@ -59,8 +64,14 @@ class TestResolveDayType:
     def test_at_yellow_threshold_is_yellow(self):
         assert _resolve_day_type(YELLOW_THRESHOLD, "green") == "yellow"
 
-    def test_just_below_yellow_is_red(self):
-        assert _resolve_day_type(YELLOW_THRESHOLD - 0.1, "green") == "red"
+    def test_just_below_yellow_is_relaxed(self):
+        assert _resolve_day_type(YELLOW_THRESHOLD - 0.1, "green") == "relaxed"
+
+    def test_at_relaxed_threshold_is_relaxed(self):
+        assert _resolve_day_type(RELAXED_THRESHOLD, "green") == "relaxed"
+
+    def test_just_below_relaxed_is_red(self):
+        assert _resolve_day_type(RELAXED_THRESHOLD - 0.1, "green") == "red"
 
 
 # ── Always must_do ZenFlow session ────────────────────────────────────────────
@@ -76,8 +87,13 @@ class TestZenFlowMustDo:
         slugs = [i.activity_slug for i in plan.must_do]
         assert "coherence_breathing" in slugs
 
-    def test_red_day_has_session(self):
+    def test_relaxed_day_has_session(self):
         plan = build_daily_plan(_inputs(readiness_score=30.0))
+        slugs = [i.activity_slug for i in plan.must_do]
+        assert "coherence_breathing" in slugs
+
+    def test_red_day_has_session(self):
+        plan = build_daily_plan(_inputs(readiness_score=20.0))
         slugs = [i.activity_slug for i in plan.must_do]
         assert "coherence_breathing" in slugs
 
@@ -87,7 +103,7 @@ class TestZenFlowMustDo:
         assert session.duration_min == SESSION_DURATION["green"]
 
     def test_red_session_duration_minimum(self):
-        plan = build_daily_plan(_inputs(readiness_score=30.0))
+        plan = build_daily_plan(_inputs(readiness_score=20.0))
         session = next(i for i in plan.must_do if i.activity_slug == "coherence_breathing")
         assert session.duration_min == SESSION_DURATION["red"]
         assert session.duration_min == 5
@@ -159,7 +175,7 @@ class TestYellowDayPlan:
 class TestRedDayPlan:
     def test_red_day_recommended_is_rest(self):
         plan = build_daily_plan(_inputs(
-            readiness_score=30.0,
+            readiness_score=20.0,
             decompress_via=["entertainment"],
         ))
         assert plan.day_type == "red"
@@ -167,12 +183,12 @@ class TestRedDayPlan:
         assert plan.recommended[0].reason_code == "genuine_rest_red"
 
     def test_red_day_no_optional(self):
-        plan = build_daily_plan(_inputs(readiness_score=30.0))
+        plan = build_daily_plan(_inputs(readiness_score=20.0))
         assert plan.optional == []
 
     def test_red_day_uses_decompress_preference(self):
         plan = build_daily_plan(_inputs(
-            readiness_score=30.0,
+            readiness_score=20.0,
             decompress_via=["cold_shower"],
         ))
         assert plan.recommended[0].activity_slug == "cold_shower"
@@ -233,8 +249,8 @@ class TestPlanSerialisation:
         assert "must_do" in priorities
 
     def test_plan_metadata(self):
-        plan = build_daily_plan(_inputs(readiness_score=75.0, stage=2))
+        plan = build_daily_plan(_inputs(readiness_score=76.0, stage=2))
         assert plan.stage == 2
         assert plan.plan_date == "2026-03-10"
         assert plan.day_type == "green"
-        assert plan.readiness == 75.0
+        assert plan.readiness == 76.0

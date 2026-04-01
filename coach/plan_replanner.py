@@ -12,14 +12,13 @@ Design:
     it only translates the reason_tag into human language.
 
     The `stage_focus` from NSHealthProfile is the structural ceiling.
-    The current state (load_score) is the floor.
-    The prescription lives between them.
+    Composite readiness (0–100, from DailyStressSummary) is the floor.
 
-Load score:
-    A composite 0.0–1.0 pressure index computed from stacked lifestyle signals.
-    ≥ 0.65 → rest
-    ≥ 0.40 → breathing_only
-    else   → stage-appropriate at adjusted intensity
+Readiness tiers (0–100):
+    > 75   → full stage-appropriate session
+    50–75  → reduced session
+    25–50  → breathing-only / minimal
+    < 25   → rest
 
 Habit event types accepted:
     "alcohol"             — drink event (severity: light | moderate | heavy)
@@ -37,11 +36,9 @@ References:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
 from typing import Optional
 
 from archetypes.scorer import NSHealthProfile
-from sessions.practice_registry import VALID_PRACTICE_TYPES
 
 
 # ── Output type ───────────────────────────────────────────────────────────────
@@ -59,7 +56,7 @@ class DailyPrescription:
     session_intensity:  str            # "low" | "moderate" | "high"
     session_window:     str            # preferred time band, e.g. "19:00–21:00"
     physical_load:      str            # "reduce" | "maintain" | "can_increase"
-    load_score:         float          # 0.0–1.0 internal composite pressure (multiply ×10 for user-facing 0–10 display)
+    readiness_score:    float          # 0–100 composite (from DailyStressSummary)
     reason_tag:         str            # drives context template, e.g. "alcohol_recovery_compound"
     carry_forward:      bool = False   # missed session that should be carried to tomorrow
     notes:              list[str] = field(default_factory=list)  # optional coach notes
@@ -81,6 +78,7 @@ class HabitSignal:
 
 def compute_daily_prescription(
     profile: NSHealthProfile,
+    readiness_score: float = 50.0,
     morning_rmssd_vs_floor: Optional[float] = None,   # e.g. 0.12 = 12% above floor
     morning_rmssd_vs_avg: Optional[float] = None,     # e.g. -0.21 = 21% below avg
     consecutive_low_reads: int = 0,
@@ -89,43 +87,22 @@ def compute_daily_prescription(
     sessions_this_week: int = 0,
 ) -> DailyPrescription:
     """
-    Compute today's DailyPrescription from current state.
+    Compute today's DailyPrescription from composite readiness + lifestyle signals.
 
-    Parameters
-    ----------
-    profile : NSHealthProfile
-        Current scoring profile — used for stage + pattern context.
-    morning_rmssd_vs_floor : float | None
-        Fractional delta vs personal floor. 0.12 = 12% above floor. None = unknown.
-    morning_rmssd_vs_avg : float | None
-        Fractional delta vs personal average. -0.21 = 21% below average. None = unknown.
-    consecutive_low_reads : int
-        How many consecutive below-floor morning reads have been recorded.
-    habit_signals : list[HabitSignal] | None
-        Recent lifestyle events (last 72 hours).
-    preferred_window_hour : int | None
-        User's best session window hour from PersonalFingerprint.
-    sessions_this_week : int
-        Sessions completed so far this week.
-
-    Returns
-    -------
-    DailyPrescription
+    readiness_score : float
+        0–100 composite from ``DailyStressSummary.readiness_score`` (yesterday's
+        stress / waking / sleep). Defaults to 50 when unknown.
     """
     signals = habit_signals or []
-
-    load_score = _compute_load_score(
-        morning_rmssd_vs_floor=morning_rmssd_vs_floor,
-        morning_rmssd_vs_avg=morning_rmssd_vs_avg,
-        consecutive_low_reads=consecutive_low_reads,
-        habit_signals=signals,
-    )
+    rs = max(0.0, min(100.0, float(readiness_score)))
 
     reason_tag = _determine_reason_tag(
-        load_score=load_score,
+        readiness_score=rs,
         habit_signals=signals,
         profile=profile,
         consecutive_low_reads=consecutive_low_reads,
+        morning_rmssd_vs_floor=morning_rmssd_vs_floor,
+        morning_rmssd_vs_avg=morning_rmssd_vs_avg,
     )
 
     session_window = _compute_session_window(
@@ -135,7 +112,7 @@ def compute_daily_prescription(
 
     return _build_prescription(
         profile=profile,
-        load_score=load_score,
+        readiness_score=rs,
         reason_tag=reason_tag,
         session_window=session_window,
         sessions_this_week=sessions_this_week,
@@ -143,92 +120,20 @@ def compute_daily_prescription(
     )
 
 
-# ── Load score ─────────────────────────────────────────────────────────────────
-
-def _compute_load_score(
-    morning_rmssd_vs_floor: Optional[float],
-    morning_rmssd_vs_avg: Optional[float],
-    consecutive_low_reads: int,
-    habit_signals: list[HabitSignal],
-) -> float:
-    """
-    Composite 0.0–1.0 pressure index.
-
-    Higher = more physiological pressure = less capacity for load today.
-
-    Weight breakdown:
-      alcohol_within_24h     0.30
-      below_floor_severity   0.35  (most sensitive personal signal)
-      consecutive_low_reads  0.20
-      weekly_load_signals    0.15
-    """
-    score = 0.0
-
-    # ── Alcohol within 24h ──────────────────────────────────────────────────
-    alcohol = [s for s in habit_signals if s.event_type == "alcohol" and s.hours_ago <= 24]
-    if alcohol:
-        worst = max(alcohol, key=lambda s: {"light": 1, "moderate": 2, "heavy": 3}.get(s.severity, 1))
-        score += 0.30 * {"light": 0.5, "moderate": 0.85, "heavy": 1.0}.get(worst.severity, 0.5)
-
-    # ── Below-floor severity ─────────────────────────────────────────────────
-    if morning_rmssd_vs_floor is not None:
-        if morning_rmssd_vs_floor < -0.20:    # > 20% below floor — very depleted
-            score += 0.35
-        elif morning_rmssd_vs_floor < -0.10:  # 10–20% below floor
-            score += 0.20
-        elif morning_rmssd_vs_floor < 0:      # marginally below floor
-            score += 0.10
-    elif morning_rmssd_vs_avg is not None:
-        # Fallback: use avg comparison if floor not available
-        if morning_rmssd_vs_avg < -0.25:
-            score += 0.25
-        elif morning_rmssd_vs_avg < -0.15:
-            score += 0.15
-
-    # ── Consecutive low reads ────────────────────────────────────────────────
-    if consecutive_low_reads >= 3:
-        score += 0.20
-    elif consecutive_low_reads == 2:
-        score += 0.12
-    elif consecutive_low_reads == 1:
-        score += 0.05
-
-    # ── Weekly load signals ──────────────────────────────────────────────────
-    stress_events = [s for s in habit_signals if s.event_type == "stressful_event"]
-    late_nights   = [s for s in habit_signals if s.event_type == "late_night" and s.hours_ago <= 48]
-    heavy_ex      = [s for s in habit_signals if s.event_type == "exercise_heavy" and s.hours_ago <= 24]
-
-    weekly_pressure = 0.0
-    if stress_events:
-        weekly_pressure += 0.5
-    if late_nights:
-        weekly_pressure += 0.3
-    if heavy_ex:
-        weekly_pressure += 0.3
-    score += 0.15 * min(1.0, weekly_pressure)
-
-    # ── Positive state override ──────────────────────────────────────────────
-    # Confirmed positive state + no alcohol/low-read signals → partial reduction
-    positive = [s for s in habit_signals if s.event_type == "positive_state"]
-    if positive and score < 0.30:
-        score *= 0.70   # reduce pressure by 30% when user explicitly reports feeling good
-
-    return round(min(1.0, score), 3)
-
-
 # ── Reason tag ─────────────────────────────────────────────────────────────────
 
 def _determine_reason_tag(
-    load_score: float,
+    readiness_score: float,
     habit_signals: list[HabitSignal],
     profile: NSHealthProfile,
     consecutive_low_reads: int,
+    morning_rmssd_vs_floor: Optional[float],
+    morning_rmssd_vs_avg: Optional[float],
 ) -> str:
     """
     Derive the reason_tag that context_builder uses to populate the coaching explanation.
 
-    The tag is a specific identifier — not a generic label.
-    The LLM translates it; never invents the reason.
+    Uses habit stacking first; then readiness tiers (inverse of old load_score).
     """
     has_alcohol = any(s.event_type == "alcohol" and s.hours_ago <= 24 for s in habit_signals)
     has_stress  = any(s.event_type == "stressful_event" for s in habit_signals)
@@ -259,10 +164,18 @@ def _determine_reason_tag(
         return "post_exercise_recovery"
     if has_missed:
         return "carry_forward_session"
-    if load_score < 0.15:
+
+    # Readiness-first tags (0–100, higher is better)
+    if readiness_score > 85:
         return "optimal_state"
-    if load_score < 0.35:
+    if readiness_score > 65:
         return "stage_progression"
+
+    # Morning RMSSD depletion hints when readiness is ambiguous
+    if morning_rmssd_vs_floor is not None and morning_rmssd_vs_floor < -0.15:
+        return "morning_depletion"
+    if morning_rmssd_vs_avg is not None and morning_rmssd_vs_avg < -0.20:
+        return "morning_depletion"
 
     return f"stage_{profile.stage}_standard"
 
@@ -271,51 +184,50 @@ def _determine_reason_tag(
 
 def _build_prescription(
     profile: NSHealthProfile,
-    load_score: float,
+    readiness_score: float,
     reason_tag: str,
     session_window: str,
     sessions_this_week: int,
     habit_signals: list[HabitSignal],
 ) -> DailyPrescription:
     """
-    Map load_score + stage + signals → DailyPrescription.
-
-    The stage_focus from NSHealthProfile is the direction (what we're building).
-    The load_score determines how much of it the body can accept today.
+    Map readiness_score (0–100) + stage + signals → DailyPrescription.
     """
     missed = any(s.event_type == "missed_session" for s in habit_signals)
     positive = any(s.event_type == "positive_state" for s in habit_signals)
     stage = profile.stage
+    rs = readiness_score
 
-    # ── High pressure: rest or minimal ────────────────────────────────────────
-    if load_score >= 0.65:
+    # ── Very low readiness: rest ───────────────────────────────────────────────
+    if rs < 25:
         return DailyPrescription(
             session_type      = "rest",
             session_duration  = 0,
             session_intensity = "low",
             session_window    = session_window,
             physical_load     = "reduce",
-            load_score        = load_score,
+            readiness_score   = rs,
             reason_tag        = reason_tag,
             carry_forward     = sessions_this_week < _weekly_target(stage),
             notes             = ["Body is in active recovery. Rest is the prescription."],
         )
 
-    if load_score >= 0.40:
+    # ── Low–moderate readiness: breathing only ─────────────────────────────────
+    if rs < 50:
         return DailyPrescription(
             session_type      = "breathing_only",
             session_duration  = 10,
             session_intensity = "low",
             session_window    = session_window,
             physical_load     = "reduce",
-            load_score        = load_score,
+            readiness_score   = rs,
             reason_tag        = reason_tag,
             carry_forward     = sessions_this_week < _weekly_target(stage),
             notes             = ["Minimum effective dose — breathing only, no physical load."],
         )
 
-    # ── Moderate pressure: reduced version of stage plan ─────────────────────
-    if load_score >= 0.20:
+    # ── Mid readiness: reduced stage plan ──────────────────────────────────────
+    if rs < 75:
         base_dur, base_int = _stage_base(stage)
         return DailyPrescription(
             session_type      = "full" if stage >= 2 else "breathing_only",
@@ -323,14 +235,13 @@ def _build_prescription(
             session_intensity = "low",
             session_window    = session_window,
             physical_load     = "maintain",
-            load_score        = load_score,
+            readiness_score   = rs,
             reason_tag        = reason_tag,
         )
 
-    # ── Low pressure: full stage plan ────────────────────────────────────────
+    # ── High readiness: full stage plan ────────────────────────────────────────
     base_dur, base_int = _stage_base(stage)
 
-    # Green + positive → can increase if capacity present
     if positive and profile.recovery_capacity >= 12 and profile.load_management >= 12:
         physical_load = "can_increase"
     else:
@@ -342,7 +253,7 @@ def _build_prescription(
         session_intensity = base_int,
         session_window    = session_window,
         physical_load     = physical_load,
-        load_score        = load_score,
+        readiness_score   = rs,
         reason_tag        = reason_tag,
         notes             = (["Carry-forward from missed session."] if missed else []),
     )

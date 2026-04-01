@@ -347,14 +347,14 @@ class TestSessionPrescriber:
         session = prescribe_session(
             stage=1, prf_status=PRF_FOUND,
             stored_prf_bpm=6.5,
-            load_score=0.20,
+            readiness_score=80.0,
         )
         assert session.practice_type == "resonance_hold"
 
     def test_high_stress_stage_1_gives_box(self):
         session = prescribe_session(
             stage=1, prf_status=PRF_FOUND,
-            load_score=0.75,
+            readiness_score=25.0,
         )
         assert session.practice_type == "box_breathing"
 
@@ -362,7 +362,7 @@ class TestSessionPrescriber:
         """Stage 0 should never receive box_breathing — gates don't apply yet."""
         session = prescribe_session(
             stage=0, prf_status=PRF_UNKNOWN,
-            load_score=0.90,
+            readiness_score=10.0,
             total_sessions_completed=5,
         )
         assert session.practice_type != "box_breathing"
@@ -371,7 +371,7 @@ class TestSessionPrescriber:
         session = prescribe_session(
             stage=2, prf_status=PRF_CONFIRMED,
             stored_prf_bpm=6.5,
-            load_score=0.20,
+            readiness_score=80.0,
         )
         assert session.practice_type == "plexus_hold"
 
@@ -387,7 +387,7 @@ class TestSessionPrescriber:
         session = prescribe_session(
             stage=4, prf_status=PRF_CONFIRMED,
             stored_prf_bpm=6.0,
-            load_score=0.10,
+            readiness_score=90.0,
         )
         assert session.practice_type == "silent_meditation"
 
@@ -396,7 +396,7 @@ class TestSessionPrescriber:
         session = prescribe_session(
             stage=4, prf_status=PRF_CONFIRMED,
             stored_prf_bpm=6.0,
-            load_score=0.45,
+            readiness_score=55.0,
         )
         assert session.practice_type == "resonance_hold"
 
@@ -436,7 +436,7 @@ class TestSessionPrescriber:
         session = prescribe_session(
             stage=4, prf_status=PRF_CONFIRMED,
             stored_prf_bpm=6.0,
-            load_score=0.0,
+            readiness_score=100.0,
         )
         assert session.pacer is None
 

@@ -25,7 +25,7 @@ import logging
 import json
 import re
 import uuid
-from datetime import date, datetime, UTC
+from datetime import date, datetime, timedelta, UTC
 from typing import Any, Optional
 
 from sqlalchemy import select
@@ -33,6 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.db.schema import (
     DailyPlan as DailyPlanRow,
+    DailyStressSummary,
     PlanDeviation,
     UserHabits,
     HabitEvent,
@@ -49,9 +50,9 @@ from coach.prescriber import (
 from api.services.profile_service import load_unified_profile
 from tracking.cycle_boundaries import local_today
 from tracking.plan_readiness_contract import (
+    compute_composite_readiness,
+    day_type_from_readiness,
     plan_api_contract_metadata,
-    plan_day_type_from_load_score,
-    plan_readiness_from_load_score,
 )
 
 logger = logging.getLogger(__name__)
@@ -279,7 +280,7 @@ class PlanService:
             for it in avoid_items[:2]:
                 if not isinstance(it, dict):
                     continue
-                slug_or_label = it.get("slug_or_label")
+                slug_or_label = it.get("slug_or_label") or it.get("label")
                 reason = it.get("reason")
                 if not slug_or_label or not reason:
                     continue
@@ -521,9 +522,45 @@ class PlanService:
 
         from coach.plan_replanner import compute_daily_prescription
 
-        prescription = compute_daily_prescription(profile)
-        readiness = plan_readiness_from_load_score(prescription.load_score)
-        day_type = plan_day_type_from_load_score(prescription.load_score)
+        readiness = 50.0
+        if uid is not None:
+            today_dt = datetime(today.year, today.month, today.day, tzinfo=UTC)
+            day_end = today_dt + timedelta(days=1)
+            ds_res = await self._db.execute(
+                select(DailyStressSummary).where(
+                    DailyStressSummary.user_id == uid,
+                    DailyStressSummary.summary_date >= today_dt,
+                    DailyStressSummary.summary_date < day_end,
+                )
+            )
+            t_row = ds_res.scalar_one_or_none()
+            if t_row is not None and t_row.readiness_score is not None:
+                readiness = float(t_row.readiness_score)
+            else:
+                y = today - timedelta(days=1)
+                y_start = datetime(y.year, y.month, y.day, tzinfo=UTC)
+                y_end = y_start + timedelta(days=1)
+                y_res = await self._db.execute(
+                    select(DailyStressSummary).where(
+                        DailyStressSummary.user_id == uid,
+                        DailyStressSummary.summary_date >= y_start,
+                        DailyStressSummary.summary_date < y_end,
+                    )
+                )
+                y_row = y_res.scalar_one_or_none()
+                if y_row is not None:
+                    cr = compute_composite_readiness(
+                        y_row.waking_recovery_score,
+                        getattr(y_row, "sleep_recovery_score", None),
+                        float(y_row.stress_load_score) / 10.0
+                        if y_row.stress_load_score is not None
+                        else None,
+                    )
+                    if cr is not None:
+                        readiness = cr
+
+        prescription = compute_daily_prescription(profile, readiness_score=readiness)
+        day_type = day_type_from_readiness(readiness)
 
         return PrescriberInputs(
             stage=profile.stage,
