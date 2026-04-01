@@ -40,6 +40,7 @@ import asyncio
 import json
 import logging
 import re
+import inspect
 import uuid as uuid_mod
 from datetime import UTC, date, datetime
 from typing import Any, Callable, Optional
@@ -102,7 +103,9 @@ async def clear_morning_bundle_uup(
             avoid_items_json=[],
             plan_generated_for_date=None,
         )
-        session.add(uup)
+        res = session.add(uup)
+        if inspect.isawaitable(res):
+            await res
     else:
         uup.morning_brief_text = None
         uup.morning_brief_day_state = None

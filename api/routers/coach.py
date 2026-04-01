@@ -126,6 +126,14 @@ class NightClosureResponse(BaseModel):
     tomorrow_seed:     str
 
 
+class YesterdaySummaryResponse(BaseModel):
+    weekly_trend:       Optional[str]
+    yesterday_stress:   Optional[str]
+    yesterday_recovery: Optional[str]
+    yesterday_adherence: Optional[str]
+    generated_for:      Optional[str]   # YYYY-MM-DD
+    is_stale:           bool
+
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 
 async def _gated_nudge_decision(
@@ -432,6 +440,75 @@ async def get_morning_brief(
         avoid_items    = avoid,
     )
 
+
+@router.get("/yesterday-summary", response_model=YesterdaySummaryResponse)
+async def get_yesterday_summary(
+    request: Request,
+    user_id: UserIdDep,
+    db:      AsyncSession = Depends(get_db),
+    track_svc: TrackingService = Depends(_tracking_svc_coach),
+) -> YesterdaySummaryResponse:
+    """
+    Return cached \"Yesterday summary\" for the current IST cycle.
+
+    Generated best-effort and cached in UserUnifiedProfile.
+    """
+    import api.db.schema as _db
+    from coach.yesterday_summary import clear_yesterday_summary_uup, generate_yesterday_summary
+
+    uid = _user_uuid_for_coach(user_id)
+    cycle_ist = await track_svc.get_current_cycle_local_date()
+
+    recap = await track_svc.get_morning_recap()
+    if not recap.get("summary"):
+        await clear_yesterday_summary_uup(db, uid, cycle_ist)
+        return YesterdaySummaryResponse(
+            weekly_trend=None,
+            yesterday_stress=None,
+            yesterday_recovery=None,
+            yesterday_adherence=None,
+            generated_for=cycle_ist.isoformat(),
+            is_stale=False,
+        )
+
+    result = await db.execute(
+        select(_db.UserUnifiedProfile).where(_db.UserUnifiedProfile.user_id == uid)
+    )
+    uup = result.scalar_one_or_none()
+
+    generated_for = uup.yesterday_summary_generated_for if uup else None
+    is_stale = (generated_for is None or generated_for < cycle_ist)
+    empty_for_today = bool(
+        uup
+        and generated_for == cycle_ist
+        and not any(
+            [
+                uup.yesterday_summary_weekly_trend,
+                uup.yesterday_summary_stress,
+                uup.yesterday_summary_recovery,
+                uup.yesterday_summary_adherence,
+            ]
+        )
+    )
+
+    if is_stale or empty_for_today:
+        llm_client = getattr(request.app.state, "llm_client", None)
+        await generate_yesterday_summary(AsyncSessionLocal, uid, llm_client)
+        result = await db.execute(
+            select(_db.UserUnifiedProfile).where(_db.UserUnifiedProfile.user_id == uid)
+        )
+        uup = result.scalar_one_or_none()
+        generated_for = uup.yesterday_summary_generated_for if uup else None
+        is_stale = (generated_for is None or generated_for < cycle_ist)
+
+    return YesterdaySummaryResponse(
+        weekly_trend=uup.yesterday_summary_weekly_trend if uup else None,
+        yesterday_stress=uup.yesterday_summary_stress if uup else None,
+        yesterday_recovery=uup.yesterday_summary_recovery if uup else None,
+        yesterday_adherence=uup.yesterday_summary_adherence if uup else None,
+        generated_for=generated_for.isoformat() if generated_for else None,
+        is_stale=is_stale,
+    )
 
 # ── Phase 5 endpoints ────────────────────────────────────────────────────────
 

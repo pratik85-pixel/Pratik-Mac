@@ -318,6 +318,17 @@ class TestCoachEndpoints:
         # local_engine always produces a summary key
         assert "summary" in data or any(k in data for k in ("reply", "action", "message"))
 
+    def test_yesterday_summary_returns_200(self, client):
+        r = client.get("/coach/yesterday-summary", headers=self._HEADERS)
+        assert r.status_code == 200
+        data = r.json()
+        assert "weekly_trend" in data
+        assert "yesterday_stress" in data
+        assert "yesterday_recovery" in data
+        assert "yesterday_adherence" in data
+        assert "generated_for" in data
+        assert "is_stale" in data
+
     def test_nudge_returns_200(self, client):
         r = client.get("/coach/nudge", headers=self._HEADERS)
         assert r.status_code == 200

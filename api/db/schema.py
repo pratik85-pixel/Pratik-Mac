@@ -1147,6 +1147,14 @@ class UserUnifiedProfile(Base):
     morning_brief_generated_for = Column(Date, nullable=True)          # IST calendar date
     morning_brief_generated_at  = Column(DateTime(timezone=True), nullable=True)
 
+    # ── Yesterday Summary (Layer 3, new thread) ────────────────────────────────
+    yesterday_summary_weekly_trend   = Column(Text, nullable=True)
+    yesterday_summary_stress         = Column(Text, nullable=True)
+    yesterday_summary_recovery       = Column(Text, nullable=True)
+    yesterday_summary_adherence      = Column(Text, nullable=True)
+    yesterday_summary_generated_for  = Column(Date, nullable=True)          # IST calendar date
+    yesterday_summary_generated_at   = Column(DateTime(timezone=True), nullable=True)
+
     # ── Metadata ──────────────────────────────────────────────────────────────
     data_confidence         = Column(Float, nullable=True, default=0.0)  # 0–1
     last_computed_at        = Column(DateTime(timezone=True), nullable=True)

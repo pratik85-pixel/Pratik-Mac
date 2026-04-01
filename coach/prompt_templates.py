@@ -32,9 +32,30 @@ NARRATIVE_MAX_CHARS = 8000
 
 _VERITY_PERSONA = """\
 You are Verity — ZenFlow's personal health coach.
-You are warm, direct, honest, and human. You know this user from their profile narrative.
-Never use clinical or technical terms (for example HRV, RMSSD, vagal, cortisol, autonomic, parasympathetic).
-Never give medical advice or diagnose.
+You are warm, direct, honest, and human — like a friendly coach, not a robot.
+Your role is to give accurate, meaningful insight in simple Indian English about the user's personal health.
+You know this user from their profile narrative and known facts — treat those as memory.
+
+Mission
+-------
+- Help the user reduce stress, improve waking and sleeping recovery, and improve overall wellbeing.
+- Maximise adherence to today's plan by making the plan feel doable and personally relevant.
+- ZenFlow is not just a breathing app. It helps people improve health without over-stressing their system.
+- If the user wants to push hard (gym/sport), encourage it while helping them protect recovery and long-term nervous system health.
+
+Grounding
+---------
+- Do not hallucinate. If information is missing, say you don't have enough data yet.
+- Keep advice practical, specific, and easy to understand.
+
+Safety
+------
+- Never give medical advice or diagnose.
+
+Language
+--------
+- You may use technical terms like RMSSD, vagal tone, cortisol, etc. but only when helpful and always translate them into plain language immediately.
+
 When the user shares something personal — a preference, habit, or feeling — acknowledge it naturally before anything else. Treat known facts as memory.
 If the topic drifts to finance, legal advice, or unrelated hobbies, redirect gently and differently each time — never use a fixed script.
 Output only valid JSON when the user prompt asks for JSON. No markdown fences around JSON.
@@ -185,11 +206,38 @@ def build_layer3_morning_brief_prompt(
                 yesterday_row = r
                 break
 
+    def _week_rows(traj: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+        if not traj:
+            return []
+        # Weekly framing should reflect what happened leading into today.
+        # Exclude today's row (if present) and take up to the last 7 days.
+        rows = [r for r in traj if str(r.get("date", "")) != str(packet.today_local_date)]
+        rows = rows[-7:]
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            out.append({
+                "date": r.get("date"),
+                "day_type": r.get("day_type"),
+                "readiness_score": r.get("readiness_score"),
+                "waking_recovery_score": r.get("waking_recovery_score"),
+                "sleep_recovery_score": r.get("sleep_recovery_score"),
+                "stress_load_score": r.get("stress_load_score"),
+                "adherence_pct": r.get("adherence_pct"),
+            })
+        return out
+
+    today_row = None
+    if packet.daily_trajectory:
+        for r in packet.daily_trajectory:
+            if str(r.get("date", "")) == str(packet.today_local_date):
+                today_row = r
+                break
+
     def _row_min(r: Any) -> dict[str, Any]:
-        # Omit deprecated readiness_score — cite stress + recovery only (matches app).
         return {
             "date": r.get("date"),
             "day_type": r.get("day_type"),
+            "readiness_score": r.get("readiness_score"),
             "waking_recovery_score": r.get("waking_recovery_score"),
             "sleep_recovery_score": r.get("sleep_recovery_score"),
             "stress_load_score": r.get("stress_load_score"),
@@ -203,20 +251,35 @@ TODAY_LOCAL_DATE: {packet.today_local_date}
 USER PROFILE — read first (Layer 2 narrative):
 {narrative_excerpt}
 
+MORNING CONTEXT:
+  - The user has just woken up and is about to start the day.
+  - The day has not unfolded yet. Do NOT mention intraday/live numbers shown on screens later in the day.
+  - Today's readiness score (if provided) is a morning baseline derived from yesterday's stress + waking recovery + sleep recovery (plus the user's baseline). It is OK to cite it as a summary verdict.
+
+WEEK_CONTEXT_7D (leading into today; newest last):
+{json.dumps(_week_rows(packet.daily_trajectory), ensure_ascii=False, default=str)[:3000]}
+
 DAY_STATE DECISION RULE:
   - Determine "day_state" from YESTERDAY_ROW only.
   - Do NOT use today's data to choose day_state.
   - You may still write brief/evidence/action for today.
 
 DATA NOTES:
+  - readiness_score: 0–100 — cite as \"XX/100\" when you use it
   - stress_load_score: 0–10 scale — cite as "X.X/10"
   - waking_recovery_score, sleep_recovery_score: 0–100 — cite as "XX%" or "XX/100"
 
 YESTERDAY_ROW:
 {json.dumps(_row_min(yesterday_row or {}), ensure_ascii=False, default=str)}
 
-TASK: Write the morning brief — how today looks for this person and the one most important thing to do.
-Do not cite readiness as a single number. Use stress and recovery signals instead.
+TODAY_BASELINE (readiness may be present; derived from yesterday signals):
+{json.dumps(_row_min(today_row or {}), ensure_ascii=False, default=str)}
+
+TASK: Write the morning brief — as a friendly coach — guiding what to do and what not to do today.
+Structure inside brief_text:
+  - Line 1: Weekly trend (good/average/rough) in plain words.
+  - Line 2: Today's day type verdict (high intensity / moderate / relaxed / red) and why (yesterday + baseline readiness).
+  - Line 3: Goals for today (1–2 concrete targets) that support adherence.
 
 OUTPUT — valid JSON only, exactly these keys:
 {{
@@ -240,20 +303,48 @@ def build_layer3_plan_brief_prompt(
     plan_items: list[dict[str, Any]],
 ) -> tuple[str, str]:
     narrative_excerpt = (uup_narrative or "")[:NARRATIVE_MAX_CHARS]
+    # Plan guidance is delivered in the morning context; avoid intraday/live mentions.
+    yesterday_date = None
+    try:
+        y_dt = datetime.strptime(packet.today_local_date, "%Y-%m-%d").date()
+        yesterday_date = (y_dt - timedelta(days=1)).isoformat()
+    except Exception:
+        yesterday_date = None
+
+    yesterday_row = None
+    if packet.daily_trajectory and yesterday_date:
+        for r in packet.daily_trajectory:
+            if r.get("date") == yesterday_date:
+                yesterday_row = r
+                break
+
+    today_row = (packet.daily_trajectory[-1] if packet.daily_trajectory else {}) or {}
     user_prompt = f"""\
 TODAY_LOCAL_DATE: {packet.today_local_date}
 
 USER PROFILE (Layer 2 narrative):
 {narrative_excerpt}
 
+MORNING CONTEXT:
+  - The user is starting the day. Do NOT mention intraday/live numbers from later in the day.
+  - It is OK to reference today's readiness as a baseline verdict because it is derived from yesterday's stress + waking recovery + sleep recovery (plus baseline).
+  - Your job is to make the plan resonate so adherence stays high.
+
 TODAY PLAN ITEMS:
 {json.dumps(plan_items, ensure_ascii=False, default=str)[:5000]}
 
-TODAY ROW (stress/recovery context):
-{json.dumps(packet.daily_trajectory[-1] if packet.daily_trajectory else {}, ensure_ascii=False, default=str)[:1500]}
+YESTERDAY SUMMARY CONTEXT (use this to justify today's direction):
+{json.dumps(yesterday_row or {}, ensure_ascii=False, default=str)[:1500]}
 
-TASK: Explain WHY each plan item fits this person today. Do not repeat the morning brief or restate green/yellow/red. Start with the activity names.
-"avoid_items": 1–2 things to ease off today with a short reason. Labels must be plain English (e.g. "intense exercise") — no underscores or slugs.
+TODAY BASELINE (readiness may be present; derived from yesterday signals):
+{json.dumps(today_row, ensure_ascii=False, default=str)[:1500]}
+
+TASK:
+- Explain WHY each plan item fits this person today, in a friendly coach voice.
+- Do not repeat the morning brief. Do not restate green/yellow/red.
+- Start with the activity names.
+- Make it feel practical: if high intensity is appropriate, encourage gym/sport while protecting recovery (e.g. cooldown, breath reset during work calls). Keep it non-medical and non-prescriptive.
+- "avoid_items": 1–2 things to ease off today with a short reason. Labels must be plain English (e.g. "extended work calls") — no underscores or slugs.
 
 OUTPUT JSON only, exactly:
 {{
@@ -291,6 +382,82 @@ TASK: One short nudge for this person and this trigger. At most 60 words in "mes
 
 OUTPUT JSON only: {{ "message": "<string>" }}
 """.strip()
+    return _VERITY_PERSONA, user_prompt
+
+
+# ── Layer 3 — Yesterday summary (new thread) ───────────────────────────────────
+
+def build_layer3_yesterday_summary_prompt(
+    packet: CoachInputPacket,
+    uup_narrative: str,
+) -> tuple[str, str]:
+    """
+    Build (system_prompt, user_prompt) for the Layer 3 yesterday-summary call.
+
+    Output JSON keys (exactly):
+      - weekly_trend
+      - yesterday_stress
+      - yesterday_recovery
+      - yesterday_adherence
+    """
+    yesterday_date = None
+    try:
+        y_dt = datetime.strptime(packet.today_local_date, "%Y-%m-%d").date()
+        yesterday_date = (y_dt - timedelta(days=1)).isoformat()
+    except Exception:
+        yesterday_date = None
+
+    yesterday_row = None
+    if packet.daily_trajectory and yesterday_date:
+        for r in packet.daily_trajectory:
+            if r.get("date") == yesterday_date:
+                yesterday_row = r
+                break
+
+    week_rows = []
+    if packet.daily_trajectory:
+        rows = [r for r in packet.daily_trajectory if str(r.get("date", "")) != str(packet.today_local_date)]
+        week_rows = rows[-7:]
+
+    narrative_excerpt = (uup_narrative or "")[:NARRATIVE_MAX_CHARS]
+
+    user_prompt = f"""\
+TODAY_LOCAL_DATE: {packet.today_local_date}
+
+USER PROFILE (Layer 2 narrative):
+{narrative_excerpt}
+
+WEEK_CONTEXT_7D (leading into today; newest last):
+{json.dumps(week_rows, ensure_ascii=False, default=str)[:3500]}
+
+YESTERDAY_ROW (summary + scores + adherence fields if present):
+{json.dumps(yesterday_row or {}, ensure_ascii=False, default=str)[:2000]}
+
+PLAN DEVIATIONS (last 30d, if present):
+{json.dumps(packet.plan_deviations_30d or [], ensure_ascii=False, default=str)[:2000]}
+
+ADHERENCE (30d summary, if present):
+{json.dumps(packet.adherence_30d or {}, ensure_ascii=False, default=str)[:1500]}
+
+TASK:
+Write a \"Yesterday summary\" in 4 sections. Be grounded. Friendly coach voice. Indian English.
+No medical diagnosis/advice. If something is missing, say it clearly.
+
+SECTION RULES:
+1) weekly_trend: 2–4 sentences — overall week verdict and any red flags (stress, recovery, adherence, band wear signals if available).
+2) yesterday_stress: 2–4 sentences — what likely drove stress and key events (use tags/windows if present in narrative).
+3) yesterday_recovery: 2–4 sentences — waking + sleep recovery, sleep quality (hours/REM/Deep only if available in inputs), what helped.
+4) yesterday_adherence: 2–4 sentences — what they did vs missed; make it motivating and specific.
+
+OUTPUT — valid JSON only, exactly these keys:
+{{
+  \"weekly_trend\": \"...\",
+  \"yesterday_stress\": \"...\",
+  \"yesterday_recovery\": \"...\",
+  \"yesterday_adherence\": \"...\"
+}}
+""".strip()
+
     return _VERITY_PERSONA, user_prompt
 
 
@@ -564,8 +731,11 @@ CURRENT PRESCRIPTION:
 HOW TO RESPOND:
     - Reply in your own words; match the user's energy (short if brief, fuller if they asked something real).
     - If they shared something new, acknowledge it first.
+    - You may reference today's scores when helpful (stress load, waking recovery, balance) if they are present above.
     - Ask a natural follow-up question unless the user has explicitly wrapped up (said bye, thanks, done, etc.).
     - Do not re-introduce yourself.
+    - Stay in-scope: health, wellness, fitness, stress management, sleep, recovery, breathing, nutrition (performance/recovery context), mindfulness, and lifestyle habits.
+    - If they ask for movies, celebrities, finance, legal advice, or unrelated web searches: redirect gently back to health and their plan/state.
 
 OUTPUT JSON only:
 {{
