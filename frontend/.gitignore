@@ -1,0 +1,17 @@
+node_modules/
+.expo/
+dist/
+web-build/
+*.orig.*
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+*.orig.*
+yarn-error.log
+# macOS
+.DS_Store
+# @generated Expo autolinking
+ios/
+android/

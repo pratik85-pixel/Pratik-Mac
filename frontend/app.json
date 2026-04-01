@@ -1,0 +1,67 @@
+{
+  "expo": {
+    "name": "ZenFlow",
+    "slug": "zenflow-verity",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "backgroundColor": "#000000",
+    "splash": {
+      "image": "./assets/splash-icon.png",
+      "backgroundColor": "#000000",
+      "imageContentMode": "contain",
+      "resizeMode": "contain"
+    },
+    "assetBundlePatterns": [
+      "**/*"
+    ],
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#000000"
+      },
+      "package": "com.zenflow.verity",
+      "versionCode": 32,
+      "permissions": [
+        "android.permission.BLUETOOTH_SCAN",
+        "android.permission.BLUETOOTH_CONNECT",
+        "android.permission.ACCESS_FINE_LOCATION",
+        "android.permission.FOREGROUND_SERVICE",
+        "android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE",
+        "android.permission.WAKE_LOCK",
+        "android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS",
+        "android.permission.POST_NOTIFICATIONS"
+      ]
+    },
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.zenflow.verity",
+      "infoPlist": {
+        "NSBluetoothAlwaysUsageDescription": "ZenFlow uses Bluetooth to connect to your Polar band and read heart rhythm data.",
+        "NSBluetoothPeripheralUsageDescription": "ZenFlow uses Bluetooth to connect to your Polar band."
+      }
+    },
+    "plugins": [
+      "./plugins/withForegroundService",
+      [
+        "expo-splash-screen",
+        {
+          "image": "./assets/splash-icon.png",
+          "backgroundColor": "#000000",
+          "imageContentMode": "contain",
+          "resizeMode": "contain"
+        }
+      ],
+      "expo-asset",
+      "expo-notifications",
+      "react-native-ble-plx"
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "bab74a16-9052-43bd-9c2a-cc33fc667a02"
+      }
+    },
+    "owner": "pratik85"
+  }
+}
