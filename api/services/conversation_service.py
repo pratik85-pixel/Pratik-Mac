@@ -48,6 +48,19 @@ logger = logging.getLogger(__name__)
 _FACT_PERSIST_MIN_CONFIDENCE = 0.8
 _COACH_TURN_TIMEOUT_S = 45.0
 
+
+class ConversationNotFoundError(Exception):
+    """Raised when a conversation_id does not exist in the in-memory store."""
+
+
+class ConversationOwnerMismatchError(PermissionError):
+    """Raised when the caller user_id does not match the conversation's owner."""
+
+
+def _user_ids_equal(a: str, b: str) -> bool:
+    """Normalize user ids before comparing — tolerates whitespace/case differences."""
+    return (a or "").strip() == (b or "").strip()
+
 # Conversation extractor signal → HabitEvent.event_type mapping
 # Any signal not in this map is stored directly under its label (truncated to 40 chars).
 _SIGNAL_TO_EVENT_TYPE: dict[str, str] = {
@@ -102,13 +115,28 @@ class ConversationService:
         self,
         conversation_id: str,
         db: Optional[AsyncSession] = None,
+        caller_user_id: Optional[str] = None,
     ) -> None:
         """
         Close the conversation and persist any extracted lifestyle signals
         as HabitEvent rows for prescriber / assessor consumption.
 
         Also persists extracted UserFacts to the user_facts table.
+
+        If `caller_user_id` is provided, it must match the conversation's owner;
+        otherwise `ConversationOwnerMismatchError` is raised and nothing is closed.
         """
+        if caller_user_id is not None:
+            existing = self._store.get(conversation_id)
+            if existing is not None and not _user_ids_equal(existing.user_id, caller_user_id):
+                logger.warning(
+                    "conversation_owner_mismatch conv=%s caller=%s owner=%s",
+                    conversation_id, caller_user_id, existing.user_id,
+                )
+                raise ConversationOwnerMismatchError(
+                    "conversation does not belong to caller"
+                )
+
         final_state = self._manager.close_session(conversation_id)
         logger.info("conversation_close conv=%s", conversation_id)
 
@@ -229,17 +257,31 @@ class ConversationService:
         user_message:    str,
         model_service:   ModelService,
         db:              Optional[AsyncSession] = None,
+        caller_user_id:  Optional[str] = None,
     ) -> TurnResult:
         """
         Process one user message and return the coach reply + any plan updates.
         Persists both sides of the turn to DB if `db` is provided.
+
+        If `caller_user_id` is provided, the in-memory conversation's
+        `user_id` must match — otherwise `ConversationOwnerMismatchError` is
+        raised. This prevents IDOR via a leaked/guessed `conversation_id`.
         """
         started = perf_counter()
         state = self._store.get(conversation_id)
         if state is None:
-            raise ValueError(f"conversation {conversation_id} not found")
+            raise ConversationNotFoundError(f"conversation {conversation_id} not found")
 
         user_id = state.user_id
+
+        if caller_user_id is not None and not _user_ids_equal(user_id, caller_user_id):
+            logger.warning(
+                "conversation_owner_mismatch conv=%s caller=%s owner=%s",
+                conversation_id, caller_user_id, user_id,
+            )
+            raise ConversationOwnerMismatchError(
+                "conversation does not belong to caller"
+            )
         fp      = await model_service.get_fingerprint(user_id) or PersonalFingerprint()
         profile = model_service.get_profile_from_fingerprint(fp)
         self._scratch_profile = profile

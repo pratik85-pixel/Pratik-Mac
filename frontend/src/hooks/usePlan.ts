@@ -42,7 +42,9 @@ export const usePlan = (opts?: UsePlanOptions) => {
     } finally {
       inflight.current = null;
     }
-  }, []);
+    // NOTE: `enabled` is included in the deps so toggling the option from
+    // false → true rebuilds the callback and the fetch actually runs.
+  }, [enabled]);
 
   const confirmItem = useCallback(async (id: string) => {
     try {

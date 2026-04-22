@@ -1,4 +1,4 @@
-import axios, { AxiosInstance } from 'axios';
+import axios, { AxiosError, AxiosInstance, AxiosRequestConfig } from 'axios';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
 // Default to local dev. User configures this in Settings.
@@ -21,11 +21,35 @@ export async function initClient(baseOverride?: string): Promise<void> {
     },
   });
 
-  // Attach user-id header to every request automatically
   _client.interceptors.request.use((config) => {
     if (_userId) config.headers['X-User-Id'] = _userId;
     return config;
   });
+
+  // Idempotent-GET retry with exponential backoff for transient network
+  // failures (timeouts, 502/503/504). Non-idempotent methods are never
+  // retried to avoid double writes.
+  _client.interceptors.response.use(
+    (resp) => resp,
+    async (error: AxiosError) => {
+      const cfg: (AxiosRequestConfig & { _retryCount?: number }) | undefined = error.config;
+      const status = error.response?.status;
+      const method = (cfg?.method ?? 'get').toLowerCase();
+      const transient =
+        error.code === 'ECONNABORTED' ||
+        error.code === 'ERR_NETWORK' ||
+        status === 502 ||
+        status === 503 ||
+        status === 504;
+      const retriable = method === 'get' && transient;
+      if (!cfg || !retriable) return Promise.reject(error);
+      cfg._retryCount = (cfg._retryCount ?? 0) + 1;
+      if (cfg._retryCount > 2) return Promise.reject(error);
+      const backoffMs = 250 * 2 ** (cfg._retryCount - 1);
+      await new Promise((r) => setTimeout(r, backoffMs));
+      return _client!.request(cfg);
+    },
+  );
 }
 
 export function getClient(): AxiosInstance {

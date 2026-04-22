@@ -41,6 +41,10 @@ export default function PlanItemCard({ item, onPress }: PlanItemCardProps) {
       onPress={onPress}
       activeOpacity={0.75}
       style={styles.row}
+      accessibilityRole="button"
+      accessibilityLabel={`${item.title}, ${isComplete ? 'completed' : `${item.duration_minutes} minutes`}`}
+      accessibilityState={{ checked: isComplete }}
+      accessibilityHint={isComplete ? 'Already done' : 'Tap to view details or mark complete'}
     >
       <View style={styles.iconWrap}>
         <Ionicons

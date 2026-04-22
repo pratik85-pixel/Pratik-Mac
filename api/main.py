@@ -24,6 +24,7 @@ from typing import AsyncGenerator
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
 
 from api.config import get_settings
@@ -165,13 +166,24 @@ def create_app() -> FastAPI:
     )
 
     # ── CORS ──────────────────────────────────────────────────────────────────
+    # Native mobile apps don't send an Origin header, so an empty list is fine
+    # for them. For browser clients, set `CORS_ORIGINS` to an explicit allowlist.
+    _origins = _cfg.CORS_ORIGINS
+    # `allow_credentials=True` with a wildcard origin is spec-invalid and unsafe,
+    # so we drop credentials when origins is "*" (Settings also replaces "*" with
+    # [] in production — belt-and-suspenders).
+    _allow_credentials = _origins != ["*"] and len(_origins) > 0
     app.add_middleware(
         CORSMiddleware,
-        allow_origins     = _cfg.CORS_ORIGINS,
-        allow_credentials = True,
-        allow_methods     = ["*"],
-        allow_headers     = ["*"],
+        allow_origins     = _origins,
+        allow_credentials = _allow_credentials,
+        allow_methods     = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        allow_headers     = ["Authorization", "Content-Type", "X-User-Id", "X-Request-ID"],
     )
+
+    # ── Trusted Host ──────────────────────────────────────────────────────────
+    if _cfg.TRUSTED_HOSTS:
+        app.add_middleware(TrustedHostMiddleware, allowed_hosts=list(_cfg.TRUSTED_HOSTS))
 
     @app.middleware("http")
     async def _request_timing_middleware(request: Request, call_next):

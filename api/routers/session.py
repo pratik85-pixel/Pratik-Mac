@@ -10,6 +10,7 @@ GET  /session/{id}/live    — poll current live metrics
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Optional
 
@@ -175,11 +176,14 @@ async def end_session(
     if owner != user_id:
         raise HTTPException(status_code=403, detail="session does not belong to this user")
 
-    outcome: Optional[SessionOutcome] = svc.end_session(
+    # `end_session` does CPU-bound numpy + outcome math; offload to a thread
+    # so the event loop keeps serving other clients while it runs.
+    outcome: Optional[SessionOutcome] = await asyncio.to_thread(
+        svc.end_session,
         session_id,
         user_id=user_id,
-        morning_rmssd_ms     = body.morning_rmssd_ms,
-        personal_floor_rmssd = body.personal_floor_rmssd,
+        morning_rmssd_ms=body.morning_rmssd_ms,
+        personal_floor_rmssd=body.personal_floor_rmssd,
     )
 
     if outcome is None:

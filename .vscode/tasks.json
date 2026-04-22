@@ -4,53 +4,53 @@
 		{
 			"label": "Expo Start (ZenFlowVerity)",
 			"type": "shell",
-			"command": "cd /Users/pratikbarman/Desktop/Zenflow_front && npx expo start --tunnel",
+			"command": "cd \"${workspaceFolder}/frontend\" && npx expo start --tunnel",
 			"isBackground": true,
 			"problemMatcher": []
 		},
 		{
 			"label": "Expo Start Android",
 			"type": "shell",
-			"command": "cd /Users/pratikbarman/Desktop/Zenflow_front && npx expo start --android",
+			"command": "cd \"${workspaceFolder}/frontend\" && npx expo start --android",
 			"isBackground": true,
 			"problemMatcher": []
 		},
 		{
 			"label": "Expo Start (new IP)",
 			"type": "shell",
-			"command": "cd /Users/pratikbarman/Desktop/Zenflow_front && npx expo start --port 8081",
+			"command": "cd \"${workspaceFolder}/frontend\" && npx expo start --port 8081",
 			"isBackground": true,
 			"problemMatcher": []
 		},
 		{
 			"label": "Backend Server",
 			"type": "shell",
-			"command": "pkill -f 'uvicorn api.main' 2>/dev/null; sleep 1; cd /Users/pratikbarman/Desktop/Zenflow_backend && python3 -m uvicorn api.main:app --host 127.0.0.1 --port 8000 --reload",
+			"command": "pkill -f 'uvicorn api.main' 2>/dev/null; sleep 1; cd \"${workspaceFolder}\" && python3 -m uvicorn api.main:app --host 127.0.0.1 --port 8000 --reload",
 			"isBackground": true,
 			"problemMatcher": []
 		},
 		{
 			"label": "EAS Build Android v13-fix",
 			"type": "shell",
-			"command": "export PATH=\"$HOME/.npm-global/bin:$PATH\" EXPO_TOKEN=\"NkUqALgfgbtl9bqLG8UW8OlhSn7QSW2MLHs_6Tyn\" && cd /Users/pratikbarman/Desktop/Zenflow_front && eas build --platform android --profile preview --non-interactive",
+			"command": "export PATH=\"$HOME/.npm-global/bin:$PATH\" && cd \"${workspaceFolder}/frontend\" && eas build --platform android --profile preview --non-interactive",
 			"isBackground": false
 		},
 		{
 			"label": "Deploy: Alembic migrate head",
 			"type": "shell",
-			"command": "cd /Users/pratikbarman/Desktop/Zenflow_backend && railway run --service api alembic upgrade head",
+			"command": "cd \"${workspaceFolder}\" && railway run --service api alembic upgrade head",
 			"isBackground": false
 		},
 		{
 			"label": "Deploy: Alembic upgrade head (public URL)",
 			"type": "shell",
-			"command": "cd /Users/pratikbarman/Desktop/Zenflow_backend && DATABASE_URL='postgresql://postgres:lStXwgKefGXXShUSTPXvxTmKluKPcLmE@switchyard.proxy.rlwy.net:35936/railway' alembic upgrade head",
+			"command": "cd \"${workspaceFolder}\" && DATABASE_URL='postgresql://postgres:lStXwgKefGXXShUSTPXvxTmKluKPcLmE@switchyard.proxy.rlwy.net:35936/railway' alembic upgrade head",
 			"isBackground": false
 		},
 		{
 			"label": "Migrate and Deploy",
 			"type": "shell",
-			"command": "cd /Users/pratikbarman/Desktop/Zenflow_backend && DATABASE_URL='postgresql://postgres:lStXwgKefGXXShUSTPXvxTmKluKPcLmE@switchyard.proxy.rlwy.net:35936/railway' alembic upgrade head && echo '=== MIGRATION DONE ===' && railway up --service api && echo '=== DEPLOY DONE ==='",
+			"command": "cd \"${workspaceFolder}\" && DATABASE_URL='postgresql://postgres:lStXwgKefGXXShUSTPXvxTmKluKPcLmE@switchyard.proxy.rlwy.net:35936/railway' alembic upgrade head && echo '=== MIGRATION DONE ===' && railway up --service api && echo '=== DEPLOY DONE ==='",
 			"isBackground": false,
 			"presentation": {
 				"panel": "new",

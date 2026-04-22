@@ -31,6 +31,7 @@ export function ZenScreen({
 }: ZenScreenProps) {
   const inner = scrollable ? (
     <ScrollView
+      style={ss.screenScrollView}
       contentContainerStyle={[ss.screenScroll, style]}
       showsVerticalScrollIndicator={false}
       keyboardShouldPersistTaps="handled"
@@ -166,6 +167,8 @@ export function ScoreRing({
 const ss = StyleSheet.create({
   screenGradient: { flex: 1 },
   screenSafe:     { flex: 1 },
+  /** Lets ScrollView fill SafeAreaView so contentContainer flexGrow can size to viewport. */
+  screenScrollView: { flex: 1 },
   screenScroll:   { paddingHorizontal: 20, paddingTop: 16, paddingBottom: 32, gap: 16 },
   screenFlex:     { flex: 1, paddingHorizontal: 20, paddingTop: 16 },
 });

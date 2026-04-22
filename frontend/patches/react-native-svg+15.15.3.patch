@@ -1,0 +1,27 @@
+diff --git a/node_modules/react-native-svg/android/build.gradle b/node_modules/react-native-svg/android/build.gradle
+index 4fe912c..9b79732 100644
+--- a/node_modules/react-native-svg/android/build.gradle
++++ b/node_modules/react-native-svg/android/build.gradle
+@@ -15,6 +15,9 @@ buildscript {
+     }
+ }
+ 
++// Must run before `com.facebook.react` (New Architecture) — that plugin spawns node on apply.
++apply from: new File(rootProject.projectDir, 'zenflow-node.gradle')
++
+ def isNewArchitectureEnabled() {
+     // To opt-in for the New Architecture, you can either:
+     // - Set `newArchEnabled` to true inside the `gradle.properties` file
+@@ -44,10 +47,11 @@ def resolveReactNativeDirectory() {
+   }
+ 
+   // Fallback to node resolver for custom directory structures like monorepos.
++  def nodeBin = rootProject.ext.zenflowResolvedNode
+   def reactNativePackage = file(
+       providers.exec {
+           workingDir(rootDir)
+-          commandLine("node", "--print", "require.resolve('react-native/package.json')")
++          commandLine(nodeBin, "--print", "require.resolve('react-native/package.json')")
+       }.standardOutput.asText.get().trim()
+   )
+   if (reactNativePackage.exists()) {

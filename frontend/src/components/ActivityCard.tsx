@@ -104,6 +104,9 @@ export default function ActivityCard({ type, event, onTagPress }: ActivityCardPr
           }}
           style={[styles.tagCta, { borderColor: accentColor }]}
           activeOpacity={0.75}
+          accessibilityRole="button"
+          accessibilityLabel="Tag this activity"
+          accessibilityHint="Opens the tagging sheet to label this window"
         >
           <Text style={[styles.tagCtaText, { color: accentColor }]}>Tag</Text>
           <Ionicons name="chevron-forward" size={11} color={accentColor} />

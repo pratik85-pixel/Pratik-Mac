@@ -21,6 +21,7 @@ Dependencies
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import json
 import re
@@ -261,7 +262,11 @@ class PlanService:
                 uup_narrative=narrative,
                 plan_items=payload_items,
             )
-            raw = self._llm_client.chat(sys_prompt, user_prompt)
+            # Offload the sync OpenAI call to a worker thread so the event
+            # loop isn't blocked on network IO for 1-10s per call.
+            raw = await asyncio.to_thread(
+                self._llm_client.chat, sys_prompt, user_prompt
+            )
 
             # Parse JSON robustly.
             cleaned = raw.strip()

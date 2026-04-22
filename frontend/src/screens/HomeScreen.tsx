@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  View, Text, StyleSheet, TouchableOpacity,
+  View, Text, StyleSheet, TouchableOpacity, ScrollView,
   ActivityIndicator, Animated, RefreshControl, Modal,
 } from 'react-native';
 import { Bluetooth, BatteryFull } from 'lucide-react-native';
@@ -458,7 +458,7 @@ export default function HomeScreen() {
   return (
     <ZenScreen
       scrollable
-      scrollEnabled={isMyDayOpen || isOutlookExpanded}
+      scrollEnabled={isMyDayOpen}
       style={s.scroll}
       refreshControl={
         <RefreshControl
@@ -468,182 +468,221 @@ export default function HomeScreen() {
         />
       }
     >
-      {/* ── Header row ────────────────────────────────────────────── */}
-      <View style={s.headerRow}>
-        <View>
-          <Text style={s.eyebrow}>{getTodayLabel()}</Text>
-          <Text style={s.greeting}>{greeting()}</Text>
+      <View style={s.screenColumn}>
+        {/* ── Header row ────────────────────────────────────────────── */}
+        <View style={s.headerRow}>
+          <View>
+            <Text style={s.eyebrow}>{getTodayLabel()}</Text>
+            <Text style={s.greeting}>{greeting()}</Text>
+          </View>
+          <View style={s.headerRight}>
+            <Animated.View style={[s.polarIconWrap, { opacity: polarStatus === 'streaming' ? pulseAnim : 1 }]}>
+              <Bluetooth size={20} color={dotColor} strokeWidth={2.2} />
+            </Animated.View>
+            <Animated.View style={{ opacity: batteryPct != null && batteryPct < 10 ? batteryPulseAnim : 1 }}>
+              <View style={s.batteryRow}>
+                <BatteryFull size={18} color={batteryColor} strokeWidth={2.2} />
+                <Text style={[s.batteryText, { color: batteryColor }]}>
+                  {batteryPct == null ? '--%' : `${Math.round(batteryPct)}%`}
+                </Text>
+                {batteryPct != null && batteryPct < 10 ? (
+                  <Text style={s.batteryRecharge}>Recharge</Text>
+                ) : null}
+              </View>
+            </Animated.View>
+          </View>
         </View>
-        <View style={s.headerRight}>
-          <Animated.View style={[s.polarIconWrap, { opacity: polarStatus === 'streaming' ? pulseAnim : 1 }]}>
-            <Bluetooth size={20} color={dotColor} strokeWidth={2.2} />
-          </Animated.View>
-          <Animated.View style={{ opacity: batteryPct != null && batteryPct < 10 ? batteryPulseAnim : 1 }}>
-            <View style={s.batteryRow}>
-              <BatteryFull size={18} color={batteryColor} strokeWidth={2.2} />
-              <Text style={[s.batteryText, { color: batteryColor }]}>
-                {batteryPct == null ? '--%' : `${Math.round(batteryPct)}%`}
-              </Text>
-              {batteryPct != null && batteryPct < 10 ? (
-                <Text style={s.batteryRecharge}>Recharge</Text>
-              ) : null}
+
+        {/* ── Collecting banner (shown when band streaming but no scores yet) ── */}
+        {!data && polarStatus === 'streaming' && (
+          <View style={s.collectingBanner}>
+            <Text style={s.collectingText}>⏳ Collecting data — scores appear once your first session is processed</Text>
+          </View>
+        )}
+
+        <View style={s.homeFill}>
+          <View style={s.cardsColumn}>
+            {/* ── Today's outlook (readiness + coach brief; brief scrolls inside card) ─ */}
+            <View
+              style={[
+                s.outlookWrap,
+                stressState ? s.outlookWrapWithLive : s.outlookWrapSolo,
+              ]}
+            >
+            <SectionCard style={s.outlookCard}>
+              <View style={s.outlookTopRow}>
+                <TouchableOpacity
+                  style={s.outlookTitleTouch}
+                  activeOpacity={0.88}
+                  onPress={() => nav.navigate('MorningSummary')}
+                >
+                  <View style={s.outlookTitleBlock}>
+                    <SectionEyebrow>TODAY'S OUTLOOK</SectionEyebrow>
+                    <Text style={s.outlookSubtext}>basis yesterday&apos;s data</Text>
+                  </View>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={s.outlookExpandBtn}
+                  activeOpacity={0.8}
+                  onPress={() => setIsOutlookExpanded(v => !v)}
+                >
+                  <Text style={s.outlookExpandChevron}>{isOutlookExpanded ? '⌃' : '⌄'}</Text>
+                </TouchableOpacity>
+              </View>
+
+              <TouchableOpacity
+                activeOpacity={0.92}
+                onPress={() => nav.navigate('MorningSummary')}
+              >
+                <View style={s.readinessCenter}>
+                  <ArcGauge
+                    value={todayReadinessSafe}
+                    color={dayStateColor(todayDayState)}
+                    size={78}
+                    stroke={5}
+                    valueFontSize={17}
+                    displayValue={todayReadinessSafe == null ? '—' : `${Math.round(todayReadinessSafe)}`}
+                    displaySuffix={todayReadinessSafe == null ? undefined : '/100'}
+                  />
+                  <Text style={s.dayTypeLabel}>{dayTypeLabel}</Text>
+                </View>
+              </TouchableOpacity>
+
+              <ScrollView
+                style={[
+                  s.outlookBriefScroll,
+                  {
+                    maxHeight: isOutlookExpanded ? 76 : 48,
+                    minHeight: isOutlookExpanded ? 52 : 40,
+                  },
+                ]}
+                contentContainerStyle={s.outlookBriefScrollContent}
+                nestedScrollEnabled
+                showsVerticalScrollIndicator={isOutlookExpanded}
+                keyboardShouldPersistTaps="handled"
+              >
+                <Text style={s.briefMain}>{briefBody}</Text>
+              </ScrollView>
+            </SectionCard>
             </View>
-          </Animated.View>
+
+            {/* ── Right now: live stress zone + trend (new API) ── */}
+            {stressState ? (
+            <View style={s.nowWrap}>
+              <TouchableOpacity
+                style={s.nowTouch}
+                activeOpacity={0.9}
+                onPress={() => nav.navigate('RealTimeData')}
+              >
+                <SectionCard style={[s.nowCard, { borderLeftColor: zoneAccent(stressState.stress_now_zone), borderLeftWidth: 3 }]}>
+                  <View style={s.nowTopRow}>
+                    <View style={s.nowTopRowSide} />
+                    {pipelineScoreConfidence && pipelineScoreConfidence !== 'high' ? (
+                      <Text style={s.nowConfidenceCenter} numberOfLines={1}>
+                        {pipelineScoreConfidence === 'low'
+                          ? 'Calibrating Baseline'
+                          : 'Calibrating Baseline'}
+                      </Text>
+                    ) : null}
+                    <View style={s.nowTopRowSideEnd}>
+                      <View style={[s.nowLivePill, { borderColor: 'rgba(255,255,255,0.18)' }]}>
+                        <Text style={[s.liveBadgeText, { color: confidenceHeartColor }]}>LIVE</Text>
+                      </View>
+                    </View>
+                  </View>
+                  <View style={s.currentDualRingRow}>
+                    <View style={s.currentRingCell}>
+                      <ArcGauge
+                        value={stressScore}
+                        color={stressRingColor}
+                        size={72}
+                        stroke={5}
+                        goal={goalLoad}
+                        valueFontSize={16}
+                        displayValue={stressScore10 == null ? '—' : `${stressScore10.toFixed(1)}`}
+                        displaySuffix="/10"
+                      />
+                      <Text style={s.currentRingLabel}>Stress{'\n'}load</Text>
+                      {dominanceSide === 'stress' ? <View style={s.dominanceBar} /> : null}
+                    </View>
+                    <View style={s.currentRingCell}>
+                      <ArcGauge value={currentRecoveryCombined} color={recoveryRingColor} size={72} stroke={5} goal={recoveryGoal} valueFontSize={16} />
+                      <Text style={s.currentRecoveryLabel}>Waking{'\n'}recovery</Text>
+                      {dominanceSide === 'recovery' ? <View style={s.dominanceBar} /> : null}
+                    </View>
+                    <View style={s.currentRingCell}>
+                      <ArcGauge
+                        value={currentSleepRecovery}
+                        color={ZEN.colors.readiness}
+                        size={72}
+                        stroke={5}
+                        valueFontSize={16}
+                        displayValue={currentSleepRecovery == null ? '—' : `${Math.round(currentSleepRecovery)}%`}
+                      />
+                      <Text style={s.currentSleepLabel}>Sleep{'\n'}recovery</Text>
+                    </View>
+                  </View>
+                </SectionCard>
+              </TouchableOpacity>
+            </View>
+            ) : null}
+
+            {/* ── My day (expandable taggable events) ─────────────────────────────── */}
+            <View style={s.myDayOuter}>
+            <SectionCard style={s.myDayCard}>
+              <TouchableOpacity
+                style={s.myDayHeader}
+                activeOpacity={0.82}
+                onPress={() => setIsMyDayOpen(v => !v)}
+              >
+                <SectionEyebrow>MY DAY</SectionEyebrow>
+                <View style={s.myDayRight}>
+                  <Text style={s.myDayCount}>{myDayCount}</Text>
+                  <Text style={s.myDayChevron}>{isMyDayOpen ? '⌃' : '⌄'}</Text>
+                </View>
+              </TouchableOpacity>
+
+              {isMyDayOpen ? (
+                <View style={s.myDayBody}>
+                  {combinedEvents.length === 0 ? (
+                    <Text style={s.myDayEmpty}>No events yet today.</Text>
+                  ) : (
+                    <View style={s.myDayList}>
+                      {combinedEvents.map(ev => {
+                        if (ev.type === 'stress') {
+                          const w = ev.window as StressWindow;
+                          const row = {
+                            id: String((w as any).id),
+                            time: fmtTime(String((w as any).started_at)),
+                            label: (w as any).tag_candidate ?? (w as any).tag ?? 'Unnamed event',
+                            contribution: Math.round((w as any).stress_contribution_pct ?? 0),
+                            tagged: (w as any).tag !== null && (w as any).tag !== undefined,
+                            tagLabel: (w as any).tag ?? undefined,
+                            onTag: (w as any).tag ? undefined : () => openTagSheet('stress', w),
+                          };
+                          return <StressEventRow key={ev.key} event={row as any} />;
+                        }
+                        const w = ev.window as RecoveryWindow;
+                        const row = {
+                          id: String((w as any).id),
+                          time: fmtTime(String((w as any).started_at)),
+                          label: (w as any).tag ?? 'Rest window',
+                          contribution: Math.round((w as any).recovery_contribution_pct ?? 0),
+                          tagged: (w as any).tag !== null && (w as any).tag !== undefined,
+                          tagLabel: (w as any).tag ?? undefined,
+                          onTag: (w as any).tag ? undefined : () => openTagSheet('recovery', w),
+                        };
+                        return <RecoveryEventRow key={ev.key} event={row as any} />;
+                      })}
+                    </View>
+                  )}
+                </View>
+              ) : null}
+            </SectionCard>
+            </View>
+          </View>
         </View>
       </View>
-
-      {/* ── Collecting banner (shown when band streaming but no scores yet) ── */}
-      {!data && polarStatus === 'streaming' && (
-        <View style={s.collectingBanner}>
-          <Text style={s.collectingText}>⏳ Collecting data — scores appear once your first session is processed</Text>
-        </View>
-      )}
-
-      {/* ── Today's outlook (readiness + coach brief) ───────────────────────── */}
-      <TouchableOpacity activeOpacity={0.9} onPress={() => nav.navigate('MorningSummary')}>
-        <SectionCard style={[s.outlookCard, isOutlookExpanded ? s.outlookCardExpanded : null]}>
-          <View style={s.outlookTopRow}>
-            <View style={s.outlookTitleBlock}>
-              <SectionEyebrow>TODAY'S OUTLOOK</SectionEyebrow>
-              <Text style={s.outlookSubtext}>basis yesterday&apos;s data</Text>
-            </View>
-            <TouchableOpacity
-              style={s.outlookExpandBtn}
-              activeOpacity={0.8}
-              onPress={(e) => {
-                e.stopPropagation?.();
-                setIsOutlookExpanded(v => !v);
-              }}
-            >
-              <Text style={s.outlookExpandChevron}>{isOutlookExpanded ? '⌃' : '⌄'}</Text>
-            </TouchableOpacity>
-          </View>
-
-          <View style={s.readinessCenter}>
-            <ArcGauge
-              value={todayReadinessSafe}
-              color={dayStateColor(todayDayState)}
-              size={97}
-              stroke={6}
-              valueFontSize={19}
-              displayValue={todayReadinessSafe == null ? '—' : `${Math.round(todayReadinessSafe)}`}
-              displaySuffix={todayReadinessSafe == null ? undefined : '/100'}
-            />
-            <Text style={s.dayTypeLabel}>{dayTypeLabel}</Text>
-          </View>
-
-          <Text style={s.briefMain} numberOfLines={isOutlookExpanded ? undefined : 7}>
-            {briefBody}
-          </Text>
-        </SectionCard>
-      </TouchableOpacity>
-
-      {/* ── Right now: live stress zone + trend (new API) ── */}
-      {stressState ? (
-        <TouchableOpacity activeOpacity={0.9} onPress={() => nav.navigate('RealTimeData')}>
-          <SectionCard style={[s.nowCard, { borderLeftColor: zoneAccent(stressState.stress_now_zone), borderLeftWidth: 3 }]}>
-          <View style={s.nowTopRow}>
-            <View style={s.nowTopRowSide} />
-            {pipelineScoreConfidence && pipelineScoreConfidence !== 'high' ? (
-              <Text style={s.nowConfidenceCenter} numberOfLines={1}>
-                {pipelineScoreConfidence === 'low'
-                  ? 'Calibrating Baseline'
-                  : 'Calibrating Baseline'}
-              </Text>
-            ) : null}
-            <View style={s.nowTopRowSideEnd}>
-              <View style={[s.nowLivePill, { borderColor: 'rgba(255,255,255,0.18)' }]}>
-                <Text style={[s.liveBadgeText, { color: confidenceHeartColor }]}>LIVE</Text>
-              </View>
-            </View>
-          </View>
-          <View style={s.currentDualRingRow}>
-            <View style={s.currentRingCell}>
-              <ArcGauge
-                value={stressScore}
-                color={stressRingColor}
-                size={84}
-                stroke={6}
-                goal={goalLoad}
-                valueFontSize={18}
-                displayValue={stressScore10 == null ? '—' : `${stressScore10.toFixed(1)}`}
-                displaySuffix="/10"
-              />
-              <Text style={s.currentRingLabel}>Stress{'\n'}load</Text>
-              {dominanceSide === 'stress' ? <View style={s.dominanceBar} /> : null}
-            </View>
-            <View style={s.currentRingCell}>
-              <ArcGauge value={currentRecoveryCombined} color={recoveryRingColor} size={84} stroke={6} goal={recoveryGoal} valueFontSize={18} />
-              <Text style={s.currentRecoveryLabel}>Waking{'\n'}recovery</Text>
-              {dominanceSide === 'recovery' ? <View style={s.dominanceBar} /> : null}
-            </View>
-            <View style={s.currentRingCell}>
-              <ArcGauge
-                value={currentSleepRecovery}
-                color={ZEN.colors.readiness}
-                size={84}
-                stroke={6}
-                valueFontSize={18}
-                displayValue={currentSleepRecovery == null ? '—' : `${Math.round(currentSleepRecovery)}%`}
-              />
-              <Text style={s.currentSleepLabel}>Sleep{'\n'}recovery</Text>
-            </View>
-          </View>
-          </SectionCard>
-        </TouchableOpacity>
-      ) : null}
-
-      {/* ── My day (expandable taggable events) ─────────────────────────────── */}
-      <SectionCard style={s.myDayCard}>
-        <TouchableOpacity
-          style={s.myDayHeader}
-          activeOpacity={0.82}
-          onPress={() => setIsMyDayOpen(v => !v)}
-        >
-          <SectionEyebrow>MY DAY</SectionEyebrow>
-          <View style={s.myDayRight}>
-            <Text style={s.myDayCount}>{myDayCount}</Text>
-            <Text style={s.myDayChevron}>{isMyDayOpen ? '⌃' : '⌄'}</Text>
-          </View>
-        </TouchableOpacity>
-
-        {isMyDayOpen ? (
-          <View style={s.myDayBody}>
-            {combinedEvents.length === 0 ? (
-              <Text style={s.myDayEmpty}>No events yet today.</Text>
-            ) : (
-              <View style={s.myDayList}>
-                {combinedEvents.map(ev => {
-                  if (ev.type === 'stress') {
-                    const w = ev.window as StressWindow;
-                    const row = {
-                      id: String((w as any).id),
-                      time: fmtTime(String((w as any).started_at)),
-                      label: (w as any).tag_candidate ?? (w as any).tag ?? 'Unnamed event',
-                      contribution: Math.round((w as any).stress_contribution_pct ?? 0),
-                      tagged: (w as any).tag !== null && (w as any).tag !== undefined,
-                      tagLabel: (w as any).tag ?? undefined,
-                      onTag: (w as any).tag ? undefined : () => openTagSheet('stress', w),
-                    };
-                    return <StressEventRow key={ev.key} event={row as any} />;
-                  }
-                  const w = ev.window as RecoveryWindow;
-                  const row = {
-                    id: String((w as any).id),
-                    time: fmtTime(String((w as any).started_at)),
-                    label: (w as any).tag ?? 'Rest window',
-                    contribution: Math.round((w as any).recovery_contribution_pct ?? 0),
-                    tagged: (w as any).tag !== null && (w as any).tag !== undefined,
-                    tagLabel: (w as any).tag ?? undefined,
-                    onTag: (w as any).tag ? undefined : () => openTagSheet('recovery', w),
-                  };
-                  return <RecoveryEventRow key={ev.key} event={row as any} />;
-                })}
-              </View>
-            )}
-          </View>
-        ) : null}
-      </SectionCard>
 
       <TagBottomSheet
         visible={isTagSheetOpen && tagTarget != null}
@@ -706,8 +745,46 @@ export default function HomeScreen() {
 // ─── Styles ───────────────────────────────────────────────────────────────────
 
 const s = StyleSheet.create({
-  // keep home non-scroll by default (scrollEnabled toggles on expand)
-  scroll: { gap: 6, paddingBottom: 12, flexGrow: 1 },
+  // Content fills viewport when My Day is collapsed (scrollEnabled false); flexGrow + ScrollView flex:1 in ZenScreen.
+  scroll: { flexGrow: 1, paddingBottom: 8 },
+  screenColumn: {
+    flex: 1,
+    minHeight: 0,
+    gap: 6,
+  },
+  homeFill: {
+    flex: 1,
+    minHeight: 0,
+  },
+  cardsColumn: {
+    flex: 1,
+    minHeight: 0,
+    gap: 6,
+  },
+  outlookWrap: {
+    minWidth: 0,
+    minHeight: 0,
+  },
+  /** Share vertical space with live metrics card */
+  outlookWrapWithLive: {
+    flex: 1.65,
+  },
+  /** No live card: outlook uses remaining column space */
+  outlookWrapSolo: {
+    flex: 1,
+  },
+  nowWrap: {
+    flex: 1,
+    minWidth: 0,
+    minHeight: 0,
+  },
+  nowTouch: {
+    flex: 1,
+    minHeight: 0,
+  },
+  myDayOuter: {
+    flexShrink: 0,
+  },
   center: { flex: 1, alignItems: 'center', justifyContent: 'center' },
 
   polarDot: {
@@ -794,7 +871,7 @@ const s = StyleSheet.create({
   },
   collectingBanner: {
     marginHorizontal: 16,
-    marginBottom:     12,
+    marginBottom:     6,
     paddingHorizontal: 14,
     paddingVertical:   10,
     borderRadius:      10,
@@ -817,8 +894,17 @@ const s = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'space-between',
   },
-  outlookCard: { gap: 10, paddingVertical: 12, minHeight: 308 },
-  outlookCardExpanded: { minHeight: 360 },
+  outlookCard: {
+    flex: 1,
+    minHeight: 0,
+    gap: 8,
+    paddingVertical: 8,
+    overflow: 'hidden',
+  },
+  outlookTitleTouch: {
+    flex: 1,
+    minWidth: 0,
+  },
   outlookTopRow: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -846,8 +932,14 @@ const s = StyleSheet.create({
   readinessCenter: {
     alignItems: 'center',
     justifyContent: 'center',
-    paddingTop: 2,
-    gap: 8,
+    paddingTop: 0,
+    gap: 4,
+  },
+  outlookBriefScroll: {
+    flexShrink: 1,
+  },
+  outlookBriefScrollContent: {
+    paddingBottom: 4,
   },
   readinessLabel: {
     fontSize: 12,
@@ -932,7 +1024,7 @@ const s = StyleSheet.create({
     lineHeight: 16,
     marginTop: 2,
   },
-  nowCard: { gap: 8, paddingVertical: 8 },
+  nowCard: { flex: 1, minHeight: 0, gap: 6, paddingVertical: 6 },
   nowTopRow: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -960,9 +1052,9 @@ const s = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'flex-start',
     justifyContent: 'space-between',
-    gap: 6,
-    marginTop: 2,
-    marginBottom: 2,
+    gap: 4,
+    marginTop: 0,
+    marginBottom: 0,
   },
   currentRingCell: {
     flex: 1,
@@ -1009,8 +1101,8 @@ const s = StyleSheet.create({
   },
   // briefCardFixed/briefTopRow replaced by outlookCard/outlookTopRow
   briefMain: {
-    fontSize: 13,
-    lineHeight: 21,
+    fontSize: 12,
+    lineHeight: 18,
     color: ZEN.colors.white,
   },
   morningSummaryBtn: {
@@ -1048,7 +1140,7 @@ const s = StyleSheet.create({
   },
 
   // ── My day (expandable) ─────────────────────────────────────────
-  myDayCard: { gap: 10, paddingVertical: 8, marginBottom: 10 },
+  myDayCard: { gap: 8, paddingVertical: 6, marginBottom: 0 },
   myDayHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
   myDayRight: { flexDirection: 'row', alignItems: 'center', gap: 10 },
   myDayCount: { fontSize: 13, fontWeight: '500', color: ZEN.colors.textNear },

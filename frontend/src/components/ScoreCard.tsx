@@ -51,6 +51,9 @@ export default function ScoreCard({
       onPress={onPress}
       activeOpacity={onPress ? 0.7 : 1}
       style={[styles.card, { borderColor: cfg.border }, style]}
+      disabled={!onPress}
+      accessibilityRole={onPress ? 'button' : 'text'}
+      accessibilityLabel={`${label}: ${value != null ? Math.round(value) : 'no data'}${sub ? `. ${sub}` : ''}${isEstimated ? '. Estimated' : ''}`}
     >
       <Text style={[styles.label]}>{label}</Text>
       <Text style={[styles.score, { color: cfg.color }, large && styles.scoreLarge]}>

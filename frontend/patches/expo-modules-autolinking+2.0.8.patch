@@ -1,0 +1,156 @@
+diff --git a/node_modules/expo-modules-autolinking/scripts/android/autolinking_implementation.gradle b/node_modules/expo-modules-autolinking/scripts/android/autolinking_implementation.gradle
+index 98c404e..5615a5b 100644
+--- a/node_modules/expo-modules-autolinking/scripts/android/autolinking_implementation.gradle
++++ b/node_modules/expo-modules-autolinking/scripts/android/autolinking_implementation.gradle
+@@ -1,6 +1,92 @@
+ import groovy.json.JsonSlurper
++import java.nio.file.Files
++import java.nio.file.Path
+ import java.nio.file.Paths
+ 
++/** ZenFlow: Android Studio Gradle often has no `node` on PATH; respect NODE_BINARY in env / local.properties. */
++class ExpoAutolinkingNodeResolver {
++  /** Prefer symlink-safe NIO checks over File.isFile() (nvm/Homebrew shims). */
++  static String pickExecutable(String raw) {
++    if (raw == null) return null
++    def t = raw.trim()
++    if (t.isEmpty()) return null
++    try {
++      Path p = Paths.get(t).toAbsolutePath().normalize()
++      if (!Files.exists(p)) return null
++      Path use = p
++      try {
++        use = p.toRealPath()
++      } catch (Throwable ignored) {
++        use = p
++      }
++      if (Files.isExecutable(use)) return use.toString()
++      if (Files.isRegularFile(use)) return use.toString()
++    } catch (Throwable ignored) { }
++    return null
++  }
++
++  static String resolve(File projectDir, Object gradleRef = null) {
++    File root = projectDir != null ? projectDir : new File(System.getProperty('user.dir', '.'))
++    try {
++      if (gradleRef != null && gradleRef.ext?.has('zenflowNodeBinary')) {
++        def g = pickExecutable(gradleRef.ext.zenflowNodeBinary.toString())
++        if (g != null) return g
++      }
++    } catch (Throwable ignored) { }
++    def sp = pickExecutable(System.getProperty('NODE_BINARY'))
++    if (sp != null) return sp
++    def env = pickExecutable(System.getenv('NODE_BINARY'))
++    if (env != null) return env
++    try {
++      def lp = new File(root, 'local.properties')
++      if (lp.exists()) {
++        def props = new Properties()
++        lp.withInputStream { props.load(it) }
++        def p = pickExecutable(props.getProperty('NODE_BINARY'))
++        if (p != null) return p
++      }
++    } catch (Throwable ignored) { }
++    try {
++      def gp = new File(root, 'gradle.properties')
++      if (gp.exists()) {
++        def props = new Properties()
++        gp.withInputStream { props.load(it) }
++        def p = pickExecutable(props.getProperty('NODE_BINARY'))
++        if (p != null) return p
++      }
++    } catch (Throwable ignored) { }
++    def brew = pickExecutable('/opt/homebrew/bin/node')
++    if (brew != null) return brew
++    def usrLocal = pickExecutable('/usr/local/bin/node')
++    if (usrLocal != null) return usrLocal
++    def usrBin = pickExecutable('/usr/bin/node')
++    if (usrBin != null) return usrBin
++    def win = pickExecutable('C:/Program Files/nodejs/node.exe')
++    if (win != null) return win
++    try {
++      def os = System.getProperty('os.name', '').toLowerCase()
++      if (os.contains('windows')) {
++        def proc = ['cmd', '/c', 'where node'].execute(null, root)
++        proc.waitFor()
++        if (proc.exitValue() == 0) {
++          def line = proc.text.readLines().find { it && pickExecutable(it.trim()) != null }
++          if (line) return pickExecutable(line.trim())
++        }
++      } else {
++        def proc = ['/bin/bash', '-lc', 'command -v node'].execute(null, root)
++        proc.waitFor()
++        if (proc.exitValue() == 0) {
++          def line = proc.text.readLines().find { it && pickExecutable(it.trim()) != null }
++          if (line) return pickExecutable(line.trim())
++        }
++      }
++    } catch (Throwable ignored) { }
++    throw new GradleException(
++      "ZenFlow: could not resolve Node for Expo autolinking. Set NODE_BINARY in android/local.properties (run: which node), " +
++      "or pass -DNODE_BINARY=/path/to/node in org.gradle.jvmargs in android/gradle.properties."
++    )
++  }
++}
+ 
+ // Object representing a gradle project.
+ class ExpoModuleGradleProject {
+@@ -95,14 +181,17 @@ class ExpoAutolinkingManager {
+   private File projectDir
+   private Map options
+   private Object cachedResolvingResults
++  /** ZenFlow: optional Gradle handle so Node resolution can prefer gradle.ext.zenflowNodeBinary from settings.gradle. */
++  private final Object gradleRef
+ 
+   static String generatedPackageListNamespace = 'expo.modules'
+   static String generatedPackageListFilename = 'ExpoModulesPackageList.java'
+   static String generatedFilesSrcDir = 'generated/expo/src/main/java'
+ 
+-  ExpoAutolinkingManager(File projectDir, Map options = [:]) {
++  ExpoAutolinkingManager(File projectDir, Map options = [:], Object gradleRef = null) {
+     this.projectDir = projectDir
+     this.options = options
++    this.gradleRef = gradleRef
+   }
+ 
+   Object resolve(ProviderFactory providers, shouldUseCachedValue=false) {
+@@ -112,7 +201,7 @@ class ExpoAutolinkingManager {
+     if (shouldUseCachedValue) {
+       logger.warn("Warning: Expo modules were resolved multiple times. Probably something is wrong with the project configuration.")
+     }
+-    String[] args = convertOptionsToCommandArgs('resolve', this.options)
++    String[] args = convertOptionsToCommandArgs('resolve', this.options, this.projectDir, this.gradleRef)
+     args += ['--json']
+ 
+     String output = providers.exec {
+@@ -149,7 +238,7 @@ class ExpoAutolinkingManager {
+   }
+ 
+   static void generatePackageList(Project project, Map options) {
+-    String[] args = convertOptionsToCommandArgs('generate-package-list', options)
++    String[] args = convertOptionsToCommandArgs('generate-package-list', options, project.rootDir, project.gradle)
+ 
+     // Construct absolute path to generated package list.
+     def generatedFilePath = getGeneratedFilePath(project)
+@@ -173,9 +262,10 @@ class ExpoAutolinkingManager {
+     }.result.get().assertNormalExitValue()
+   }
+ 
+-  static private String[] convertOptionsToCommandArgs(String command, Map options) {
++  static private String[] convertOptionsToCommandArgs(String command, Map options, File projectDir, Object gradleRef = null) {
++    def nodeCmd = ExpoAutolinkingNodeResolver.resolve(projectDir, gradleRef)
+     String[] args = [
+-      'node',
++      nodeCmd,
+       '--no-warnings',
+       '--eval',
+       // Resolve the `expo` > `expo-modules-autolinking` chain from the project root
+@@ -231,7 +321,7 @@ if (rootProject instanceof ProjectDescriptor) {
+   // Method to be used in `settings.gradle`. Options passed here will have an effect in `build.gradle` context as well,
+   // i.e. adding the dependencies and generating the package list.
+   ext.useExpoModules = { Map options = [:] ->
+-    ExpoAutolinkingManager manager = new ExpoAutolinkingManager(rootProject.projectDir, options)
++    ExpoAutolinkingManager manager = new ExpoAutolinkingManager(rootProject.projectDir, options, gradle)
+     ExpoModule[] modules = manager.getModules(providers)
+     MavenRepo[] extraMavenRepos = manager.getExtraMavenRepos(providers)
+ 

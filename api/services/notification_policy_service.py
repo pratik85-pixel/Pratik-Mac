@@ -11,6 +11,7 @@ Builds user notification feed and applies actions for:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from datetime import UTC, date, datetime, timedelta
@@ -426,7 +427,10 @@ class NotificationPolicyService:
                     trigger_type=trigger_type,
                     trigger_context=trigger_context,
                 )
-                raw = self._llm_client.chat(sys_prompt, user_prompt)
+                # Offload sync OpenAI call to a worker thread.
+                raw = await asyncio.to_thread(
+                    self._llm_client.chat, sys_prompt, user_prompt
+                )
                 cleaned = raw.strip()
                 cleaned = re.sub(r"^```(?:json)?\\n?", "", cleaned)
                 cleaned = re.sub(r"\\n?```$", "", cleaned)

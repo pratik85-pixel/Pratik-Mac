@@ -28,11 +28,15 @@ from api.db.database import get_db, AsyncSessionLocal
 from api.db.schema import CoachMessage, ConversationEvent
 from api.services.model_service import ModelService
 from api.services.coach_service import CoachService
-from api.services.conversation_service import ConversationService
+from api.services.conversation_service import (
+    ConversationService,
+    ConversationNotFoundError,
+    ConversationOwnerMismatchError,
+)
 from api.services.tracking_service import TrackingService
 from api.utils import parse_uuid
 from tracking.cycle_boundaries import product_calendar_timezone
-from api.rate_limiter import conversation_limiter
+from api.rate_limiter import conversation_limiter, llm_unit_limiter
 from api.auth import UserIdDep
 
 logger = logging.getLogger(__name__)
@@ -212,6 +216,7 @@ async def post_session_brief(
     Generate coaching message for a just-completed session.
     The session outcome must already be stored via POST /session/{id}/end.
     """
+    llm_unit_limiter.check(user_id)
     # Retrieve cached outcome from session_service (held after end_session)
     svc = request.app.state.session_service
     outcome: Optional[SessionOutcome] = svc.get_cached_outcome(session_id, user_id=user_id)
@@ -241,6 +246,7 @@ async def nudge(
     db:        AsyncSession = Depends(get_db),
 ) -> dict:
     """Generate a short mid-day nudge when gates (window/cap/data) pass."""
+    llm_unit_limiter.check(user_id)
     decision = await _gated_nudge_decision(
         user_id=user_id,
         db=db,
@@ -278,21 +284,28 @@ async def conversation_turn(
         result = await conv_svc.process_turn(
             conversation_id, body.message,
             model_service=model_svc, db=db,
+            caller_user_id=user_id,
         )
-    except ValueError as exc:
-        if "not found" in str(exc):
-            # Stale conversation_id (server restarted, in-memory store wiped).
-            # Open a fresh conversation and retry transparently.
-            conversation_id = await conv_svc.open(user_id, trigger_context="user_initiated")
-            result = await conv_svc.process_turn(
-                conversation_id, body.message,
-                model_service=model_svc, db=db,
-            )
-        else:
-            raise
+    except ConversationNotFoundError:
+        # Stale conversation_id (server restarted, in-memory store wiped).
+        # Open a fresh conversation and retry transparently.
+        conversation_id = await conv_svc.open(user_id, trigger_context="user_initiated")
+        result = await conv_svc.process_turn(
+            conversation_id, body.message,
+            model_service=model_svc, db=db,
+            caller_user_id=user_id,
+        )
+    except ConversationOwnerMismatchError:
+        raise HTTPException(status_code=403, detail="conversation does not belong to caller")
 
     if not result.session_open:
-        await conv_svc.close_and_persist(conversation_id, db=db)
+        try:
+            await conv_svc.close_and_persist(
+                conversation_id, db=db, caller_user_id=user_id,
+            )
+        except ConversationOwnerMismatchError:
+            # Race: owner changed between process_turn and close — safe to ignore.
+            logger.warning("owner_mismatch on close_and_persist conv=%s", conversation_id)
 
     payload = result.reply_payload or {}
     return CoachReply(
@@ -342,8 +355,13 @@ async def close_conversation(
     conv_svc: ConversationService = Depends(_conv_svc),
     db:       AsyncSession        = Depends(get_db),
 ) -> dict:
-    """Explicitly close a conversation session."""
-    await conv_svc.close_and_persist(conversation_id, db=db)
+    """Explicitly close a conversation session (owner-only)."""
+    try:
+        await conv_svc.close_and_persist(
+            conversation_id, db=db, caller_user_id=user_id,
+        )
+    except ConversationOwnerMismatchError:
+        raise HTTPException(status_code=403, detail="conversation does not belong to caller")
     return {"closed": True, "conversation_id": conversation_id}
 
 
@@ -361,6 +379,7 @@ async def get_morning_brief(
     UserUnifiedProfile. If the cache is stale/missing for today, this endpoint
     attempts a best-effort refresh before returning.
     """
+    llm_unit_limiter.check(user_id)
     import api.db.schema as _db
     from coach.morning_brief import clear_morning_bundle_uup, generate_morning_brief
 
@@ -453,6 +472,7 @@ async def get_yesterday_summary(
 
     Generated best-effort and cached in UserUnifiedProfile.
     """
+    llm_unit_limiter.check(user_id)
     import api.db.schema as _db
     from coach.yesterday_summary import clear_yesterday_summary_uup, generate_yesterday_summary
 
@@ -529,6 +549,7 @@ async def nudge_check(
 
     Returns should_nudge=True + generated message only when all gates pass.
     """
+    llm_unit_limiter.check(user_id)
     return await _gated_nudge_decision(
         user_id=user_id,
         db=db,
@@ -547,6 +568,7 @@ async def evening_checkin(
     Synthesise today's physio data into a brief evening check-in.
     Called at ~18:30 IST or on user demand.
     """
+    llm_unit_limiter.check(user_id)
     from coach.data_assembler import assemble_for_user
 
     uid = _user_uuid_for_coach(user_id)
@@ -571,6 +593,7 @@ async def night_closure(
     Gate: must be called at or after 21:30 IST — returns 409 if too early.
     Persists tomorrow_seed into UserUnifiedProfile.coach_narrative.
     """
+    llm_unit_limiter.check(user_id)
     from sqlalchemy import select as _select
     import api.db.schema as _db
     from coach.data_assembler import assemble_for_user

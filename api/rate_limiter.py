@@ -44,7 +44,22 @@ class RollingRateLimiter:
 
 
 # ── Shared singletons — one instance per process ──────────────────────────────
+from api.config import get_settings as _get_settings
+
+_cfg = _get_settings()
+
 # conversation: 10 turns per user per 60 s  (normal usage: 1–3 per session)
 conversation_limiter: RollingRateLimiter = RollingRateLimiter(max_calls=10, window_seconds=60)
 # ingest: 20 batches per user per 60 s  (normal: ~1 per 5 min from the band)
 ingest_limiter: RollingRateLimiter = RollingRateLimiter(max_calls=20, window_seconds=60)
+
+# Shared LLM bucket — every coach endpoint that invokes the LLM charges
+# against the same per-user counter so an attacker cannot fan-out across
+# endpoints to drain credit.  Defaults: 30 LLM requests per 60 s per user.
+llm_unit_limiter: RollingRateLimiter = RollingRateLimiter(
+    max_calls=_cfg.LLM_RATE_MAX_CALLS,
+    window_seconds=_cfg.LLM_RATE_WINDOW_SECONDS,
+)
+
+# WebSocket connections per user — guards against runaway reconnect loops.
+ws_conn_limiter: RollingRateLimiter = RollingRateLimiter(max_calls=10, window_seconds=60)

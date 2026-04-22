@@ -73,18 +73,16 @@ export default function WaveformChart({
   const chartH = height - PADDING_TOP - PADDING_BOTTOM;
   const chartW = SVG_W - PADDING_LEFT - PADDING_RIGHT;
 
-  if (!points || points.length < 2) {
-    return (
-      <View style={[styles.empty, { height }]}>
-        <Text style={styles.emptyText}>No data yet for this day</Text>
-      </View>
-    );
-  }
-
+  // IMPORTANT: do not early-return before calling hooks. React requires the same
+  // number and order of hooks on every render — returning above `useMemo` when
+  // `points.length` crosses the threshold causes runtime corruption.
   const derived = useMemo(() => {
+    if (!points || points.length < 2) {
+      return { kind: 'empty' as const, reason: 'no-data' as const };
+    }
     const valid = points.filter((p) => p.rmssd_ms && p.rmssd_ms > 0 && p.window_start);
     if (valid.length < 2) {
-      return { kind: 'empty' as const };
+      return { kind: 'empty' as const, reason: 'invalid' as const };
     }
 
     // Single-pass min/max (avoid Math.min(...arr) / Math.max(...arr) for large arrays)
@@ -184,9 +182,10 @@ export default function WaveformChart({
   }, [points, events, variant, chartH, chartW]);
 
   if (derived.kind === 'empty') {
+    const msg = derived.reason === 'no-data' ? 'No data yet for this day' : 'No waveform data';
     return (
       <View style={[styles.empty, { height }]}>
-        <Text style={styles.emptyText}>No waveform data</Text>
+        <Text style={styles.emptyText}>{msg}</Text>
       </View>
     );
   }

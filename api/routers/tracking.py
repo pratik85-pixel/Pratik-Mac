@@ -22,7 +22,7 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.db.database import get_db, AsyncSessionLocal
@@ -547,7 +547,9 @@ class BeatSample(BaseModel):
 
 
 class IngestRequest(BaseModel):
-    beats:     list[BeatSample]
+    # Cap the batch size to protect the event loop and DB from abusive clients.
+    # 5000 samples comfortably covers a 30-minute window at 1 Hz plus overhead.
+    beats:     list[BeatSample] = Field(..., max_length=5000)
     context:   str   = "background"   # "background" | "sleep"
     acc_mean:  Optional[float] = None
     gyro_mean: Optional[float] = None
@@ -576,61 +578,19 @@ async def ingest_beats(
     detection is a no-op (returns early) until the personal baseline is built.
     """
     ingest_limiter.check(user_id)
-    if not body.beats:
-        return IngestResponse(windows_processed=0, beats_received=0)
+    from api.services.ingest_pipeline import ingest_beat_batch, BeatLike
 
-    context = body.context if body.context in ("background", "sleep") else "background"
-
-    # Sort by timestamp
-    beats = sorted(body.beats, key=lambda b: b.ts)
-
-    WINDOW_SEC = 300  # 5 minutes
-
-    # Group beats into 5-min buckets anchored to the first beat
-    bucket_start_ts = beats[0].ts
-    buckets: list[list[BeatSample]] = []
-    current: list[BeatSample] = []
-
-    for beat in beats:
-        if beat.ts - bucket_start_ts >= WINDOW_SEC and current:
-            buckets.append(current)
-            current = []
-            bucket_start_ts = beat.ts
-        current.append(beat)
-
-    if current:
-        buckets.append(current)
-
-    windows_processed = 0
-    first_win_start: Optional[datetime] = None
-    for bucket in buckets:
-        ppi_vals = [b.ppi_ms for b in bucket]
-        ts_vals  = [b.ts for b in bucket]
-        win_start = datetime.fromtimestamp(bucket[0].ts, tz=UTC)
-        win_end   = datetime.fromtimestamp(bucket[-1].ts, tz=UTC)
-
-        if first_win_start is None:
-            first_win_start = win_start
-
-        try:
-            await svc.ingest_background_window(
-                ppi_ms       = ppi_vals,
-                timestamps   = ts_vals,
-                window_start = win_start,
-                window_end   = win_end,
-                context      = context,
-                acc_mean     = body.acc_mean,
-                gyro_mean    = body.gyro_mean,
-            )
-            windows_processed += 1
-        except Exception:
-            logger.exception("ingest_background_window failed for window %s", win_start)
-
-    logger.info("INGEST uid=%s context=%s windows_processed=%d beats=%d", svc._uid, context, windows_processed, len(beats))
-
+    beats_like = [BeatLike(ts=b.ts, ppi_ms=b.ppi_ms) for b in body.beats]
+    windows_processed, beats_received = await ingest_beat_batch(
+        svc,
+        beats=beats_like,
+        context=body.context,
+        acc_mean=body.acc_mean,
+        gyro_mean=body.gyro_mean,
+    )
     return IngestResponse(
         windows_processed=windows_processed,
-        beats_received=len(beats),
+        beats_received=beats_received,
     )
 
 

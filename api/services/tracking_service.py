@@ -2299,12 +2299,15 @@ class TrackingService:
         return boundaries
 
     async def _count_days_with_data(self) -> int:
+        # Use SQL COUNT(*) rather than loading every row into memory.
+        from sqlalchemy import func as _func
         result = await self._db.execute(
-            select(db.DailyStressSummary)
+            select(_func.count())
+            .select_from(db.DailyStressSummary)
             .where(db.DailyStressSummary.user_id == self._uid)
             .where(db.DailyStressSummary.is_partial_data == False)  # noqa: E712
         )
-        return len(result.scalars().all())
+        return int(result.scalar() or 0)
 
     @staticmethod
     def _db_stress_to_results(rows: Sequence[db.StressWindow]) -> list[StressWindowResult]:

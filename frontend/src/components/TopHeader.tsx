@@ -10,6 +10,8 @@ interface TopHeaderProps {
   rightIcon?: React.ReactNode;
   onLeftPress?: () => void;
   onRightPress?: () => void;
+  leftLabel?: string;
+  rightLabel?: string;
 }
 
 export default function TopHeader({
@@ -20,6 +22,8 @@ export default function TopHeader({
   rightIcon,
   onLeftPress,
   onRightPress,
+  leftLabel,
+  rightLabel,
 }: TopHeaderProps) {
   return (
     <View style={s.row}>
@@ -29,12 +33,18 @@ export default function TopHeader({
         onPress={onLeftPress}
         activeOpacity={0.8}
         disabled={!onLeftPress}
+        accessibilityRole={onLeftPress ? 'button' : 'none'}
+        accessibilityLabel={leftLabel}
       >
         {leftIcon ?? <View style={s.placeholder} />}
       </TouchableOpacity>
 
       {/* Center */}
-      <View style={s.center}>
+      <View
+        style={s.center}
+        accessibilityRole="header"
+        accessibilityLabel={eyebrow ? `${eyebrow}. ${title}${subtitle ? `. ${subtitle}` : ''}` : title}
+      >
         {eyebrow ? (
           <Text style={s.eyebrow}>{eyebrow}</Text>
         ) : null}
@@ -50,6 +60,8 @@ export default function TopHeader({
         onPress={onRightPress}
         activeOpacity={0.8}
         disabled={!onRightPress}
+        accessibilityRole={onRightPress ? 'button' : 'none'}
+        accessibilityLabel={rightLabel}
       >
         {rightIcon ?? <View style={s.placeholder} />}
       </TouchableOpacity>

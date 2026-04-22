@@ -103,6 +103,11 @@ class Session(Base):
     user = relationship("User", back_populates="sessions")
     metrics = relationship("Metric", back_populates="session")
 
+    __table_args__ = (
+        Index("ix_sessions_user_started", "user_id", "started_at"),
+        Index("ix_sessions_user_context_started", "user_id", "context", "started_at"),
+    )
+
 
 # ── Metrics (time-series) ──────────────────────────────────────────────────────
 
@@ -507,6 +512,10 @@ class CoachMessage(Base):
 
     user = relationship("User", back_populates="coach_messages")
 
+    __table_args__ = (
+        Index("ix_coach_messages_user_type_created", "user_id", "message_type", "created_at"),
+    )
+
 
 class ConversationEvent(Base):
     """Individual turns in a coach conversation."""
@@ -522,6 +531,10 @@ class ConversationEvent(Base):
     # Extracted signals (from conversation_extractor — coach turns only)
     extracted_events = Column(JSON, nullable=True)
     plan_adjusted    = Column(Boolean, default=False)
+
+    __table_args__ = (
+        Index("ix_conversation_events_user_ts", "user_id", "ts"),
+    )
 
 
 # ── Outcomes ───────────────────────────────────────────────────────────────────

@@ -64,7 +64,13 @@ export default function EventRow({ type, event, onTagPress }: EventRowProps) {
 
       {/* Tag CTA */}
       {showTagCta ? (
-        <TouchableOpacity onPress={onTagPress} style={styles.tagCta}>
+        <TouchableOpacity
+          onPress={onTagPress}
+          style={styles.tagCta}
+          accessibilityRole="button"
+          accessibilityLabel="Tag this event"
+          accessibilityHint="Opens the tagging sheet"
+        >
           <Text style={styles.tagCtaText}>Tag?</Text>
         </TouchableOpacity>
       ) : (

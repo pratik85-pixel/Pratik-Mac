@@ -51,6 +51,9 @@ export default function VoiceInput({ onStopRecording }: VoiceInputProps) {
           onPressOut={handleMicPressOut}
           style={styles.iconBtn}
           activeOpacity={0.7}
+          accessibilityRole="button"
+          accessibilityLabel={isRecording ? 'Stop recording' : 'Hold to record voice message'}
+          accessibilityState={{ selected: isRecording }}
         >
           <Animated.View style={{ transform: [{ scale: scaleAnim }] }}>
             <Ionicons
@@ -64,6 +67,10 @@ export default function VoiceInput({ onStopRecording }: VoiceInputProps) {
           style={[styles.sendBtn, text.trim().length > 0 && styles.sendBtnActive]}
           onPress={submitText}
           activeOpacity={0.8}
+          disabled={text.trim().length === 0}
+          accessibilityRole="button"
+          accessibilityLabel="Send message"
+          accessibilityState={{ disabled: text.trim().length === 0 }}
         >
           <Ionicons name="arrow-up" size={17} color="#FFF" />
         </TouchableOpacity>

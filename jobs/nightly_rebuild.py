@@ -650,7 +650,12 @@ async def _rebuild_one_user(
             sys_prompt, user_prompt = build_layer2_narrative_prompt(packet)
 
             if llm_client is not None:
-                raw = llm_client.chat(sys_prompt, user_prompt, json_mode=False)
+                # Offload sync OpenAI call to a worker thread so the nightly
+                # job does not block the event loop (and, by extension, any
+                # other cohabiting async tasks in this process).
+                raw = await asyncio.to_thread(
+                    llm_client.chat, sys_prompt, user_prompt, False
+                )
                 narrative = (raw or "").strip()
                 if not narrative:
                     narrative = _fallback_layer2_narrative(packet)
@@ -723,43 +728,85 @@ async def run_nightly_rebuild(llm_client: Optional[Any] = None) -> dict:
     dict with keys: total, succeeded, failed, skipped, duration_seconds
     """
     from api.db.database import AsyncSessionLocal
+    from sqlalchemy import text
 
     started_at = datetime.now(UTC)
     log.info("nightly_rebuild START %s", started_at.isoformat())
 
-    if llm_client is None:
-        llm_client = _build_llm_client()
+    # ── Postgres advisory lock ────────────────────────────────────────────────
+    # Every replica's scheduler will race to run this at the same cron tick.
+    # A session-scoped advisory lock guarantees only one worker (across the
+    # whole DB) executes the job at a time; others bail out quickly.
+    _LOCK_KEY = 7431_0001  # arbitrary but stable
+    async with AsyncSessionLocal() as lock_session:
+        got_lock = (
+            await lock_session.execute(
+                text("SELECT pg_try_advisory_lock(:k)"), {"k": _LOCK_KEY}
+            )
+        ).scalar()
+        if not got_lock:
+            log.info("nightly_rebuild SKIP — another worker holds the advisory lock")
+            return {
+                "total": 0, "succeeded": 0, "failed": 0, "skipped": 1,
+                "duration_seconds": 0.0, "started_at": started_at.isoformat(),
+                "reason": "advisory_lock_busy",
+            }
 
-    succeeded = 0
-    failed    = 0
-    skipped   = 0
-    results   = []
+        try:
+            if llm_client is None:
+                llm_client = _build_llm_client()
 
-    async with AsyncSessionLocal() as session:
-        user_ids = await _get_active_user_ids(session)
-        log.info("nightly_rebuild active_users=%d", len(user_ids))
+            succeeded = 0
+            failed    = 0
+            skipped   = 0
+            results   = []
 
-        for user_id in user_ids:
-            # Use a fresh session per user to isolate failures
-            async with AsyncSessionLocal() as user_session:
-                r = await _rebuild_one_user(user_session, user_id, llm_client)
+            async with AsyncSessionLocal() as session:
+                user_ids = await _get_active_user_ids(session)
+                log.info("nightly_rebuild active_users=%d", len(user_ids))
+
+            # Process users with bounded concurrency so long LLM calls
+            # overlap but we never spawn an unbounded number of sessions.
+            max_concurrent = int(os.getenv("NIGHTLY_REBUILD_CONCURRENCY", "4"))
+            sem = asyncio.Semaphore(max(1, max_concurrent))
+
+            async def _run_one(user_id):
+                async with sem:
+                    async with AsyncSessionLocal() as user_session:
+                        return await _rebuild_one_user(user_session, user_id, llm_client)
+
+            tasks = [asyncio.create_task(_run_one(uid)) for uid in user_ids]
+            for fut in asyncio.as_completed(tasks):
+                try:
+                    r = await fut
+                except Exception as exc:
+                    log.exception("nightly_rebuild user failed: %s", exc)
+                    r = {"status": "error", "error": str(exc)}
                 results.append(r)
-                if r["status"] == "ok":
+                if r.get("status") == "ok":
                     succeeded += 1
                 else:
                     failed += 1
 
-    duration = (datetime.now(UTC) - started_at).total_seconds()
-    summary = {
-        "total":            len(results),
-        "succeeded":        succeeded,
-        "failed":           failed,
-        "skipped":          skipped,
-        "duration_seconds": round(duration, 2),
-        "started_at":       started_at.isoformat(),
-    }
-    log.info("nightly_rebuild END %s", summary)
-    return summary
+            duration = (datetime.now(UTC) - started_at).total_seconds()
+            summary = {
+                "total":            len(results),
+                "succeeded":        succeeded,
+                "failed":           failed,
+                "skipped":          skipped,
+                "duration_seconds": round(duration, 2),
+                "started_at":       started_at.isoformat(),
+            }
+            log.info("nightly_rebuild END %s", summary)
+            return summary
+        finally:
+            try:
+                await lock_session.execute(
+                    text("SELECT pg_advisory_unlock(:k)"), {"k": _LOCK_KEY}
+                )
+                await lock_session.commit()
+            except Exception:
+                log.warning("nightly_rebuild advisory unlock failed", exc_info=True)
 
 
 def _build_llm_client() -> Optional[Any]:

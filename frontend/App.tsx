@@ -2,6 +2,8 @@ import React, { useEffect, useRef, useState } from 'react';
 import { AppState, AppStateStatus, View, ActivityIndicator, StyleSheet, Platform, PermissionsAndroid } from 'react-native';
 import * as IntentLauncher from 'expo-intent-launcher';
 import { NavigationContainer } from '@react-navigation/native';
+import { QueryClientProvider } from '@tanstack/react-query';
+import { queryClient } from './src/api/queryClient';
 import { initClient } from './src/api/client';
 import { getUser, saveApiBase, getApiBase } from './src/store/auth';
 import { setUserId } from './src/api/client';
@@ -121,9 +123,11 @@ export default function App() {
   }
 
   return (
-    <NavigationContainer theme={NAV_THEME}>
-      <AppNavigator initialRouteName={hasUser ? 'Main' : 'Onboarding'} />
-    </NavigationContainer>
+    <QueryClientProvider client={queryClient}>
+      <NavigationContainer theme={NAV_THEME}>
+        <AppNavigator initialRouteName={hasUser ? 'Main' : 'Onboarding'} />
+      </NavigationContainer>
+    </QueryClientProvider>
   );
 }
 
