@@ -26,7 +26,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 import api.db.schema as db
 from coach.text_sanitizer import sanitize_text
-from tracking.cycle_boundaries import local_today, product_calendar_timezone
+from tracking.cycle_boundaries import (
+    local_today,
+    product_calendar_timezone,
+    recap_yesterday_local_date,
+    utc_instant_bounds_for_local_calendar_date,
+)
 
 
 def _sanitize_text(text: Optional[str], *, max_len: int = 200) -> str:
@@ -48,6 +53,106 @@ def _pct_str(delta_frac: float, *, reference: str) -> str:
     sign = "-" if delta_frac < 0 else "+"
     above_below = "below" if delta_frac < 0 else "above"
     return f"{sign}{abs_pct:.0f}% {above_below} {reference}"
+
+
+def _coverage_label_from_hours(hours: Optional[float]) -> Optional[str]:
+    """
+    Bucket wear-hours into a descriptive label. This is context data — the
+    model is free to interpret or ignore it. Buckets are intentionally coarse.
+    """
+    if hours is None:
+        return None
+    if hours <= 0:
+        return "none"
+    if hours < 8:
+        return "low"
+    if hours < 16:
+        return "partial"
+    return "full"
+
+
+async def _compute_band_coverage(
+    session: AsyncSession,
+    user_id: uuid_mod.UUID,
+    *,
+    now_utc: datetime,
+    days: int = 7,
+) -> dict[str, Any]:
+    """
+    Compute deterministic band-wear coverage for yesterday (local calendar)
+    and a per-day hours list for the trailing `days` days.
+
+    Returns a dict with:
+      - yesterday_wear_hours: float | None
+      - yesterday_coverage_label: "full" | "partial" | "low" | "none" | None
+      - wear_hours_last7: list[float]  (oldest → newest, length == days)
+      - has_sleep_data_yesterday: bool
+    """
+    yesterday_local = recap_yesterday_local_date(now_utc)
+    window_start = yesterday_local - timedelta(days=days - 1)
+
+    range_start_utc, _ = utc_instant_bounds_for_local_calendar_date(window_start)
+    _, range_end_utc = utc_instant_bounds_for_local_calendar_date(yesterday_local)
+
+    res = await session.execute(
+        select(db.BandWearSession)
+        .where(
+            and_(
+                db.BandWearSession.user_id == user_id,
+                db.BandWearSession.started_at < range_end_utc,
+            )
+        )
+    )
+    rows = list(res.scalars().all())
+
+    # Per-day accumulator (minutes)
+    day_minutes: dict[date, float] = {
+        (window_start + timedelta(days=i)): 0.0 for i in range(days)
+    }
+    has_sleep_yday = False
+
+    for bws in rows:
+        started = bws.started_at
+        # Treat an open session as running up to now_utc so partial sessions
+        # still contribute hours. Respect tz-awareness.
+        ended = bws.ended_at or now_utc
+        if started is None:
+            continue
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=UTC)
+        if ended.tzinfo is None:
+            ended = ended.replace(tzinfo=UTC)
+        if ended <= range_start_utc or started >= range_end_utc:
+            continue
+
+        # Walk each day in window; clip session to that day's UTC span.
+        for d in list(day_minutes.keys()):
+            d_start_utc, d_end_utc = utc_instant_bounds_for_local_calendar_date(d)
+            lo = started if started > d_start_utc else d_start_utc
+            hi = ended if ended < d_end_utc else d_end_utc
+            if hi <= lo:
+                continue
+            day_minutes[d] += (hi - lo).total_seconds() / 60.0
+
+            if d == yesterday_local and getattr(bws, "has_sleep_data", False):
+                has_sleep_yday = True
+
+    wear_hours_last7: list[float] = []
+    for d in sorted(day_minutes.keys()):
+        wear_hours_last7.append(round(day_minutes[d] / 60.0, 2))
+
+    y_minutes = day_minutes.get(yesterday_local, 0.0)
+    y_hours: Optional[float] = round(y_minutes / 60.0, 2) if y_minutes is not None else None
+    # Treat zero wear as "none" (still a meaningful signal), not null.
+    label = _coverage_label_from_hours(y_hours)
+
+    return {
+        "yesterday_date": yesterday_local.isoformat(),
+        "yesterday_wear_hours": y_hours,
+        "yesterday_coverage_label": label,
+        "wear_hours_last7": wear_hours_last7,
+        "has_sleep_data_yesterday": bool(has_sleep_yday),
+    }
 
 
 def _compute_sleep_recovery_score_from_raw(
@@ -128,6 +233,11 @@ class CoachInputPacket:
 
     # ── Existing UUP traits (personality lens + continuity) ───────────────
     uup: dict[str, Any] = field(default_factory=dict)
+
+    # ── Band-wear coverage (yesterday + 7d trend) ─────────────────────────
+    # Deterministic context only. The model is free to factor it in or ignore
+    # it; no hard rule maps these values to any output field.
+    band_coverage: dict[str, Any] = field(default_factory=dict)
 
     # ── Future placeholders (not wired yet) ───────────────────────────────
     future_signals: dict[str, Any] = field(default_factory=dict)
@@ -647,6 +757,21 @@ async def build_coach_input_packet(
         "total_deviations": len(dev_rows),
     }
 
+    # ── Band-wear coverage (yesterday + 7d trend) ─────────────────────────
+    # Open context: we surface hours + a coarse label. The prompt layers pass
+    # this into the LLM without attaching any rule. The response layer can
+    # also echo it into API payloads for UI cues, independently of the LLM.
+    try:
+        band_coverage = await _compute_band_coverage(session, user_id, now_utc=now_utc)
+    except Exception:
+        band_coverage = {
+            "yesterday_date": None,
+            "yesterday_wear_hours": None,
+            "yesterday_coverage_label": None,
+            "wear_hours_last7": [],
+            "has_sleep_data_yesterday": False,
+        }
+
     # ── Future signals (best-effort) ──────────────────────────────────────
     future_signals: dict[str, Any] = {
         "hr_bpm_resting": getattr(pm, "rmssd_resting_hr_bpm", None) if pm is not None else None,
@@ -688,6 +813,7 @@ async def build_coach_input_packet(
         plan_deviations_30d=plan_deviations_30d,
         adherence_30d=adherence_30d,
         uup=uup,
+        band_coverage=band_coverage,
         future_signals=future_signals,
     )
 

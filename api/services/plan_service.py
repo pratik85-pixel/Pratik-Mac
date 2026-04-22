@@ -280,9 +280,11 @@ class PlanService:
             brief = obj.get("brief")
             avoid_items = obj.get("avoid_items") or []
 
-            # Shape/limit for safety.
+            # Shape/limit for safety. Cap to ONE avoid item per the
+            # forward-looking plan contract — the plan section is about
+            # today's DOs; exactly one "ease off" line is enough.
             out_avoid: list[dict[str, Any]] = []
-            for it in avoid_items[:2]:
+            for it in avoid_items[:1]:
                 if not isinstance(it, dict):
                     continue
                 slug_or_label = it.get("slug_or_label") or it.get("label")
@@ -293,7 +295,9 @@ class PlanService:
                     {"slug_or_label": str(slug_or_label)[:100], "reason": str(reason)[:300]}
                 )
 
-            result = {"brief": str(brief)[:600] if brief is not None else None, "avoid_items": out_avoid}
+            # 900-char cap leaves room for a fuller forward-looking brief
+            # (ordering of activities, timing cues) without risking unbounded LLM output.
+            result = {"brief": str(brief)[:900] if brief is not None else None, "avoid_items": out_avoid}
 
             # Cache brief + avoid_items in UUP so the plan cache path can return them too.
             try:

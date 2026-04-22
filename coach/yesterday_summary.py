@@ -27,7 +27,8 @@ log = logging.getLogger(__name__)
 _OFFLINE_YESTERDAY_SUMMARY = {
     "weekly_trend": "Your summary is being prepared. Check back in a moment.",
     "yesterday_stress": "I don't have yesterday’s stress details yet.",
-    "yesterday_recovery": "I don't have yesterday’s recovery details yet.",
+    "yesterday_waking_recovery": "I don't have yesterday’s waking recovery details yet.",
+    "yesterday_sleep_recovery": "I don't have yesterday’s sleep recovery details yet.",
     "yesterday_adherence": "I don't have yesterday’s plan adherence details yet.",
 }
 
@@ -54,6 +55,8 @@ async def clear_yesterday_summary_uup(
             yesterday_summary_weekly_trend=None,
             yesterday_summary_stress=None,
             yesterday_summary_recovery=None,
+            yesterday_summary_waking_recovery=None,
+            yesterday_summary_sleep_recovery=None,
             yesterday_summary_adherence=None,
             yesterday_summary_generated_for=cycle_ist,
             yesterday_summary_generated_at=now_utc,
@@ -65,6 +68,8 @@ async def clear_yesterday_summary_uup(
         uup.yesterday_summary_weekly_trend = None
         uup.yesterday_summary_stress = None
         uup.yesterday_summary_recovery = None
+        uup.yesterday_summary_waking_recovery = None
+        uup.yesterday_summary_sleep_recovery = None
         uup.yesterday_summary_adherence = None
         uup.yesterday_summary_generated_for = cycle_ist
         uup.yesterday_summary_generated_at = now_utc
@@ -154,7 +159,11 @@ async def _run_yesterday_summary(
     fields = {
         "yesterday_summary_weekly_trend": result["weekly_trend"],
         "yesterday_summary_stress": result["yesterday_stress"],
-        "yesterday_summary_recovery": result["yesterday_recovery"],
+        # Legacy combined field stays null on new writes; readers fall back to
+        # the split columns below.
+        "yesterday_summary_recovery": None,
+        "yesterday_summary_waking_recovery": result["yesterday_waking_recovery"],
+        "yesterday_summary_sleep_recovery": result["yesterday_sleep_recovery"],
         "yesterday_summary_adherence": result["yesterday_adherence"],
         "yesterday_summary_generated_for": cycle_ist,
         "yesterday_summary_generated_at": now_utc,
@@ -184,14 +193,39 @@ def _parse_yesterday_json(raw: str) -> Optional[dict]:
     except Exception:
         return None
 
-    keys = ("weekly_trend", "yesterday_stress", "yesterday_recovery", "yesterday_adherence")
+    keys = (
+        "weekly_trend",
+        "yesterday_stress",
+        "yesterday_waking_recovery",
+        "yesterday_sleep_recovery",
+        "yesterday_adherence",
+    )
     if not all(k in obj for k in keys):
+        # Back-compat: if the LLM still returned the old single-recovery
+        # schema, split it into the two new fields so callers never see a
+        # half-populated response.
+        legacy_keys = (
+            "weekly_trend",
+            "yesterday_stress",
+            "yesterday_recovery",
+            "yesterday_adherence",
+        )
+        if all(k in obj for k in legacy_keys):
+            combined = str(obj.get("yesterday_recovery", ""))[:1200]
+            return {
+                "weekly_trend": str(obj.get("weekly_trend", ""))[:1200],
+                "yesterday_stress": str(obj.get("yesterday_stress", ""))[:1200],
+                "yesterday_waking_recovery": combined,
+                "yesterday_sleep_recovery": combined,
+                "yesterday_adherence": str(obj.get("yesterday_adherence", ""))[:1200],
+            }
         return None
     # Safety caps
     return {
         "weekly_trend": str(obj.get("weekly_trend", ""))[:1200],
         "yesterday_stress": str(obj.get("yesterday_stress", ""))[:1200],
-        "yesterday_recovery": str(obj.get("yesterday_recovery", ""))[:1200],
+        "yesterday_waking_recovery": str(obj.get("yesterday_waking_recovery", ""))[:1200],
+        "yesterday_sleep_recovery": str(obj.get("yesterday_sleep_recovery", ""))[:1200],
         "yesterday_adherence": str(obj.get("yesterday_adherence", ""))[:1200],
     }
 

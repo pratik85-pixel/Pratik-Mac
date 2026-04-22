@@ -1,12 +1,31 @@
 import { getClient } from './client';
 import { wrap, type W } from './core';
-import type { CoachReply, ConversationTurn, MorningBriefResponse } from '../types';
+import type {
+  CoachReply,
+  ConversationTurn,
+  MorningBriefResponse,
+  YesterdaySummaryResponse,
+} from '../types';
 
 export async function getMorningBrief(): Promise<W<MorningBriefResponse | null>> {
   try {
     const r = await getClient().get<MorningBriefResponse>('/coach/morning-brief', {
       params: { _: Date.now() },
     });
+    return wrap(r.data);
+  } catch {
+    return wrap(null);
+  }
+}
+
+export async function getYesterdaySummary(): Promise<
+  W<YesterdaySummaryResponse | null>
+> {
+  try {
+    const r = await getClient().get<YesterdaySummaryResponse>(
+      '/coach/yesterday-summary',
+      { params: { _: Date.now() } },
+    );
     return wrap(r.data);
   } catch {
     return wrap(null);

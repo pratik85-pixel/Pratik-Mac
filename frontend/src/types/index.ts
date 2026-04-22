@@ -93,6 +93,19 @@ export interface MorningRecapResponse {
   summary: MorningRecapSummaryBlock | null;
 }
 
+/** GET /coach/yesterday-summary */
+export interface YesterdaySummaryResponse {
+  weekly_trend: string | null;
+  yesterday_stress: string | null;
+  yesterday_waking_recovery?: string | null;
+  yesterday_sleep_recovery?: string | null;
+  /** Legacy combined recovery narrative (pre-split). */
+  yesterday_recovery?: string | null;
+  yesterday_adherence: string | null;
+  generated_for: string | null;
+  is_stale: boolean;
+}
+
 /** GET /coach/morning-brief */
 export interface MorningBriefResponse {
   day_state: string | null;
@@ -104,6 +117,10 @@ export interface MorningBriefResponse {
   is_stale: boolean;
   plan: Array<Record<string, any>>;
   avoid_items: Array<Record<string, any>>;
+  // Deterministic band-wear coverage cues (independent of LLM output).
+  yesterday_wear_hours?: number | null;
+  yesterday_coverage_label?: 'full' | 'partial' | 'low' | 'none' | null;
+  has_sleep_data_yesterday?: boolean | null;
 }
 
 /** GET /plan/home-status */
@@ -178,6 +195,10 @@ export interface DailyPlan {
   check_in_pending?: boolean;
   adherence_pct?: number | null;
   plan_updated_count?: number;
+  /** Forward-looking plan brief from Layer 3 plan prompt. */
+  brief?: string | null;
+  /** Single "ease off today" line (capped at 1 by the backend). */
+  avoid_items?: Array<{ slug_or_label?: string; label?: string; reason?: string }>;
 }
 
 // ── Coach ─────────────────────────────────────────────────────────────────────

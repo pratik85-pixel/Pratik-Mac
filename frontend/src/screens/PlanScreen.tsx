@@ -241,7 +241,9 @@ export default function PlanScreen() {
   const [refreshing, setRefreshing]   = useState(false);
   const [selected, setSelected]       = useState<PlanItem | null>(null);
   const [completing, setCompleting]   = useState(false);
-  const [avoidItems, setAvoidItems]   = useState<Array<{ slug_or_label?: string; reason?: string }>>([]);
+  const [avoidItems, setAvoidItems]   = useState<
+    Array<{ slug_or_label?: string; label?: string; reason?: string }>
+  >([]);
   const [coachGuidance, setCoachGuidance] = useState<string[]>([]);
   const [strictBlocked, setStrictBlocked] = useState(false);
 
@@ -269,30 +271,52 @@ export default function PlanScreen() {
       ]);
       const recapData = recapRes.status === 'fulfilled' ? (recapRes.value.data ?? null) : null;
       if (applyStrictGate(recapData)) return;
+
+      let planData: DailyPlan | null = null;
       if (planRes.status === 'fulfilled') {
         const d = planRes.value.data;
-        if (d?.items?.length) setPlan(d);
-        else setPlan(null);
+        if (d?.items?.length) {
+          planData = d;
+          setPlan(d);
+        } else {
+          setPlan(null);
+        }
       } else {
         setPlan(null);
       }
-      if (briefRes.status === 'fulfilled') {
+
+      // Prefer the plan's own forward-looking brief + single avoid_item.
+      // Only fall back to the morning brief lines if /plan/today did not
+      // return its own guidance payload yet.
+      const planBrief = (planData?.brief ?? '').trim();
+      const planAvoid = (planData?.avoid_items ?? []) as Array<{
+        slug_or_label?: string;
+        label?: string;
+        reason?: string;
+      }>;
+
+      if (planBrief.length > 0) {
+        setCoachGuidance([planBrief]);
+        setAvoidItems(planAvoid);
+      } else if (briefRes.status === 'fulfilled') {
         const brief = briefRes.value.data;
-        const avoid = (brief?.avoid_items ?? []) as Array<{ slug_or_label?: string; reason?: string }>;
+        const avoid = (brief?.avoid_items ?? []) as Array<{
+          slug_or_label?: string;
+          reason?: string;
+        }>;
         if (!hasCoachBriefContent(brief)) {
           setCoachGuidance([]);
           setAvoidItems([]);
         } else {
-          const lines = [brief?.brief_text, brief?.evidence, brief?.one_action]
-            .map((s) => (s ?? '').trim())
-            .filter((s) => s.length > 0)
-            .slice(0, 3);
-          setAvoidItems(avoid);
-          setCoachGuidance(lines);
+          // Legacy fallback — ONE line from the brief, not three, so the plan
+          // section does not visually echo the morning brief.
+          const line = (brief?.brief_text ?? '').trim();
+          setCoachGuidance(line ? [line] : []);
+          setAvoidItems(planAvoid.length > 0 ? planAvoid : avoid);
         }
       } else {
         setCoachGuidance([]);
-        setAvoidItems([]);
+        setAvoidItems(planAvoid);
       }
     } catch {}
     finally {
@@ -454,12 +478,17 @@ export default function PlanScreen() {
             )}
             {donts.length > 0 ? (
               <>
-                <Text style={s.coachDontsTitle}>Don&apos;ts</Text>
-                {donts.slice(0, 3).map((item, idx) => (
-                  <Text key={`coach-dont-${idx}`} style={s.coachDontItem}>
-                    {'\u2022'} {item.slug_or_label ?? 'Avoid major trigger'}
-                  </Text>
-                ))}
+                <Text style={s.coachDontsTitle}>Don&apos;t</Text>
+                {donts.slice(0, 1).map((item, idx) => {
+                  const label = item.slug_or_label ?? item.label ?? 'Avoid major trigger';
+                  const reason = (item.reason ?? '').trim();
+                  return (
+                    <Text key={`coach-dont-${idx}`} style={s.coachDontItem}>
+                      {'\u2022'} {label}
+                      {reason ? ` — ${reason}` : ''}
+                    </Text>
+                  );
+                })}
               </>
             ) : null}
           </SurfaceCard>

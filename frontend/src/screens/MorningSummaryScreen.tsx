@@ -1,4 +1,4 @@
-import React, { useMemo } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { View, Text, StyleSheet, ScrollView, TouchableOpacity } from 'react-native';
 import { useNavigation } from '@react-navigation/native';
 import { NativeStackNavigationProp } from '@react-navigation/native-stack';
@@ -8,6 +8,8 @@ import { useDailyData } from '../contexts/DailyDataContext';
 import type { HomeStackParamList } from '../navigation/AppNavigator';
 import { ZEN, ZenScreen, SectionCard, SectionEyebrow } from '../ui/zenflow-ui-kit';
 import { ArcGauge } from '../ui/ArcGauge';
+import { getYesterdaySummary } from '../api/coach';
+import type { YesterdaySummaryResponse } from '../types';
 
 function sleepScoreFromArea(area: number | null | undefined): number | null {
   if (area == null || area <= 0) return null;
@@ -46,6 +48,28 @@ export default function MorningSummaryScreen() {
   const nav = useNavigation<NativeStackNavigationProp<HomeStackParamList>>();
   const { morningRecap, morningBrief, planHome } = useDailyData();
   const summary = morningRecap?.summary;
+
+  const [yesterdaySummary, setYesterdaySummary] =
+    useState<YesterdaySummaryResponse | null>(null);
+
+  // Fetch the coach's forward-looking "yesterday summary" narrative once the
+  // recap is available. Failures are silent — UI degrades to score-only.
+  useEffect(() => {
+    let cancelled = false;
+    if (!morningRecap?.summary) {
+      setYesterdaySummary(null);
+      return () => {
+        cancelled = true;
+      };
+    }
+    (async () => {
+      const res = await getYesterdaySummary();
+      if (!cancelled) setYesterdaySummary(res.data ?? null);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [morningRecap?.summary]);
 
   // If recap isn't ready, do not fall back to "today" — show a stable placeholder.
   if (!morningRecap?.for_date || summary == null) {
@@ -181,6 +205,52 @@ export default function MorningSummaryScreen() {
           </View>
         </SectionCard>
 
+        {(() => {
+          const ys = yesterdaySummary;
+          if (!ys) return null;
+          const waking = (ys.yesterday_waking_recovery ?? ys.yesterday_recovery ?? '').trim();
+          const sleep = (ys.yesterday_sleep_recovery ?? ys.yesterday_recovery ?? '').trim();
+          const stress = (ys.yesterday_stress ?? '').trim();
+          const trend = (ys.weekly_trend ?? '').trim();
+          const adherence = (ys.yesterday_adherence ?? '').trim();
+          if (!stress && !waking && !sleep && !trend && !adherence) return null;
+          return (
+            <SectionCard style={s.narrativeCard}>
+              <SectionEyebrow>Yesterday Narrative</SectionEyebrow>
+              {stress ? (
+                <View style={s.narrativeItem}>
+                  <Text style={s.narrativeTitle}>Stress</Text>
+                  <Text style={s.narrativeBody}>{stress}</Text>
+                </View>
+              ) : null}
+              {waking ? (
+                <View style={s.narrativeItem}>
+                  <Text style={s.narrativeTitle}>Waking Recovery</Text>
+                  <Text style={s.narrativeBody}>{waking}</Text>
+                </View>
+              ) : null}
+              {sleep ? (
+                <View style={s.narrativeItem}>
+                  <Text style={s.narrativeTitle}>Sleep Recovery</Text>
+                  <Text style={s.narrativeBody}>{sleep}</Text>
+                </View>
+              ) : null}
+              {trend ? (
+                <View style={s.narrativeItem}>
+                  <Text style={s.narrativeTitle}>Weekly Trend</Text>
+                  <Text style={s.narrativeBody}>{trend}</Text>
+                </View>
+              ) : null}
+              {adherence ? (
+                <View style={s.narrativeItem}>
+                  <Text style={s.narrativeTitle}>Adherence</Text>
+                  <Text style={s.narrativeBody}>{adherence}</Text>
+                </View>
+              ) : null}
+            </SectionCard>
+          );
+        })()}
+
         <SectionCard style={s.whyCard}>
           <SectionEyebrow>Why this score?</SectionEyebrow>
           <View style={s.whyItem}>
@@ -308,6 +378,24 @@ const s = StyleSheet.create({
     letterSpacing: 0.5,
     textAlign: 'center',
     lineHeight: 14,
+  },
+  narrativeCard: {
+    gap: 10,
+  },
+  narrativeItem: {
+    paddingTop: 2,
+    gap: 4,
+  },
+  narrativeTitle: {
+    color: ZEN.colors.textNear,
+    fontSize: 13,
+    fontWeight: '700',
+    letterSpacing: 0.3,
+  },
+  narrativeBody: {
+    color: ZEN.colors.textSecondary,
+    fontSize: 13,
+    lineHeight: 19,
   },
   whyCard: {
     gap: 8,

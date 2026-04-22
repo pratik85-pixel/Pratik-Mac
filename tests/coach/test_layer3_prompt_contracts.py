@@ -47,25 +47,61 @@ def test_layer3_morning_brief_prompt_has_week_context_and_no_intraday() -> None:
     assert '"day_state": "green"|"yellow"|"relaxed"|"red"' in user_prompt
 
 
-def test_layer3_plan_brief_prompt_has_yesterday_context_and_readiness_allowed() -> None:
+def test_layer3_plan_brief_prompt_is_forward_looking_and_not_directive() -> None:
+    """
+    Plan-brief prompt must be forward-looking (today going forward) and must
+    NOT carry directive/prescriptive tokens. The schema shapes the output,
+    the prompt does not tell the model HOW to write it.
+    """
     packet = _packet_with_today_and_yesterday()
     _, user_prompt = build_layer3_plan_brief_prompt(
         packet,
         "narrative",
         plan_items=[{"title": "Gym", "activity_type_slug": "sports"}],
     )
-    assert "MORNING CONTEXT" in user_prompt
-    assert "Do NOT mention intraday/live numbers" in user_prompt
-    assert "YESTERDAY SUMMARY CONTEXT" in user_prompt
-    assert "TODAY BASELINE" in user_prompt
+    # Required signals
+    assert "TODAY PLAN ITEMS" in user_prompt
+    assert "TODAY_BASELINE" in user_prompt
+    assert "DATA_COVERAGE" in user_prompt
     assert '"brief"' in user_prompt
     assert '"avoid_items"' in user_prompt
+    assert "forward-looking" in user_prompt
+
+    # "No hard mapping" audit: none of these directive/restrictive patterns
+    # should appear in the plan-brief task — the prompt must not script the
+    # voice or structure of the output.
+    forbidden_tokens = [
+        "exactly 2 sentences",
+        "Do not repeat",
+        "Do not restate",
+        "Start with the activity names",
+    ]
+    for tok in forbidden_tokens:
+        assert tok not in user_prompt, f"plan brief prompt contains directive token: {tok!r}"
 
 
-def test_layer3_yesterday_summary_prompt_has_4_keys() -> None:
-    _, user_prompt = build_layer3_yesterday_summary_prompt(_packet_with_today_and_yesterday(), "narrative")
+def test_layer3_yesterday_summary_prompt_has_5_keys_and_coverage() -> None:
+    _, user_prompt = build_layer3_yesterday_summary_prompt(
+        _packet_with_today_and_yesterday(), "narrative"
+    )
     assert '"weekly_trend"' in user_prompt
     assert '"yesterday_stress"' in user_prompt
-    assert '"yesterday_recovery"' in user_prompt
+    assert '"yesterday_waking_recovery"' in user_prompt
+    assert '"yesterday_sleep_recovery"' in user_prompt
     assert '"yesterday_adherence"' in user_prompt
+    # Legacy combined recovery key must no longer be prescribed.
+    assert '"yesterday_recovery"' not in user_prompt
+    # DATA_COVERAGE context is present so the model can factor in wear hours.
+    assert "DATA_COVERAGE" in user_prompt
+
+
+def test_layer3_morning_brief_prompt_has_data_coverage_block() -> None:
+    """
+    Morning brief prompt should pass band-wear coverage as open context
+    (not a rule) — the model is free to interpret or ignore it.
+    """
+    _, user_prompt = build_layer3_morning_brief_prompt(
+        _packet_with_today_and_yesterday(), "narrative"
+    )
+    assert "DATA_COVERAGE" in user_prompt
 

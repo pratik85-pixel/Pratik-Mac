@@ -147,7 +147,6 @@ export default function HomeScreen() {
   const [polarStatus, setPolarStatus] = useState(polarService.status);
   const [batteryPct, setBatteryPct] = useState<number | null>(polarService.batteryPct);
   const [openSession, setOpenSession] = useState<SessionHistoryItem | null>(null);
-  const [isOutlookExpanded, setIsOutlookExpanded] = useState(false);
   const [isMyDayOpen, setIsMyDayOpen] = useState(false);
   const [tagTarget, setTagTarget] = useState<{ type: 'stress' | 'recovery'; w: StressWindow | RecoveryWindow } | null>(null);
   const [isTagSheetOpen, setTagSheetOpen] = useState(false);
@@ -510,27 +509,21 @@ export default function HomeScreen() {
               ]}
             >
             <SectionCard style={s.outlookCard}>
-              <View style={s.outlookTopRow}>
-                <TouchableOpacity
-                  style={s.outlookTitleTouch}
-                  activeOpacity={0.88}
-                  onPress={() => nav.navigate('MorningSummary')}
-                >
-                  <View style={s.outlookTitleBlock}>
-                    <SectionEyebrow>TODAY'S OUTLOOK</SectionEyebrow>
-                    <Text style={s.outlookSubtext}>basis yesterday&apos;s data</Text>
-                  </View>
-                </TouchableOpacity>
-                <TouchableOpacity
-                  style={s.outlookExpandBtn}
-                  activeOpacity={0.8}
-                  onPress={() => setIsOutlookExpanded(v => !v)}
-                >
-                  <Text style={s.outlookExpandChevron}>{isOutlookExpanded ? '⌃' : '⌄'}</Text>
-                </TouchableOpacity>
-              </View>
+              <TouchableOpacity
+                style={s.outlookTitleTouch}
+                activeOpacity={0.88}
+                onPress={() => nav.navigate('MorningSummary')}
+                accessibilityRole="button"
+                accessibilityLabel="Open morning summary"
+              >
+                <View style={s.outlookTitleBlock}>
+                  <SectionEyebrow>TODAY'S OUTLOOK</SectionEyebrow>
+                  <Text style={s.outlookSubtext}>basis yesterday&apos;s data</Text>
+                </View>
+              </TouchableOpacity>
 
               <TouchableOpacity
+                style={s.readinessCenterTouch}
                 activeOpacity={0.92}
                 onPress={() => nav.navigate('MorningSummary')}
               >
@@ -538,27 +531,40 @@ export default function HomeScreen() {
                   <ArcGauge
                     value={todayReadinessSafe}
                     color={dayStateColor(todayDayState)}
-                    size={78}
-                    stroke={5}
-                    valueFontSize={17}
+                    size={88}
+                    stroke={6}
+                    valueFontSize={19}
                     displayValue={todayReadinessSafe == null ? '—' : `${Math.round(todayReadinessSafe)}`}
                     displaySuffix={todayReadinessSafe == null ? undefined : '/100'}
                   />
                   <Text style={s.dayTypeLabel}>{dayTypeLabel}</Text>
+                  {(() => {
+                    const cov = morningBrief?.yesterday_coverage_label;
+                    const hrs = morningBrief?.yesterday_wear_hours;
+                    if (cov !== 'partial' && cov !== 'low') return null;
+                    const hrsText =
+                      typeof hrs === 'number' && Number.isFinite(hrs)
+                        ? `${hrs < 1 ? hrs.toFixed(1) : Math.round(hrs)}h`
+                        : '—';
+                    const label = cov === 'low' ? 'limited data' : 'partial data';
+                    return (
+                      <Text
+                        style={s.coverageChip}
+                        numberOfLines={1}
+                        accessibilityLabel={`Band worn ${hrsText} yesterday, ${label}`}
+                      >
+                        {hrsText} band wear · {label}
+                      </Text>
+                    );
+                  })()}
                 </View>
               </TouchableOpacity>
 
               <ScrollView
-                style={[
-                  s.outlookBriefScroll,
-                  {
-                    maxHeight: isOutlookExpanded ? 76 : 48,
-                    minHeight: isOutlookExpanded ? 52 : 40,
-                  },
-                ]}
-                contentContainerStyle={s.outlookBriefScrollContent}
+                style={s.outlookBriefArea}
+                contentContainerStyle={s.outlookBriefContent}
                 nestedScrollEnabled
-                showsVerticalScrollIndicator={isOutlookExpanded}
+                showsVerticalScrollIndicator
                 keyboardShouldPersistTaps="handled"
               >
                 <Text style={s.briefMain}>{briefBody}</Text>
@@ -897,48 +903,35 @@ const s = StyleSheet.create({
   outlookCard: {
     flex: 1,
     minHeight: 0,
-    gap: 8,
-    paddingVertical: 8,
+    paddingVertical: 14,
+    paddingHorizontal: 16,
     overflow: 'hidden',
+    gap: 10,
   },
   outlookTitleTouch: {
-    flex: 1,
     minWidth: 0,
-  },
-  outlookTopRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
   },
   outlookTitleBlock: { gap: 2 },
   outlookSubtext: {
-    fontSize: 10,
+    fontSize: 11,
     color: ZEN.colors.textMuted,
-    letterSpacing: 0.2,
-    marginTop: -2,
+    letterSpacing: 0.3,
+    marginTop: 2,
   },
-  outlookExpandBtn: {
-    paddingHorizontal: 6,
-    paddingVertical: 2,
-    alignItems: 'flex-end',
+  readinessCenterTouch: {
+    alignItems: 'center',
     justifyContent: 'center',
-  },
-  outlookExpandChevron: {
-    fontSize: 16,
-    color: ZEN.colors.textMuted,
-    marginTop: -2,
-    fontWeight: '700',
   },
   readinessCenter: {
     alignItems: 'center',
     justifyContent: 'center',
-    paddingTop: 0,
-    gap: 4,
+    gap: 8,
   },
-  outlookBriefScroll: {
-    flexShrink: 1,
+  outlookBriefArea: {
+    flex: 1,
+    minHeight: 0,
   },
-  outlookBriefScrollContent: {
+  outlookBriefContent: {
     paddingBottom: 4,
   },
   readinessLabel: {
@@ -956,10 +949,26 @@ const s = StyleSheet.create({
     textAlign: 'center',
   },
   dayTypeLabel: {
-    marginTop: 2,
-    fontSize: 12,
+    marginTop: 4,
+    fontSize: 13,
+    fontWeight: '600',
     color: ZEN.colors.textSecondary,
     textAlign: 'center',
+    letterSpacing: 0.3,
+  },
+  coverageChip: {
+    marginTop: 4,
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+    fontSize: 10,
+    lineHeight: 14,
+    color: ZEN.colors.textMuted,
+    textAlign: 'center',
+    letterSpacing: 0.2,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.14)',
+    overflow: 'hidden',
   },
 
   recapCard: { gap: 10, paddingVertical: 12, borderColor: 'rgba(120,180,255,0.22)' },
@@ -1024,7 +1033,12 @@ const s = StyleSheet.create({
     lineHeight: 16,
     marginTop: 2,
   },
-  nowCard: { flex: 1, minHeight: 0, gap: 6, paddingVertical: 6 },
+  nowCard: {
+    flex: 1,
+    minHeight: 0,
+    paddingVertical: 12,
+    paddingHorizontal: 14,
+  },
   nowTopRow: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -1049,18 +1063,17 @@ const s = StyleSheet.create({
     textAlign: 'center',
   },
   currentDualRingRow: {
+    flex: 1,
     flexDirection: 'row',
-    alignItems: 'flex-start',
+    alignItems: 'center',
     justifyContent: 'space-between',
     gap: 4,
-    marginTop: 0,
-    marginBottom: 0,
   },
   currentRingCell: {
     flex: 1,
     alignItems: 'center',
-    justifyContent: 'flex-start',
-    gap: 6,
+    justifyContent: 'center',
+    gap: 8,
   },
   currentRingLabel: {
     fontSize: 11,
@@ -1099,10 +1112,9 @@ const s = StyleSheet.create({
     lineHeight: 21,
     color: ZEN.colors.textBody,
   },
-  // briefCardFixed/briefTopRow replaced by outlookCard/outlookTopRow
   briefMain: {
-    fontSize: 12,
-    lineHeight: 18,
+    fontSize: 13,
+    lineHeight: 20,
     color: ZEN.colors.white,
   },
   morningSummaryBtn: {

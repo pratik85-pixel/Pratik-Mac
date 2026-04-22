@@ -111,6 +111,11 @@ class MorningBriefResponse(BaseModel):
     is_stale:       bool            # True if generated_for < today IST
     plan:           list[dict]      # suggested plan items from UUP
     avoid_items:    list[dict]      # avoid items from UUP
+    # ── Band-wear coverage (deterministic, echoed from packet) ─────────────
+    # These are read-only UI cues — independent of the LLM output.
+    yesterday_wear_hours:       Optional[float] = None
+    yesterday_coverage_label:   Optional[str] = None   # "full"|"partial"|"low"|"none"
+    has_sleep_data_yesterday:   Optional[bool] = None
 
 
 class NudgeCheckResponse(BaseModel):
@@ -131,12 +136,16 @@ class NightClosureResponse(BaseModel):
 
 
 class YesterdaySummaryResponse(BaseModel):
-    weekly_trend:       Optional[str]
-    yesterday_stress:   Optional[str]
-    yesterday_recovery: Optional[str]
-    yesterday_adherence: Optional[str]
-    generated_for:      Optional[str]   # YYYY-MM-DD
-    is_stale:           bool
+    weekly_trend:              Optional[str]
+    yesterday_stress:          Optional[str]
+    # Split recovery narratives (Layer 3 schema). `yesterday_recovery` is
+    # retained only as a legacy alias for pre-split cached rows.
+    yesterday_waking_recovery: Optional[str] = None
+    yesterday_sleep_recovery:  Optional[str] = None
+    yesterday_recovery:        Optional[str] = None
+    yesterday_adherence:       Optional[str]
+    generated_for:             Optional[str]   # YYYY-MM-DD
+    is_stale:                  bool
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 
@@ -381,11 +390,22 @@ async def get_morning_brief(
     """
     llm_unit_limiter.check(user_id)
     import api.db.schema as _db
+    from datetime import UTC as _UTC, datetime as _dt
     from coach.morning_brief import clear_morning_bundle_uup, generate_morning_brief
+    from coach.input_builder import _compute_band_coverage
 
     uid = _user_uuid_for_coach(user_id)
 
     cycle_ist = await track_svc.get_current_cycle_local_date()
+
+    # Deterministic band-wear coverage for the response payload (independent
+    # of anything the LLM writes). Never raises into the endpoint.
+    coverage: dict = {}
+    try:
+        coverage = await _compute_band_coverage(db, uid, now_utc=_dt.now(_UTC))
+    except Exception:
+        logger.exception("morning-brief: band coverage compute failed user=%s", user_id)
+        coverage = {}
 
     recap = await track_svc.get_morning_recap()
     if not recap.get("summary"):
@@ -403,6 +423,9 @@ async def get_morning_brief(
             is_stale=False,
             plan=[],
             avoid_items=[],
+            yesterday_wear_hours=coverage.get("yesterday_wear_hours"),
+            yesterday_coverage_label=coverage.get("yesterday_coverage_label"),
+            has_sleep_data_yesterday=coverage.get("has_sleep_data_yesterday"),
         )
 
     result = await db.execute(
@@ -457,6 +480,9 @@ async def get_morning_brief(
         is_stale       = is_stale,
         plan           = plan,
         avoid_items    = avoid,
+        yesterday_wear_hours     = coverage.get("yesterday_wear_hours"),
+        yesterday_coverage_label = coverage.get("yesterday_coverage_label"),
+        has_sleep_data_yesterday = coverage.get("has_sleep_data_yesterday"),
     )
 
 
@@ -485,6 +511,8 @@ async def get_yesterday_summary(
         return YesterdaySummaryResponse(
             weekly_trend=None,
             yesterday_stress=None,
+            yesterday_waking_recovery=None,
+            yesterday_sleep_recovery=None,
             yesterday_recovery=None,
             yesterday_adherence=None,
             generated_for=cycle_ist.isoformat(),
@@ -506,6 +534,8 @@ async def get_yesterday_summary(
                 uup.yesterday_summary_weekly_trend,
                 uup.yesterday_summary_stress,
                 uup.yesterday_summary_recovery,
+                uup.yesterday_summary_waking_recovery,
+                uup.yesterday_summary_sleep_recovery,
                 uup.yesterday_summary_adherence,
             ]
         )
@@ -521,10 +551,23 @@ async def get_yesterday_summary(
         generated_for = uup.yesterday_summary_generated_for if uup else None
         is_stale = (generated_for is None or generated_for < cycle_ist)
 
+    # Prefer the split columns; if an old row still has only the legacy
+    # `yesterday_summary_recovery` set, surface it in both split fields so the
+    # UI never renders a blank recovery card during rollout.
+    waking = uup.yesterday_summary_waking_recovery if uup else None
+    sleep = uup.yesterday_summary_sleep_recovery if uup else None
+    legacy_recovery = uup.yesterday_summary_recovery if uup else None
+    if not waking and legacy_recovery:
+        waking = legacy_recovery
+    if not sleep and legacy_recovery:
+        sleep = legacy_recovery
+
     return YesterdaySummaryResponse(
         weekly_trend=uup.yesterday_summary_weekly_trend if uup else None,
         yesterday_stress=uup.yesterday_summary_stress if uup else None,
-        yesterday_recovery=uup.yesterday_summary_recovery if uup else None,
+        yesterday_waking_recovery=waking,
+        yesterday_sleep_recovery=sleep,
+        yesterday_recovery=legacy_recovery,
         yesterday_adherence=uup.yesterday_summary_adherence if uup else None,
         generated_for=generated_for.isoformat() if generated_for else None,
         is_stale=is_stale,

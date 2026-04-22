@@ -176,6 +176,9 @@ PLAN_DEVIATIONS_30D:
 ADHERENCE_30D:
 {_json(packet.adherence_30d)}
 
+DATA_COVERAGE (band wear context — interpret or ignore as you judge):
+{_json(packet.band_coverage)}
+
 EXISTING_UUP_NARRATIVE (previous narrative for continuity; can be empty):
 {_json(packet.uup.get("previous_coach_narrative"), max_chars=2000)}
 """.strip(),
@@ -275,6 +278,9 @@ YESTERDAY_ROW:
 TODAY_BASELINE (readiness may be present; derived from yesterday signals):
 {json.dumps(_row_min(today_row or {}), ensure_ascii=False, default=str)}
 
+DATA_COVERAGE (band wear context — interpret or ignore as you judge):
+{json.dumps(packet.band_coverage, ensure_ascii=False, default=str)[:600]}
+
 TASK: Write the morning brief — as a friendly coach — guiding what to do and what not to do today.
 Structure inside brief_text:
   - Line 1: Weekly trend (good/average/rough) in plain words.
@@ -303,53 +309,37 @@ def build_layer3_plan_brief_prompt(
     plan_items: list[dict[str, Any]],
 ) -> tuple[str, str]:
     narrative_excerpt = (uup_narrative or "")[:NARRATIVE_MAX_CHARS]
-    # Plan guidance is delivered in the morning context; avoid intraday/live mentions.
-    yesterday_date = None
-    try:
-        y_dt = datetime.strptime(packet.today_local_date, "%Y-%m-%d").date()
-        yesterday_date = (y_dt - timedelta(days=1)).isoformat()
-    except Exception:
-        yesterday_date = None
-
-    yesterday_row = None
-    if packet.daily_trajectory and yesterday_date:
-        for r in packet.daily_trajectory:
-            if r.get("date") == yesterday_date:
-                yesterday_row = r
-                break
 
     today_row = (packet.daily_trajectory[-1] if packet.daily_trajectory else {}) or {}
     user_prompt = f"""\
 TODAY_LOCAL_DATE: {packet.today_local_date}
 
-USER PROFILE (Layer 2 narrative):
+USER PROFILE (Layer 2 narrative — carries yesterday's story already):
 {narrative_excerpt}
-
-MORNING CONTEXT:
-  - The user is starting the day. Do NOT mention intraday/live numbers from later in the day.
-  - It is OK to reference today's readiness as a baseline verdict because it is derived from yesterday's stress + waking recovery + sleep recovery (plus baseline).
-  - Your job is to make the plan resonate so adherence stays high.
 
 TODAY PLAN ITEMS:
 {json.dumps(plan_items, ensure_ascii=False, default=str)[:5000]}
 
-YESTERDAY SUMMARY CONTEXT (use this to justify today's direction):
-{json.dumps(yesterday_row or {}, ensure_ascii=False, default=str)[:1500]}
-
-TODAY BASELINE (readiness may be present; derived from yesterday signals):
+TODAY_BASELINE (readiness may be present):
 {json.dumps(today_row, ensure_ascii=False, default=str)[:1500]}
 
+DATA_COVERAGE (band wear context — interpret or ignore as you judge):
+{json.dumps(packet.band_coverage, ensure_ascii=False, default=str)[:600]}
+
 TASK:
-- Explain WHY each plan item fits this person today, in a friendly coach voice.
-- Do not repeat the morning brief. Do not restate green/yellow/red.
-- Start with the activity names.
-- Make it feel practical: if high intensity is appropriate, encourage gym/sport while protecting recovery (e.g. cooldown, breath reset during work calls). Keep it non-medical and non-prescriptive.
-- "avoid_items": 1–2 things to ease off today with a short reason. Labels must be plain English (e.g. "extended work calls") — no underscores or slugs.
+Write a plan brief that is forward-looking — about today going forward.
+It should help the user picture the next few hours: which activities come
+first, in what order, and roughly when. You decide the voice, the ordering
+rationale, and how much timing detail to include. The narrative already
+carries yesterday's context; the brief itself is about today.
+
+For avoid_items, return a single item — one line — the most useful thing
+to ease off today. Labels should be plain English, no slugs or underscores.
 
 OUTPUT JSON only, exactly:
 {{
-  "brief": "exactly 2 sentences: (1) name activities and why prescribed, (2) mechanism or expected benefit in plain words",
-  "avoid_items": [ {{"label": "plain English", "reason": "short reason"}} ]
+  "brief": "forward-looking plan brief about today",
+  "avoid_items": [ {{"label": "plain English", "reason": "one short line"}} ]
 }}
 """.strip()
     return _VERITY_PERSONA, user_prompt
@@ -397,7 +387,8 @@ def build_layer3_yesterday_summary_prompt(
     Output JSON keys (exactly):
       - weekly_trend
       - yesterday_stress
-      - yesterday_recovery
+      - yesterday_waking_recovery
+      - yesterday_sleep_recovery
       - yesterday_adherence
     """
     yesterday_date = None
@@ -439,22 +430,28 @@ PLAN DEVIATIONS (last 30d, if present):
 ADHERENCE (30d summary, if present):
 {json.dumps(packet.adherence_30d or {}, ensure_ascii=False, default=str)[:1500]}
 
-TASK:
-Write a \"Yesterday summary\" in 4 sections. Be grounded. Friendly coach voice. Indian English.
-No medical diagnosis/advice. If something is missing, say it clearly.
+DATA_COVERAGE (band wear context — interpret or ignore as you judge):
+{json.dumps(packet.band_coverage, ensure_ascii=False, default=str)[:600]}
 
-SECTION RULES:
-1) weekly_trend: 2–4 sentences — overall week verdict and any red flags (stress, recovery, adherence, band wear signals if available).
-2) yesterday_stress: 2–4 sentences — what likely drove stress and key events (use tags/windows if present in narrative).
-3) yesterday_recovery: 2–4 sentences — waking + sleep recovery, sleep quality (hours/REM/Deep only if available in inputs), what helped.
-4) yesterday_adherence: 2–4 sentences — what they did vs missed; make it motivating and specific.
+TASK:
+Write a "Yesterday summary" across five fields. Friendly coach voice, Indian English.
+You decide tone, length, and how to weight the signals. The shapes below describe
+the kind of thing each field should talk about — they are not templates.
+
+FIELD SHAPES (guidance, not rules):
+- weekly_trend: the overall week leading into today.
+- yesterday_stress: the story of stress load yesterday.
+- yesterday_waking_recovery: the story of daytime (waking) recovery yesterday — the waking recovery score, background windows, what seemed to help or disrupt.
+- yesterday_sleep_recovery: the story of sleep-period recovery yesterday — the sleep recovery score, sleep windows, overall night reset.
+- yesterday_adherence: what they did vs missed against the plan, in a motivating way.
 
 OUTPUT — valid JSON only, exactly these keys:
 {{
-  \"weekly_trend\": \"...\",
-  \"yesterday_stress\": \"...\",
-  \"yesterday_recovery\": \"...\",
-  \"yesterday_adherence\": \"...\"
+  "weekly_trend": "...",
+  "yesterday_stress": "...",
+  "yesterday_waking_recovery": "...",
+  "yesterday_sleep_recovery": "...",
+  "yesterday_adherence": "..."
 }}
 """.strip()
 
