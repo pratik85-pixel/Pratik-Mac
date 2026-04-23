@@ -43,7 +43,7 @@ class MorningBundleOrchestrator:
                             llm_client=self._llm_client,
                         )
                         model_svc = ModelService(session)
-                        plan_svc = PlanService(session, model_svc)
+                        plan_svc = PlanService(session, model_svc, self._llm_client)
                         recap = await track_svc.get_morning_recap()
                         if recap.get("summary"):
                             await plan_svc.get_or_create_today_plan(user_id, force_regen=True)

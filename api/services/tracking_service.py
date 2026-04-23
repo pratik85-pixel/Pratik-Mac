@@ -25,7 +25,7 @@ import logging
 from time import perf_counter
 from dataclasses import asdict, replace
 from datetime import UTC, date, datetime, time, timedelta
-from typing import Any, Optional, Sequence
+from typing import Any, Optional, Sequence, cast
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import delete, select
@@ -1294,6 +1294,26 @@ class TrackingService:
             session.sleep_started_at  = sleep_ws[0].window_start
             session.sleep_ended_at    = sleep_ws[-1].window_end
 
+        # Diagnostic: long overnight-looking wear with zero sleep-tagged windows
+        # (client must send context="sleep" for server-side sleep recovery).
+        if not session.has_sleep_data:
+            dur_h = (session_end_ts - session.started_at).total_seconds() / 3600.0
+            if dur_h >= 4.0:
+                local_tz = ZoneInfo(CONFIG.tracking.STRESS_STATE_TIMEZONE)
+                sl = session.started_at.astimezone(local_tz)
+                el = session_end_ts.astimezone(local_tz)
+                crosses_midnight = sl.date() != el.date()
+                nightish = crosses_midnight or sl.hour >= 21 or el.hour <= 8
+                if nightish:
+                    logger.warning(
+                        "BandWearSession overnight-length wear but has_sleep_data=false "
+                        "user=%s duration_h=%.1f started_local=%s ended_local=%s",
+                        self._uid,
+                        dur_h,
+                        sl.isoformat(),
+                        el.isoformat(),
+                    )
+
         session.is_closed = True
         await self._db.flush()
 
@@ -1931,34 +1951,53 @@ class TrackingService:
             return local_today()
         return user_row.last_morning_cycle_reset_local_date
 
-    async def resolve_strict_recap_anchor(self) -> tuple[date, datetime, datetime]:
+    async def resolve_strict_recap_anchor(self) -> tuple[Optional[date], Optional[datetime], Optional[datetime]]:
         """
         Completed-cycle day for morning recap + UTC [start, end) bounds.
 
-        Recap follows morning-reset semantics with stale-reset protection:
-        - If today's reset has fired (last_reset >= local_today), show prior
-          completed cycle: ``last_reset - 1 day``.
-        - If reset has not fired yet today and last_reset == yesterday, show
-          ``last_reset`` itself.
-        - If last_reset is older than yesterday (stale), fallback to calendar
-          yesterday to avoid pinning recap to an old day.
-        - If no reset exists yet, fallback to IST calendar yesterday.
+        A calendar day is only \"yesterday\" for recap once its cycle is **closed**
+        (``DailyStressSummary.is_partial_data`` is False after nightly calibration),
+        except when today's reset has already fired (then prior day is closed by
+        definition).
+
+        - If today's reset has fired (``last_reset >= local_today``): recap =
+          ``last_reset - 1`` (completed prior cycle).
+        - If ``last_reset`` is **stale** (older than calendar yesterday): use
+          calendar yesterday **only** if that row is finalized; else no recap.
+        - If ``last_reset == calendar yesterday`` but that row is still partial
+          (live cycle spans IST midnight): return ``(None, None, None)`` — no
+          premature recap flip at midnight.
+        - If ``last_reset`` is None: no strict recap yet.
         """
-        recap_for_date = recap_yesterday_local_date()
         today_local = local_today()
         uid = parse_uuid(self._uid)
-        if uid is not None:
-            user_row = await self._db.get(db.User, uid)
-            if user_row is not None and user_row.last_morning_cycle_reset_local_date is not None:
-                rd = user_row.last_morning_cycle_reset_local_date
-                if rd >= today_local:
-                    recap_for_date = rd - timedelta(days=1)
-                elif rd == (today_local - timedelta(days=1)):
-                    recap_for_date = rd
-                else:
-                    recap_for_date = recap_yesterday_local_date()
-        start_ts, end_ts = utc_instant_bounds_for_local_calendar_date(recap_for_date)
-        return recap_for_date, start_ts, end_ts
+        if uid is None:
+            return None, None, None
+        user_row = await self._db.get(db.User, uid)
+        if user_row is None or user_row.last_morning_cycle_reset_local_date is None:
+            return None, None, None
+        rd = cast(date, user_row.last_morning_cycle_reset_local_date)
+
+        if rd >= today_local:
+            recap_for_date = rd - timedelta(days=1)
+            start_ts, end_ts = utc_instant_bounds_for_local_calendar_date(recap_for_date)
+            return recap_for_date, start_ts, end_ts
+
+        # rd < today_local
+        if rd < today_local - timedelta(days=1):
+            cal_yest = recap_yesterday_local_date()
+            y_row = await self._load_day_summary(cal_yest)
+            if y_row is not None and y_row.is_partial_data is False:
+                start_ts, end_ts = utc_instant_bounds_for_local_calendar_date(cal_yest)
+                return cal_yest, start_ts, end_ts
+            return None, None, None
+
+        # rd == calendar yesterday: only expose recap once that day is finalized
+        prior_row = await self._load_day_summary(rd)
+        if prior_row is not None and prior_row.is_partial_data is False:
+            start_ts, end_ts = utc_instant_bounds_for_local_calendar_date(rd)
+            return rd, start_ts, end_ts
+        return None, None, None
 
     async def load_strict_recap_daily_row(self) -> Optional[db.DailyStressSummary]:
         """
@@ -1967,7 +2006,9 @@ class TrackingService:
         No snapshot / inferred fallback — if the row is missing, downstream surfaces
         (recap, coach brief, plan) must stay empty for this cycle.
         """
-        start_ts, end_ts = (await self.resolve_strict_recap_anchor())[1:3]
+        recap_for_date, start_ts, end_ts = await self.resolve_strict_recap_anchor()
+        if recap_for_date is None or start_ts is None or end_ts is None:
+            return None
         return await self._load_day_summary_by_utc_bounds(start_ts, end_ts)
 
     async def has_strict_yesterday_summary(self) -> bool:
@@ -2075,6 +2116,8 @@ class TrackingService:
 
         Strict IST-day lookup only: if there is no DailyStressSummary row for
         ``for_date``, summary is null (no inferred snapshot).
+        When the active cycle is not yet closed (partial row across IST midnight),
+        ``for_date`` and ``summary`` are both null.
         """
         recap_for_date, _, _ = await self.resolve_strict_recap_anchor()
 
@@ -2087,6 +2130,14 @@ class TrackingService:
             row_user = res.one_or_none()
             if row_user is not None:
                 ack_d = row_user[0]
+
+        if recap_for_date is None:
+            return {
+                "for_date": None,
+                "should_show": False,
+                "acknowledged_for_date": False,
+                "summary": None,
+            }
 
         row = await self.load_strict_recap_daily_row()
 
@@ -2118,7 +2169,7 @@ class TrackingService:
         return {
             "for_date": recap_for_date.isoformat(),
             "should_show": should_show,
-            "acknowledged_for_date": ack_d == recap_for_date,
+            "acknowledged_for_date": bool(ack_d == recap_for_date),
             "summary": summary,
         }
 

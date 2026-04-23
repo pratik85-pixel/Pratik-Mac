@@ -680,11 +680,25 @@ async def _rebuild_one_user(
         # Ensures Plan tab is ready before first user open.
         try:
             model_svc = ModelService(db=session)
-            plan_svc = PlanService(db=session, model_service=model_svc)
+            plan_svc = PlanService(db=session, model_service=model_svc, llm_client=llm_client)
             plan_dict = await plan_svc.get_or_create_today_plan(str(user_id), force_regen=True)
             result["plan_items"] = len(plan_dict.get("items", []))
         except Exception as exc:
             log.warning("plan materialisation failed user=%s: %s", user_id, exc)
+
+        # ── Layer 3 coach caches (morning brief + yesterday summary) ─────────
+        try:
+            from uuid import UUID as _UUID
+
+            from api.db.database import AsyncSessionLocal as _SessionFactory
+            from coach.morning_brief import generate_morning_brief
+            from coach.yesterday_summary import generate_yesterday_summary
+
+            uid_uuid = user_id if isinstance(user_id, _UUID) else _UUID(str(user_id))
+            await generate_morning_brief(_SessionFactory, uid_uuid, llm_client)
+            await generate_yesterday_summary(_SessionFactory, uid_uuid, llm_client)
+        except Exception as exc:
+            log.warning("nightly coach Layer3 cache failed user=%s: %s", user_id, exc)
 
         # Streak increment
         await _increment_streak(session, user_id)

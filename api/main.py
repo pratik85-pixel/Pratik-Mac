@@ -123,9 +123,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     logger.info("services initialised: session, coach, conversation")
 
-    # ── Nightly scheduler (02:00 UTC) ─────────────────────────────────────────
+    # ── Nightly scheduler (01:00 UTC = 06:30 IST) ─────────────────────────────
     scheduler = None
     if _SCHEDULER_AVAILABLE:
+        from datetime import UTC as _UTC, datetime as _dt, timedelta as _td
+
         from jobs.nightly_rebuild import run_nightly_rebuild
         scheduler = AsyncIOScheduler(timezone="UTC")
         scheduler.add_job(
@@ -137,7 +139,27 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             replace_existing=True,
         )
         scheduler.start()
-        logger.info("nightly scheduler started — next run 01:00 UTC (06:30 IST)")
+        job = scheduler.get_job("nightly_rebuild")
+        next_run = getattr(job, "next_run_time", None) if job else None
+        logger.info("nightly scheduler started — next_run=%s", next_run)
+        # Catch-up: if we booted after today's 01:00 UTC window, next_run may be
+        # tomorrow — fire once soon so we don't skip a whole day on deploy/restart.
+        now_utc = _dt.now(_UTC)
+        if job is not None and next_run is not None:
+            nr = next_run
+            if nr.tzinfo is None:
+                nr = nr.replace(tzinfo=_UTC)
+            else:
+                nr = nr.astimezone(_UTC)
+            if now_utc.hour >= 1 and nr.date() > now_utc.date():
+                scheduler.modify_job(
+                    "nightly_rebuild",
+                    next_run_time=now_utc + _td(seconds=45),
+                )
+                logger.info(
+                    "nightly scheduler catch-up: moved next_run to %s",
+                    now_utc + _td(seconds=45),
+                )
     else:
         logger.warning("apscheduler not installed — nightly rebuild will not run automatically")
 

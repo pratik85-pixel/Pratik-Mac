@@ -231,8 +231,7 @@ class PlanService:
                     )
                 )
             except Exception:
-                # Layer 3 is best-effort; never block plan fetch.
-                pass
+                logger.exception("plan Layer3 wrapper failed user=%s", user_id)
 
         return payload
 
@@ -250,6 +249,11 @@ class PlanService:
         If LLM is disabled/unavailable or narrative missing, returns safe defaults.
         """
         if self._llm_client is None or not narrative:
+            logger.warning(
+                "plan brief Layer3 skipped user=%s reason=%s",
+                user_id,
+                "no_llm_client" if self._llm_client is None else "no_narrative",
+            )
             return {"brief": None, "avoid_items": []}
 
         try:
@@ -316,6 +320,7 @@ class PlanService:
 
             return result
         except Exception:
+            logger.exception("plan brief Layer3 failed user=%s", user_id)
             return {"brief": None, "avoid_items": []}
 
     async def get_home_plan_status(self, user_id: str) -> dict:

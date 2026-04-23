@@ -208,8 +208,8 @@ export default function MorningSummaryScreen() {
         {(() => {
           const ys = yesterdaySummary;
           if (!ys) return null;
-          const waking = (ys.yesterday_waking_recovery ?? ys.yesterday_recovery ?? '').trim();
-          const sleep = (ys.yesterday_sleep_recovery ?? ys.yesterday_recovery ?? '').trim();
+          const waking = (ys.yesterday_waking_recovery ?? '').trim();
+          const sleep = (ys.yesterday_sleep_recovery ?? '').trim();
           const stress = (ys.yesterday_stress ?? '').trim();
           const trend = (ys.weekly_trend ?? '').trim();
           const adherence = (ys.yesterday_adherence ?? '').trim();

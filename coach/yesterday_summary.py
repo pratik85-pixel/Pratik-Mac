@@ -22,6 +22,8 @@ import uuid as uuid_mod
 from datetime import UTC, date, datetime
 from typing import Any, Callable, Optional
 
+from tracking.cycle_boundaries import local_today
+
 log = logging.getLogger(__name__)
 
 _OFFLINE_YESTERDAY_SUMMARY = {
@@ -36,9 +38,9 @@ _OFFLINE_YESTERDAY_SUMMARY = {
 async def clear_yesterday_summary_uup(
     session,
     user_id: uuid_mod.UUID,
-    cycle_ist: date,
+    generated_for_day: date,
 ) -> None:
-    """Clear cached yesterday-summary fields for this cycle."""
+    """Clear cached yesterday-summary fields; stamp ``generated_for_day`` (typically ``local_today()``)."""
     from sqlalchemy import select
     import api.db.schema as db
 
@@ -54,11 +56,10 @@ async def clear_yesterday_summary_uup(
             user_id=user_id,
             yesterday_summary_weekly_trend=None,
             yesterday_summary_stress=None,
-            yesterday_summary_recovery=None,
             yesterday_summary_waking_recovery=None,
             yesterday_summary_sleep_recovery=None,
             yesterday_summary_adherence=None,
-            yesterday_summary_generated_for=cycle_ist,
+            yesterday_summary_generated_for=generated_for_day,
             yesterday_summary_generated_at=now_utc,
         )
         res = session.add(uup)
@@ -67,11 +68,10 @@ async def clear_yesterday_summary_uup(
     else:
         uup.yesterday_summary_weekly_trend = None
         uup.yesterday_summary_stress = None
-        uup.yesterday_summary_recovery = None
         uup.yesterday_summary_waking_recovery = None
         uup.yesterday_summary_sleep_recovery = None
         uup.yesterday_summary_adherence = None
-        uup.yesterday_summary_generated_for = cycle_ist
+        uup.yesterday_summary_generated_for = generated_for_day
         uup.yesterday_summary_generated_at = now_utc
     await session.commit()
 
@@ -99,10 +99,10 @@ async def _run_yesterday_summary(
     from api.services.tracking_service import TrackingService
 
     svc = TrackingService(session, str(user_id), session_factory=None, llm_client=None)
-    cycle_ist = await svc.get_current_cycle_local_date()
+    today_ist = local_today()
     recap = await svc.get_morning_recap()
     if not recap.get("summary"):
-        await clear_yesterday_summary_uup(session, user_id, cycle_ist)
+        await clear_yesterday_summary_uup(session, user_id, today_ist)
         log.info("yesterday_summary skipped — no strict yesterday summary user=%s", user_id)
         return
 
@@ -119,7 +119,7 @@ async def _run_yesterday_summary(
 
     narrative: Optional[str] = getattr(uup, "coach_narrative", None) if uup else None
     narrative_date = getattr(uup, "coach_narrative_date", None) if uup else None
-    narrative_is_fresh = (narrative_date == cycle_ist) if narrative_date is not None else False
+    narrative_is_fresh = (narrative_date == today_ist) if narrative_date is not None else False
 
     # Best-effort inline Layer 2 regen
     if (not narrative or not narrative_is_fresh) and llm_client is not None:
@@ -133,7 +133,7 @@ async def _run_yesterday_summary(
             narrative = (raw or "").strip() or None
             if uup is not None and narrative:
                 uup.coach_narrative = narrative
-                uup.coach_narrative_date = cycle_ist
+                uup.coach_narrative_date = today_ist
                 await session.commit()
                 log.info("yesterday_summary: Layer 2 narrative regenerated inline user=%s", user_id)
         except Exception:
@@ -159,13 +159,10 @@ async def _run_yesterday_summary(
     fields = {
         "yesterday_summary_weekly_trend": result["weekly_trend"],
         "yesterday_summary_stress": result["yesterday_stress"],
-        # Legacy combined field stays null on new writes; readers fall back to
-        # the split columns below.
-        "yesterday_summary_recovery": None,
         "yesterday_summary_waking_recovery": result["yesterday_waking_recovery"],
         "yesterday_summary_sleep_recovery": result["yesterday_sleep_recovery"],
         "yesterday_summary_adherence": result["yesterday_adherence"],
-        "yesterday_summary_generated_for": cycle_ist,
+        "yesterday_summary_generated_for": today_ist,
         "yesterday_summary_generated_at": now_utc,
     }
 
@@ -190,7 +187,8 @@ def _parse_yesterday_json(raw: str) -> Optional[dict]:
         return None
     try:
         obj = json.loads(m.group(0))
-    except Exception:
+    except json.JSONDecodeError:
+        log.warning("yesterday_summary: JSON parse failed", exc_info=True)
         return None
 
     keys = (
@@ -201,24 +199,6 @@ def _parse_yesterday_json(raw: str) -> Optional[dict]:
         "yesterday_adherence",
     )
     if not all(k in obj for k in keys):
-        # Back-compat: if the LLM still returned the old single-recovery
-        # schema, split it into the two new fields so callers never see a
-        # half-populated response.
-        legacy_keys = (
-            "weekly_trend",
-            "yesterday_stress",
-            "yesterday_recovery",
-            "yesterday_adherence",
-        )
-        if all(k in obj for k in legacy_keys):
-            combined = str(obj.get("yesterday_recovery", ""))[:1200]
-            return {
-                "weekly_trend": str(obj.get("weekly_trend", ""))[:1200],
-                "yesterday_stress": str(obj.get("yesterday_stress", ""))[:1200],
-                "yesterday_waking_recovery": combined,
-                "yesterday_sleep_recovery": combined,
-                "yesterday_adherence": str(obj.get("yesterday_adherence", ""))[:1200],
-            }
         return None
     # Safety caps
     return {

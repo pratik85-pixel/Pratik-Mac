@@ -153,6 +153,10 @@ class PolarService {
   private _sleepWindowBeats: Array<{ hr: number; ppi: number }> = [];
   private _sleepCandidateCount = 0;
   private _wakeCandidateCount  = 0;
+  /** expo-notifications id for optional sleep-mode banner (Android). */
+  private _sleepNotifId: string | null = null;
+  /** Wall-clock of last successful POST /tracking/ingest (for sleep flush watchdog). */
+  private _lastSuccessfulFlushAt = Date.now();
 
   // ── Multi-listener pub/sub ────────────────────────────────────────────────
   private _statusListeners = new Set<(status: PolarStatus) => void>();
@@ -654,7 +658,17 @@ class PolarService {
           artifact: false,
         };
         this.beats.push(beat);
+        const prevSleep = this._sleepState;
         this._updateSleepState(hr_bpm, ppi_ms);
+        if (prevSleep === 'sleep' && this._sleepState === 'sleep') {
+          const since = Date.now() - this._lastSuccessfulFlushAt;
+          if (since > FLUSH_SLEEP_MS * 3 && this.beats.length > 0) {
+            log.warn(
+              `[Polar] sleep flush watchdog — ${Math.round(since / 60_000)} min since last server flush; forcing flush`,
+            );
+            void this._flushBeats();
+          }
+        }
         this._beatCount++;
 
         // First valid beat cancels the no-signal watchdog (and reverts 'no_signal' to 'streaming')
@@ -735,6 +749,7 @@ class PolarService {
           gyro_mean: null,
         });
         this._lastFlushAt = new Date();
+        this._lastSuccessfulFlushAt = Date.now();
         this._flushListeners.forEach((fn) => fn(payload.length));
       } catch (err: any) {
         // Put beats back on failure so they don't get lost
@@ -908,6 +923,8 @@ class PolarService {
           this._sleepCandidateCount = 0;
           this._wakeCandidateCount  = 0;
           log.debug(`[Polar] sleep onset detected — avgHR=${meanHr.toFixed(0)} CV=${cv.toFixed(3)}`);
+          this._updateFlushSchedule();
+          void this._presentSleepModeNotification();
         }
       } else {
         // Soft decrement: preserve partial progress rather than full reset
@@ -922,11 +939,51 @@ class PolarService {
           this._wakeCandidateCount  = 0;
           this._sleepCandidateCount = 0;
           log.debug(`[Polar] wake detected — sleep→background avgHR=${meanHr.toFixed(0)} CV=${cv.toFixed(3)}`);
+          void this._dismissSleepModeNotification();
+          this._updateFlushSchedule();
+          void this.flushNow();
         }
       } else {
         this._wakeCandidateCount = Math.floor(this._wakeCandidateCount / 2);
       }
     }
+  }
+
+  /** Best-effort local notification so Android is less likely to freeze overnight BLE. */
+  private async _presentSleepModeNotification(): Promise<void> {
+    if (this._sleepNotifId) return;
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const Notifications = require('expo-notifications');
+      if (Platform.OS === 'android') {
+        await Notifications.setNotificationChannelAsync('zenflow-sleep', {
+          name: 'Sleep tracking',
+          importance: Notifications.AndroidImportance.DEFAULT,
+        });
+      }
+      this._sleepNotifId = await Notifications.scheduleNotificationAsync({
+        content: {
+          title: 'Night mode',
+          body: 'Tracking sleep for recovery scores — keep the band on.',
+          data: { tag: 'zenflow_sleep_track' },
+        },
+        trigger: null,
+      });
+    } catch (e) {
+      log.debug('[Polar] sleep-mode notification skipped', e);
+    }
+  }
+
+  private async _dismissSleepModeNotification(): Promise<void> {
+    if (!this._sleepNotifId) return;
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const Notifications = require('expo-notifications');
+      await Notifications.cancelScheduledNotificationAsync(this._sleepNotifId);
+    } catch {
+      // non-fatal
+    }
+    this._sleepNotifId = null;
   }
 }
 

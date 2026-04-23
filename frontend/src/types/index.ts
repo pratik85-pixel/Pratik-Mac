@@ -87,7 +87,7 @@ export interface MorningRecapSummaryBlock {
 }
 
 export interface MorningRecapResponse {
-  for_date: string;
+  for_date: string | null;
   should_show: boolean;
   acknowledged_for_date: boolean;
   summary: MorningRecapSummaryBlock | null;
@@ -99,8 +99,6 @@ export interface YesterdaySummaryResponse {
   yesterday_stress: string | null;
   yesterday_waking_recovery?: string | null;
   yesterday_sleep_recovery?: string | null;
-  /** Legacy combined recovery narrative (pre-split). */
-  yesterday_recovery?: string | null;
   yesterday_adherence: string | null;
   generated_for: string | null;
   is_stale: boolean;

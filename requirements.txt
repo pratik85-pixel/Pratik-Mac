@@ -30,7 +30,7 @@ openai==1.51.2
 tiktoken==0.7.0             # token counting for context budget
 
 # --- Scheduler ---
-apscheduler==3.10.4             # nightly rebuild cron (02:00 UTC)
+apscheduler==3.10.4             # nightly rebuild cron (01:00 UTC = 06:30 IST)
 
 # --- Testing ---
 pytest==8.3.3

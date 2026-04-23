@@ -15,6 +15,7 @@ Contract
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import uuid as uuid_mod
 from dataclasses import dataclass, field
@@ -26,6 +27,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 import api.db.schema as db
 from coach.text_sanitizer import sanitize_text
+log = logging.getLogger(__name__)
+
 from tracking.cycle_boundaries import (
     local_today,
     product_calendar_timezone,
@@ -764,6 +767,7 @@ async def build_coach_input_packet(
     try:
         band_coverage = await _compute_band_coverage(session, user_id, now_utc=now_utc)
     except Exception:
+        log.warning("band_coverage compute failed user=%s", user_id, exc_info=True)
         band_coverage = {
             "yesterday_date": None,
             "yesterday_wear_hours": None,

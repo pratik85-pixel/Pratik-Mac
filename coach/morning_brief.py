@@ -8,7 +8,7 @@ morning-brief prompt template to produce the day assessment.
 
 Flow
 ----
-1. Skip if brief is already fresh for the active cycle (cycle_ist).
+1. Skip if brief is already fresh for the IST calendar day (``local_today()``).
 2. If coach_narrative is missing or stale AND llm_client is available,
    trigger a Layer 2 narrative regen inline before proceeding.
 3. Run Layer 3 morning-brief prompt against narrative + CoachInputPacket.
@@ -45,6 +45,8 @@ import uuid as uuid_mod
 from datetime import UTC, date, datetime
 from typing import Any, Callable, Optional
 
+from tracking.cycle_boundaries import local_today
+
 log = logging.getLogger(__name__)
 
 # ── Static offline brief ──────────────────────────────────────────────────────
@@ -62,12 +64,12 @@ _OFFLINE_BRIEF = {
 async def clear_morning_bundle_uup(
     session,
     user_id: uuid_mod.UUID,
-    cycle_ist: date,
+    generated_for_day: date,
 ) -> None:
     """
     Persist an empty morning brief + clear UUP plan snippets when there is no
     strict DailyStressSummary row for the recap day (band not worn / no valid day).
-    Sets morning_brief_generated_for=cycle_ist (active morning-reset cycle date).
+    Sets ``morning_brief_generated_for`` to ``generated_for_day`` (typically ``local_today()``).
     """
     from sqlalchemy import select
     import api.db.schema as db
@@ -86,7 +88,7 @@ async def clear_morning_bundle_uup(
             and uup.morning_brief_one_action is None
         )
         empty_plan = not (uup.suggested_plan_json or uup.avoid_items_json)
-        if empty_brief and empty_plan and uup.morning_brief_generated_for == cycle_ist:
+        if empty_brief and empty_plan and uup.morning_brief_generated_for == generated_for_day:
             return
     if uup is None:
         uup = db.UserUnifiedProfile(
@@ -97,7 +99,7 @@ async def clear_morning_bundle_uup(
             morning_brief_day_confidence=None,
             morning_brief_evidence=None,
             morning_brief_one_action=None,
-            morning_brief_generated_for=cycle_ist,
+            morning_brief_generated_for=generated_for_day,
             morning_brief_generated_at=now_utc,
             suggested_plan_json=[],
             avoid_items_json=[],
@@ -112,7 +114,7 @@ async def clear_morning_bundle_uup(
         uup.morning_brief_day_confidence = None
         uup.morning_brief_evidence = None
         uup.morning_brief_one_action = None
-        uup.morning_brief_generated_for = cycle_ist
+        uup.morning_brief_generated_for = generated_for_day
         uup.morning_brief_generated_at = now_utc
         uup.suggested_plan_json = []
         uup.avoid_items_json = []
@@ -150,10 +152,10 @@ async def _run_morning_brief(
     from api.services.tracking_service import TrackingService
 
     svc = TrackingService(session, str(user_id), session_factory=None, llm_client=None)
-    cycle_ist = await svc.get_current_cycle_local_date()
+    today_ist = local_today()
     recap = await svc.get_morning_recap()
     if not recap.get("summary"):
-        await clear_morning_bundle_uup(session, user_id, cycle_ist)
+        await clear_morning_bundle_uup(session, user_id, today_ist)
         log.info("morning_brief skipped — no strict yesterday summary user=%s", user_id)
         return
 
@@ -163,8 +165,8 @@ async def _run_morning_brief(
     )
     uup = uup_res.scalar_one_or_none()
 
-    # Skip if brief is already fresh for this cycle
-    if uup and uup.morning_brief_generated_for == cycle_ist:
+    # Skip if brief is already fresh for this IST calendar day
+    if uup and uup.morning_brief_generated_for == today_ist:
         already_populated = any([
             uup.morning_brief_day_state,
             uup.morning_brief_day_confidence,
@@ -173,7 +175,7 @@ async def _run_morning_brief(
             uup.morning_brief_one_action,
         ])
         if already_populated:
-            log.debug("morning_brief already fresh for today user=%s", user_id)
+            log.debug("morning_brief already fresh for calendar day user=%s", user_id)
             return
 
     from coach.input_builder import build_coach_input_packet
@@ -182,7 +184,7 @@ async def _run_morning_brief(
     # Determine if narrative is today's
     narrative: Optional[str] = getattr(uup, "coach_narrative", None) if uup else None
     narrative_date = getattr(uup, "coach_narrative_date", None) if uup else None
-    narrative_is_fresh = (narrative_date == cycle_ist) if narrative_date is not None else False
+    narrative_is_fresh = (narrative_date == today_ist) if narrative_date is not None else False
 
     # Step 1: If narrative is missing or stale and LLM is available — regen Layer 2 inline
     if (not narrative or not narrative_is_fresh) and llm_client is not None:
@@ -197,7 +199,7 @@ async def _run_morning_brief(
             # Persist the fresh narrative immediately
             if uup is not None and narrative:
                 uup.coach_narrative = narrative
-                uup.coach_narrative_date = cycle_ist
+                uup.coach_narrative_date = today_ist
                 await session.commit()
                 log.info("morning_brief: Layer 2 narrative regenerated inline user=%s", user_id)
         except Exception:
@@ -242,7 +244,7 @@ async def _run_morning_brief(
         "morning_brief_day_confidence": result["day_confidence"],
         "morning_brief_evidence":       result["evidence"],
         "morning_brief_one_action":     result["one_action"],
-        "morning_brief_generated_for":  cycle_ist,
+        "morning_brief_generated_for":  today_ist,
         "morning_brief_generated_at":   now_utc,
     }
 
@@ -337,6 +339,7 @@ def _expected_day_state_from_recap_summary(summary: Optional[dict]) -> Optional[
             return None
         return str(day_type_from_readiness(readiness))
     except Exception:
+        log.debug("morning_brief: expected day_state from recap failed", exc_info=True)
         return None
 
 

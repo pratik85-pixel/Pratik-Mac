@@ -199,7 +199,7 @@ class MorningRecapSummaryBlock(BaseModel):
 
 
 class MorningRecapResponse(BaseModel):
-    for_date: str
+    for_date: Optional[str] = None  # null until strict recap day is closed (no midnight flip)
     should_show: bool
     acknowledged_for_date: bool
     summary: Optional[MorningRecapSummaryBlock] = None
@@ -643,8 +643,9 @@ async def get_morning_recap(
     raw = await svc.get_morning_recap()
     blk = raw.get("summary")
     summary = MorningRecapSummaryBlock(**blk) if blk else None
-    if summary is not None:
-        recap_date = _parse_date(raw["for_date"])
+    raw_for_date = raw.get("for_date")
+    if summary is not None and raw_for_date:
+        recap_date = _parse_date(raw_for_date)
         sleep_night_date, sleep_subtext = _sleep_recovery_context(recap_date)
         summary.sleep_recovery_night_date = sleep_night_date
         summary.sleep_recovery_subtext = sleep_subtext
@@ -655,7 +656,7 @@ async def get_morning_recap(
             day_type=summary.day_type,
         )
     return MorningRecapResponse(
-        for_date=raw["for_date"],
+        for_date=raw_for_date,
         should_show=raw["should_show"],
         acknowledged_for_date=raw["acknowledged_for_date"],
         summary=summary,

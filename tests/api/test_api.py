@@ -322,13 +322,11 @@ class TestCoachEndpoints:
         r = client.get("/coach/yesterday-summary", headers=self._HEADERS)
         assert r.status_code == 200
         data = r.json()
-        # 5-key split-recovery schema. Legacy `yesterday_recovery` is kept as
-        # a back-compat alias so the response stays polymorphic during rollout.
+        # Split recovery narratives (Layer 3 schema).
         assert "weekly_trend" in data
         assert "yesterday_stress" in data
         assert "yesterday_waking_recovery" in data
         assert "yesterday_sleep_recovery" in data
-        assert "yesterday_recovery" in data
         assert "yesterday_adherence" in data
         assert "generated_for" in data
         assert "is_stale" in data

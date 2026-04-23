@@ -35,7 +35,7 @@ from api.services.conversation_service import (
 )
 from api.services.tracking_service import TrackingService
 from api.utils import parse_uuid
-from tracking.cycle_boundaries import product_calendar_timezone
+from tracking.cycle_boundaries import local_today, product_calendar_timezone
 from api.rate_limiter import conversation_limiter, llm_unit_limiter
 from api.auth import UserIdDep
 
@@ -136,15 +136,12 @@ class NightClosureResponse(BaseModel):
 
 
 class YesterdaySummaryResponse(BaseModel):
-    weekly_trend:              Optional[str]
-    yesterday_stress:          Optional[str]
-    # Split recovery narratives (Layer 3 schema). `yesterday_recovery` is
-    # retained only as a legacy alias for pre-split cached rows.
+    weekly_trend:              Optional[str] = None
+    yesterday_stress:          Optional[str] = None
     yesterday_waking_recovery: Optional[str] = None
     yesterday_sleep_recovery:  Optional[str] = None
-    yesterday_recovery:        Optional[str] = None
-    yesterday_adherence:       Optional[str]
-    generated_for:             Optional[str]   # YYYY-MM-DD
+    yesterday_adherence:       Optional[str] = None
+    generated_for:             Optional[str] = None  # YYYY-MM-DD
     is_stale:                  bool
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
@@ -396,7 +393,7 @@ async def get_morning_brief(
 
     uid = _user_uuid_for_coach(user_id)
 
-    cycle_ist = await track_svc.get_current_cycle_local_date()
+    today_ist = local_today()
 
     # Deterministic band-wear coverage for the response payload (independent
     # of anything the LLM writes). Never raises into the endpoint.
@@ -409,7 +406,7 @@ async def get_morning_brief(
 
     recap = await track_svc.get_morning_recap()
     if not recap.get("summary"):
-        await clear_morning_bundle_uup(db, uid, cycle_ist)
+        await clear_morning_bundle_uup(db, uid, today_ist)
         return MorningBriefResponse(
             day_state=None,
             day_confidence=None,
@@ -419,7 +416,7 @@ async def get_morning_brief(
             summary=None,
             action=None,
             message=None,
-            generated_for=cycle_ist.isoformat(),
+            generated_for=today_ist.isoformat(),
             is_stale=False,
             plan=[],
             avoid_items=[],
@@ -434,10 +431,12 @@ async def get_morning_brief(
     uup = result.scalar_one_or_none()
 
     generated_for = uup.morning_brief_generated_for if uup else None
-    is_stale = (generated_for is None or generated_for < cycle_ist)
+    # Staleness uses IST calendar day so a new day always re-evaluates even if
+    # morning-reset cycle date is stuck (band overnight tagging missed).
+    is_stale = (generated_for is None or generated_for < today_ist)
     brief_empty_for_today = bool(
         uup
-        and generated_for == cycle_ist
+        and generated_for == today_ist
         and not any(
             [
                 uup.morning_brief_day_state,
@@ -448,6 +447,27 @@ async def get_morning_brief(
             ]
         )
     )
+
+    # Fire-and-forget morning bundle when recap exists but brief fields are empty
+    # and we are not about to run synchronous generate in this same request
+    # (avoids duplicate LLM work when is_stale/brief_empty_for_today is true).
+    will_sync_generate = is_stale or brief_empty_for_today
+    brief_missing = not uup or not any(
+        [
+            uup.morning_brief_day_state,
+            uup.morning_brief_day_confidence,
+            uup.morning_brief_text,
+            uup.morning_brief_evidence,
+            uup.morning_brief_one_action,
+        ]
+    )
+    if recap.get("summary") and brief_missing and not will_sync_generate:
+        from api.services.morning_bundle_orchestrator import MorningBundleOrchestrator
+
+        MorningBundleOrchestrator(
+            AsyncSessionLocal,
+            getattr(request.app.state, "llm_client", None),
+        ).schedule(str(user_id))
 
     if is_stale or brief_empty_for_today:
         # Lazy refresh path: backfill this cycle's brief when ingest-time trigger
@@ -460,7 +480,7 @@ async def get_morning_brief(
         )
         uup = result.scalar_one_or_none()
         generated_for = uup.morning_brief_generated_for if uup else None
-        is_stale = (generated_for is None or generated_for < cycle_ist)
+        is_stale = (generated_for is None or generated_for < today_ist)
 
     plan = uup.suggested_plan_json or [] if uup else []
     avoid = uup.avoid_items_json or [] if uup else []
@@ -503,19 +523,18 @@ async def get_yesterday_summary(
     from coach.yesterday_summary import clear_yesterday_summary_uup, generate_yesterday_summary
 
     uid = _user_uuid_for_coach(user_id)
-    cycle_ist = await track_svc.get_current_cycle_local_date()
+    today_ist = local_today()
 
     recap = await track_svc.get_morning_recap()
     if not recap.get("summary"):
-        await clear_yesterday_summary_uup(db, uid, cycle_ist)
+        await clear_yesterday_summary_uup(db, uid, today_ist)
         return YesterdaySummaryResponse(
             weekly_trend=None,
             yesterday_stress=None,
             yesterday_waking_recovery=None,
             yesterday_sleep_recovery=None,
-            yesterday_recovery=None,
             yesterday_adherence=None,
-            generated_for=cycle_ist.isoformat(),
+            generated_for=today_ist.isoformat(),
             is_stale=False,
         )
 
@@ -525,15 +544,14 @@ async def get_yesterday_summary(
     uup = result.scalar_one_or_none()
 
     generated_for = uup.yesterday_summary_generated_for if uup else None
-    is_stale = (generated_for is None or generated_for < cycle_ist)
+    is_stale = (generated_for is None or generated_for < today_ist)
     empty_for_today = bool(
         uup
-        and generated_for == cycle_ist
+        and generated_for == today_ist
         and not any(
             [
                 uup.yesterday_summary_weekly_trend,
                 uup.yesterday_summary_stress,
-                uup.yesterday_summary_recovery,
                 uup.yesterday_summary_waking_recovery,
                 uup.yesterday_summary_sleep_recovery,
                 uup.yesterday_summary_adherence,
@@ -549,25 +567,16 @@ async def get_yesterday_summary(
         )
         uup = result.scalar_one_or_none()
         generated_for = uup.yesterday_summary_generated_for if uup else None
-        is_stale = (generated_for is None or generated_for < cycle_ist)
+        is_stale = (generated_for is None or generated_for < today_ist)
 
-    # Prefer the split columns; if an old row still has only the legacy
-    # `yesterday_summary_recovery` set, surface it in both split fields so the
-    # UI never renders a blank recovery card during rollout.
     waking = uup.yesterday_summary_waking_recovery if uup else None
     sleep = uup.yesterday_summary_sleep_recovery if uup else None
-    legacy_recovery = uup.yesterday_summary_recovery if uup else None
-    if not waking and legacy_recovery:
-        waking = legacy_recovery
-    if not sleep and legacy_recovery:
-        sleep = legacy_recovery
 
     return YesterdaySummaryResponse(
         weekly_trend=uup.yesterday_summary_weekly_trend if uup else None,
         yesterday_stress=uup.yesterday_summary_stress if uup else None,
         yesterday_waking_recovery=waking,
         yesterday_sleep_recovery=sleep,
-        yesterday_recovery=legacy_recovery,
         yesterday_adherence=uup.yesterday_summary_adherence if uup else None,
         generated_for=generated_for.isoformat() if generated_for else None,
         is_stale=is_stale,

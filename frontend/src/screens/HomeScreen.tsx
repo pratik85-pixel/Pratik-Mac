@@ -2,7 +2,9 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   View, Text, StyleSheet, TouchableOpacity, ScrollView,
   ActivityIndicator, Animated, RefreshControl, Modal,
+  Platform, PermissionsAndroid,
 } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Bluetooth, BatteryFull } from 'lucide-react-native';
 import { useNavigation, useFocusEffect } from '@react-navigation/native';
 import { NativeStackNavigationProp } from '@react-navigation/native-stack';
@@ -150,6 +152,7 @@ export default function HomeScreen() {
   const [isMyDayOpen, setIsMyDayOpen] = useState(false);
   const [tagTarget, setTagTarget] = useState<{ type: 'stress' | 'recovery'; w: StressWindow | RecoveryWindow } | null>(null);
   const [isTagSheetOpen, setTagSheetOpen] = useState(false);
+  const [setupHint, setSetupHint] = useState<string | null>(null);
   const batteryPulseAnim = useRef(new Animated.Value(1)).current;
 
   // (options moved to module scope)
@@ -220,8 +223,52 @@ export default function HomeScreen() {
     setPolarStatus(polarService.status);
     const unsub = polarService.subscribeStatus((s) => setPolarStatus(s));
     const unsubBatt = polarService.subscribeBattery((pct) => setBatteryPct(pct));
+    let cancelled = false;
+    (async () => {
+      if (Platform.OS !== 'android') return;
+      try {
+        const dismissed = await AsyncStorage.getItem('@zenflow_setup_hint_dismissed');
+        if (dismissed === '1' || cancelled) {
+          if (!cancelled) setSetupHint(null);
+          return;
+        }
+        let granted = true;
+        if ((Platform.Version as number) >= 33) {
+          try {
+            granted = await PermissionsAndroid.check(
+              PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS,
+            );
+          } catch {
+            granted = true;
+          }
+        }
+        if (!granted) {
+          if (!cancelled) {
+            setSetupHint(
+              'Notifications are off — turn them on so overnight sleep tracking is not silenced by Android.',
+            );
+          }
+          return;
+        }
+        const batt = await AsyncStorage.getItem('@zenflow_battery_intent_launched');
+        const tipDone = await AsyncStorage.getItem('@zenflow_battery_tip_dismissed');
+        if (batt === '1' && tipDone !== '1' && !cancelled) {
+          setSetupHint(
+            'For reliable sleep scores, exempt ZenFlow from battery optimisation (Android Settings → Apps → ZenFlow → Battery).',
+          );
+        } else if (!cancelled) {
+          setSetupHint(null);
+        }
+      } catch {
+        if (!cancelled) setSetupHint(null);
+      }
+    })();
     // Polling is handled by DailyDataContext — no local interval needed
-    return () => { unsub(); unsubBatt(); };
+    return () => {
+      cancelled = true;
+      unsub();
+      unsubBatt();
+    };
   }, [refresh, loadSideEffects]));
 
   useEffect(() => {
@@ -498,6 +545,25 @@ export default function HomeScreen() {
             <Text style={s.collectingText}>⏳ Collecting data — scores appear once your first session is processed</Text>
           </View>
         )}
+
+        {setupHint ? (
+          <View style={s.setupHintBanner}>
+            <Text style={s.setupHintText}>{setupHint}</Text>
+            <TouchableOpacity
+              onPress={async () => {
+                try {
+                  await AsyncStorage.setItem('@zenflow_setup_hint_dismissed', '1');
+                  await AsyncStorage.setItem('@zenflow_battery_tip_dismissed', '1');
+                } catch {}
+                setSetupHint(null);
+              }}
+              accessibilityRole="button"
+              accessibilityLabel="Dismiss setup hint"
+            >
+              <Text style={s.setupHintDismiss}>Dismiss</Text>
+            </TouchableOpacity>
+          </View>
+        ) : null}
 
         <View style={s.homeFill}>
           <View style={s.cardsColumn}>
@@ -889,6 +955,31 @@ const s = StyleSheet.create({
     fontSize:   13,
     color:      ZEN.colors.textMuted,
     lineHeight: 18,
+  },
+  setupHintBanner: {
+    marginHorizontal: 16,
+    marginBottom:     8,
+    paddingHorizontal: 14,
+    paddingVertical:   12,
+    borderRadius:      10,
+    backgroundColor:  'rgba(10,132,255,0.12)',
+    borderWidth:       1,
+    borderColor:      'rgba(10,132,255,0.35)',
+    flexDirection:     'row',
+    alignItems:        'center',
+    justifyContent:    'space-between',
+    gap:               12,
+  },
+  setupHintText: {
+    flex:       1,
+    fontSize:   13,
+    color:      ZEN.colors.textBody,
+    lineHeight: 18,
+  },
+  setupHintDismiss: {
+    fontSize:   13,
+    fontWeight: '600',
+    color:      ZEN.colors.readiness,
   },
 
   readinessCard: {

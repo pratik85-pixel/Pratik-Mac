@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { AppState, AppStateStatus, View, ActivityIndicator, StyleSheet, Platform, PermissionsAndroid } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as IntentLauncher from 'expo-intent-launcher';
 import { NavigationContainer } from '@react-navigation/native';
 import { QueryClientProvider } from '@tanstack/react-query';
@@ -72,8 +73,12 @@ export default function App() {
       // silently suppresses the notification and does not honour the foreground
       // service's Doze-mode protection.
       if (Platform.OS === 'android' && (Platform.Version as number) >= 33) {
-        await PermissionsAndroid.request(
+        const nr = await PermissionsAndroid.request(
           PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS,
+        );
+        await AsyncStorage.setItem(
+          '@zenflow_notifications_granted',
+          nr === 'granted' ? '1' : '0',
         );
       }
 
@@ -86,12 +91,23 @@ export default function App() {
       // Garmin Connect and Polar Beat request this on first launch.
       if (Platform.OS === 'android') {
         try {
+          await AsyncStorage.setItem('@zenflow_battery_intent_launched', '1');
           await IntentLauncher.startActivityAsync(
             'android.settings.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS',
             { data: 'package:com.zenflow.verity' },
           );
         } catch {
           // User dismissed the dialog or already exempted — not fatal.
+        }
+      }
+
+      if (Platform.OS === 'android' && Platform.Version >= 31) {
+        try {
+          await PermissionsAndroid.request(
+            PermissionsAndroid.PERMISSIONS.BODY_SENSORS as any,
+          );
+        } catch {
+          // optional on some OEM builds
         }
       }
 
